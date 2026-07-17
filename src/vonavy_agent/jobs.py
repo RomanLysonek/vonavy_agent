@@ -909,57 +909,54 @@ class Worker:
 
     def _repair_published_artifacts(self) -> None:
         with Session(self.engine) as session:
-            jobs = session.scalars(
-                select(Job).where(
-                    Job.state == JobState.SUCCEEDED.value,
-                    Job.result_json.is_not(None),
-                )
-            ).all()
-            repairs: list[tuple[str, str, Path, Path, str, object]] = []
-            for job in jobs:
-                result = json.loads(job.result_json or "{}")
-                staging = result.get("staging_relative_path")
-                if not isinstance(staging, str):
-                    continue
-                if job.kind == "experiment":
-                    run = session.get_one(Run, json.loads(job.payload_json)["run_id"])
-                    if run.artifact_relative_path and run.manifest_hash:
-                        repairs.append(
-                            (
-                                job.id,
-                                job.kind,
-                                Path(staging),
-                                Path(run.artifact_relative_path),
-                                run.manifest_hash,
-                                None,
-                            )
-                        )
-                elif job.kind == "export":
-                    export = session.get_one(Export, json.loads(job.payload_json)["export_id"])
-                    if export.relative_path and export.manifest_hash:
-                        repairs.append(
-                            (
-                                job.id,
-                                job.kind,
-                                Path(staging),
-                                Path(export.relative_path),
-                                export.manifest_hash,
-                                result.get("bytes"),
-                            )
-                        )
-        for job_id, kind, staging, final, expected_hash, expected_size in repairs:
+            jobs = session.scalars(select(Job).where(Job.state == JobState.SUCCEEDED.value)).all()
+            job_ids = [job.id for job in jobs if job.kind in {"experiment", "export"}]
+        for job_id in job_ids:
             try:
-                if kind == "experiment":
-                    self._promote_run_bundle(staging, final, expected_hash)
-                else:
-                    self._promote_export(
-                        staging,
-                        final,
-                        expected_hash,
-                        expected_size,
-                    )
-            except (AgentError, OSError) as exc:
+                self._verify_succeeded_final(job_id)
+            except (AgentError, OSError, KeyError, ValueError) as exc:
                 self._fail_succeeded_evidence(job_id, str(exc))
+
+    def _verify_succeeded_final(self, job_id: str) -> None:
+        with Session(self.engine) as session:
+            job = session.get_one(Job, job_id)
+            if job.state != JobState.SUCCEEDED.value:
+                return
+            payload = json.loads(job.payload_json)
+            result = json.loads(job.result_json or "{}")
+            if job.kind == "experiment":
+                run = session.get(Run, payload["run_id"])
+                if run is None or not run.artifact_relative_path or not run.manifest_hash:
+                    raise AgentError(
+                        "run_evidence_missing",
+                        "Succeeded run metadata is incomplete",
+                    )
+                final_relative = Path(run.artifact_relative_path)
+                verify_run_bundle(
+                    self.settings,
+                    final_relative,
+                    run.manifest_hash,
+                )
+                self._fsync_directory((self.settings.managed_root / final_relative).parent)
+                return
+            if job.kind == "export":
+                export = session.get(Export, payload["export_id"])
+                if export is None or not export.relative_path or not export.manifest_hash:
+                    raise AgentError(
+                        "export_evidence_missing",
+                        "Succeeded export metadata is incomplete",
+                    )
+                expected_size = result.get("bytes")
+                size = expected_size if isinstance(expected_size, int) else None
+                final_relative = Path(export.relative_path)
+                with verified_managed_file(
+                    self.settings,
+                    final_relative,
+                    export.manifest_hash,
+                    size,
+                ) as export_handle:
+                    os.fsync(export_handle.fileno())
+                self._fsync_directory((self.settings.managed_root / final_relative).parent)
 
     def _fail_succeeded_evidence(self, job_id: str, message: str) -> None:
         error = {

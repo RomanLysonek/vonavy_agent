@@ -24,7 +24,7 @@ from vonavy_agent.adapters import (
     import_adapter_snapshot,
 )
 from vonavy_agent.datasets import DatasetRegistry
-from vonavy_agent.domain import DatasetMappingSpec, ExperimentSpec
+from vonavy_agent.domain import DatasetMappingSpec, ExperimentSpec, JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.experiments import create_experiment_spec
 from vonavy_agent.jobs import (
@@ -325,7 +325,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def comparison(request: ComparisonRequest) -> dict[str, object]:
         with Session(engine) as session:
             runs = [session.get(Run, run_id) for run_id in request.run_ids]
-            if any(run is None or run.summary_json is None for run in runs):
+            jobs = {
+                job.id: job
+                for job in session.scalars(
+                    select(Job).where(Job.id.in_([run.job_id for run in runs if run is not None]))
+                ).all()
+            }
+            if any(
+                run is None
+                or run.summary_json is None
+                or jobs[run.job_id].state != JobState.SUCCEEDED.value
+                for run in runs
+            ):
                 raise AgentError("runs_not_comparable", "All compared runs must be successful")
             metrics = session.scalars(
                 select(RunMetric).where(
@@ -411,7 +422,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {
                 "id": row.id,
                 "job": _job_json(job),
-                "download_ready": bool(row.relative_path),
+                "download_ready": bool(
+                    row.relative_path
+                    and row.manifest_hash
+                    and job.state == JobState.SUCCEEDED.value
+                ),
                 "sha256": row.manifest_hash,
             }
 
@@ -420,6 +435,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with Session(engine) as session:
             row = session.get(Export, export_id)
             if row is None or not row.relative_path or not row.manifest_hash:
+                raise AgentError("export_not_ready", "Export is not ready", status_code=409)
+            job = session.get_one(Job, row.job_id)
+            if job.state != JobState.SUCCEEDED.value:
                 raise AgentError("export_not_ready", "Export is not ready", status_code=409)
             relative = Path(row.relative_path)
             expected_hash = row.manifest_hash
@@ -460,13 +478,14 @@ def _version_json(version: DatasetVersion) -> dict[str, object]:
 
 
 def _job_json(job: Job) -> dict[str, object]:
+    result_visible = job.state == JobState.SUCCEEDED.value
     return {
         "id": job.id,
         "kind": job.kind,
         "state": job.state,
         "attempt": job.attempt,
         "cancel_requested": job.cancel_requested,
-        "result": json.loads(job.result_json) if job.result_json else None,
+        "result": (json.loads(job.result_json) if result_visible and job.result_json else None),
         "error": json.loads(job.error_json) if job.error_json else None,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
@@ -478,12 +497,15 @@ def _spec_json(row: ExperimentSpecRow) -> dict[str, object]:
 
 
 def _run_json(run: Run, job: Job) -> dict[str, object]:
+    evidence_visible = job.state == JobState.SUCCEEDED.value
     return {
         "id": run.id,
         "spec_id": run.spec_id,
         "gate_result_id": run.gate_result_id,
         "job": _job_json(job),
-        "summary": json.loads(run.summary_json) if run.summary_json else None,
-        "manifest_hash": run.manifest_hash,
+        "summary": (
+            json.loads(run.summary_json) if evidence_visible and run.summary_json else None
+        ),
+        "manifest_hash": run.manifest_hash if evidence_visible else None,
         "created_at": run.created_at.isoformat(),
     }

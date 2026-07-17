@@ -18,6 +18,7 @@ from vonavy_agent.domain import (
     GateReason,
     GateReport,
 )
+from vonavy_agent.eligibility import expected_grid
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_hash, canonical_json
 from vonavy_agent.persistence import (
@@ -98,7 +99,9 @@ def compute_gate(
         mapping_row = session.get_one(DatasetMapping, spec.mapping_id)
         mapping = DatasetMappingSpec.model_validate_json(mapping_row.canonical_json)
         profile = json.loads(profile_row.canonical_json)
-        frame = registry.read_materialized_frame(session, spec.dataset_version_id)
+        frame = registry.read_materialized_frame(session, spec.dataset_version_id).reset_index(
+            drop=True
+        )
     reasons: list[GateReason] = []
     warnings: list[GateReason] = []
 
@@ -256,6 +259,15 @@ def compute_gate(
             "Product/observation availability must be an explicit boolean value",
             int(invalid_observation_availability.sum()),
         )
+    grid = expected_grid(
+        entities,
+        dates,
+        observed,
+        spec.origins,
+        spec.horizon_days,
+        spec.scoring_availability_policy,
+    )
+    grid_by_key = {(cell.role, cell.origin, cell.horizon, cell.entity): cell for cell in grid}
     expected_rows = 0
     score_rows = 0
     feature_origin_failures: dict[str, int] = {}
@@ -281,13 +293,10 @@ def compute_gate(
             for horizon in range(1, spec.horizon_days + 1):
                 forecast_date = pd.Timestamp.fromordinal(origin.date.toordinal() + horizon - 1)
                 row_mask = entity_mask & (dates == forecast_date)
-                row_observed = (
-                    int(row_mask.sum()) == 1
-                    and observed[row_mask].notna().all()
-                    and bool(observed[row_mask].iloc[0])
-                )
-                if spec.scoring_availability_policy == "available_only" and not row_observed:
+                cell = grid_by_key[(origin.role, origin.date, horizon, entity)]
+                if not cell.included:
                     continue
+                row_observed = cell.observation_available is True
                 expected_rows += 1
                 if spec.scoring_availability_policy == "require_available" and not row_observed:
                     required_unavailable += 1

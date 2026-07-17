@@ -38,8 +38,10 @@ from vonavy_agent.domain import (
     RidgeDirectConfig,
     SeasonalNaiveConfig,
 )
+from vonavy_agent.eligibility import expected_grid
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_hash, canonical_json, file_hash
+from vonavy_agent.managed_files import fsync_tree
 from vonavy_agent.persistence import (
     DataProfile,
     DatasetMapping,
@@ -482,6 +484,22 @@ def run_backtest(
     expected_rows = {"calibration": 0, "test": 0}
     expected_origins: dict[tuple[str, str], int] = {}
     expected_horizons: dict[tuple[str, int], int] = {}
+    grid = expected_grid(
+        prepared.frame["_entity"],
+        prepared.frame["_date"],
+        prepared.frame["_observation_available"],
+        spec.origins,
+        spec.horizon_days,
+        spec.scoring_availability_policy,
+    )
+    for cell in grid:
+        if not cell.included:
+            continue
+        expected_rows[cell.role] += 1
+        origin_key = (cell.role, cell.origin.isoformat())
+        expected_origins[origin_key] = expected_origins.get(origin_key, 0) + 1
+        horizon_key = (cell.role, cell.horizon)
+        expected_horizons[horizon_key] = expected_horizons.get(horizon_key, 0) + 1
     for origin_spec in spec.origins:
         if ownership_check is not None:
             ownership_check()
@@ -489,22 +507,6 @@ def run_backtest(
             with Session(engine) as session:
                 if session.get_one(Job, job_id).cancel_requested:
                     raise RunCancelled
-        origin_expected = 0
-        for expected_horizon in range(1, spec.horizon_days + 1):
-            forecast_date = date.fromordinal(origin_spec.date.toordinal() + expected_horizon - 1)
-            horizon_expected = 0
-            for entity in sorted(str(value) for value in prepared.frame["_entity"].unique()):
-                actual_row = lookup.get((entity, forecast_date))
-                if actual_row is None:
-                    continue
-                observed = bool(actual_row["_observation_available"])
-                if spec.scoring_availability_policy != "available_only" or observed:
-                    horizon_expected += 1
-            expected_rows[origin_spec.role] += horizon_expected
-            origin_expected += horizon_expected
-            key = (origin_spec.role, expected_horizon)
-            expected_horizons[key] = expected_horizons.get(key, 0) + horizon_expected
-        expected_origins[(origin_spec.role, origin_spec.date.isoformat())] = origin_expected
         for seed in spec.seeds:
             for model in spec.models:
                 for horizon in range(1, spec.horizon_days + 1):
@@ -638,6 +640,7 @@ def run_backtest(
         "errors": [],
     }
     (temp_dir / "manifest.json").write_text(canonical_json(manifest), encoding="utf-8")
+    fsync_tree(temp_dir)
     if before_publish is not None:
         before_publish()
     return StagedRun(

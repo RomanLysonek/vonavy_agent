@@ -9,13 +9,14 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from vonavy_agent.adapters import adapter_capabilities
-from vonavy_agent.domain import ExperimentSpec
+from vonavy_agent.domain import ExperimentSpec, JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.experiments import create_experiment_spec
 from vonavy_agent.hashing import canonical_hash, canonical_json
 from vonavy_agent.persistence import (
     DataProfile,
     ExperimentSpecRow,
+    Job,
     PlannerProposal,
     Run,
     RunMetric,
@@ -32,7 +33,13 @@ def propose_experiments(engine: Engine, spec_id: str) -> PlannerProposal:
         profile = session.get_one(DataProfile, spec.profile_id)
         profile_json = json.loads(profile.canonical_json)
         prior_runs = session.scalars(
-            select(Run).where(Run.spec_id == spec_id, Run.summary_json.is_not(None))
+            select(Run)
+            .join(Job, Job.id == Run.job_id)
+            .where(
+                Run.spec_id == spec_id,
+                Run.summary_json.is_not(None),
+                Job.state == JobState.SUCCEEDED.value,
+            )
         ).all()
         calibration_metrics = (
             session.scalars(

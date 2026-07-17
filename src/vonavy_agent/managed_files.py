@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import stat
@@ -92,3 +93,76 @@ def publish_bytes(
         with suppress(FileNotFoundError):
             os.unlink(temp_name, dir_fd=parent_fd)
         os.close(parent_fd)
+
+
+def fsync_tree(path: Path) -> None:
+    for child in sorted(path.rglob("*")):
+        if child.is_file() and not child.is_symlink():
+            fd = os.open(child, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    directories = [child for child in path.rglob("*") if child.is_dir()]
+    for directory in [*reversed(sorted(directories)), path]:
+        fd = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def verify_run_bundle(
+    settings: Settings,
+    relative_directory: Path,
+    expected_manifest_hash: str,
+) -> None:
+    with verified_managed_file(
+        settings,
+        relative_directory / "manifest.json",
+        expected_manifest_hash,
+    ) as manifest_handle:
+        manifest = json.load(manifest_handle)
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, dict):
+        raise AgentError(
+            "artifact_integrity_failure",
+            "Run manifest outputs are invalid",
+        )
+    expected_names = {"manifest.json", *outputs}
+    directory_fd = settings.open_managed_dir_fd(relative_directory)
+    try:
+        with os.scandir(directory_fd) as entries:
+            actual_names = {
+                entry.name
+                for entry in entries
+                if stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode)
+            }
+    finally:
+        os.close(directory_fd)
+    if actual_names != expected_names:
+        raise AgentError(
+            "artifact_integrity_failure",
+            "Run bundle contains missing or unexpected files",
+        )
+    for name, evidence in outputs.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(evidence, dict)
+            or not isinstance(evidence.get("sha256"), str)
+            or not isinstance(evidence.get("bytes"), int)
+        ):
+            raise AgentError(
+                "artifact_integrity_failure",
+                "Run manifest output evidence is invalid",
+            )
+        with verified_managed_file(
+            settings,
+            relative_directory / name,
+            evidence["sha256"],
+            evidence["bytes"],
+        ):
+            pass

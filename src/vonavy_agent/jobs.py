@@ -18,10 +18,14 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session
 
-from vonavy_agent.domain import TERMINAL_JOB_STATES, JobState
+from vonavy_agent.domain import (
+    CURRENT_GATE_POLICY_VERSION,
+    TERMINAL_JOB_STATES,
+    JobState,
+)
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json, file_hash
-from vonavy_agent.managed_files import verified_managed_file
+from vonavy_agent.managed_files import verified_managed_file, verify_run_bundle
 from vonavy_agent.persistence import (
     DataProfile,
     DatasetMapping,
@@ -100,6 +104,12 @@ def enqueue_run(
             raise AgentError(
                 "gate_confirmation_invalid",
                 "A current passing gate and its exact confirmation token are required",
+            )
+        gate_payload = json.loads(gate.canonical_json)
+        if gate_payload.get("policy_version") != CURRENT_GATE_POLICY_VERSION:
+            raise AgentError(
+                "gate_policy_legacy",
+                "Gate evidence predates current leakage and availability policy; recompute it",
             )
         job = Job(kind="experiment", payload_json="{}")
         session.add(job)
@@ -213,6 +223,7 @@ class Worker:
         now = datetime.utcnow()
         evidence: list[tuple[str, str, dict[str, Any]]] = []
         stale_paths: list[Path] = []
+        finalizing_claims: list[Claim] = []
         with session_scope(self.engine) as session:
             stale = session.scalars(
                 select(Job).where(
@@ -232,23 +243,49 @@ class Worker:
                 token = job.lease_token
                 if token is None:
                     continue
+                if source == JobState.FINALIZING:
+                    replacement_token = str(uuid.uuid4())
+                    changed = cast(
+                        CursorResult[Any],
+                        session.execute(
+                            update(Job)
+                            .where(
+                                Job.id == job.id,
+                                Job.state == JobState.FINALIZING.value,
+                                Job.lease_token == token,
+                                Job.lease_expires_at < now,
+                            )
+                            .values(
+                                worker_id=self.worker_id,
+                                lease_token=replacement_token,
+                                lease_expires_at=now
+                                + timedelta(seconds=self.settings.worker_lease_seconds),
+                                updated_at=now,
+                            )
+                        ),
+                    )
+                    if changed.rowcount == 1:
+                        finalizing_claims.append(Claim(job.id, replacement_token))
+                    continue
                 values: dict[str, Any]
                 detail: dict[str, Any]
-                recovered_result = (
-                    self._publishing_result(session, job) if source == JobState.FINALIZING else None
+                legacy_complete = (
+                    self._legacy_publishing_complete(session, job)
+                    if source == JobState.PUBLISHING
+                    else False
                 )
-                if recovered_result is not None:
+                if legacy_complete:
                     target = JobState.SUCCEEDED
-                    values = {"result_json": canonical_json(recovered_result)}
-                    detail = {"reason": "recovered_finalized_result"}
+                    values = {}
+                    detail = {"reason": "recovered_legacy_publishing"}
                 elif source == JobState.CANCELLING or job.cancel_requested:
                     target = JobState.CANCELLED
                     values = {}
                     detail = {"reason": "worker_interrupted"}
-                elif job.attempt >= self.settings.worker_max_attempts or source in {
-                    JobState.PUBLISHING,
-                    JobState.FINALIZING,
-                }:
+                elif (
+                    job.attempt >= self.settings.worker_max_attempts
+                    or source == JobState.PUBLISHING
+                ):
                     target = JobState.FAILED
                     error = {"code": "worker_interrupted", "attempts": job.attempt}
                     values = {"error_json": canonical_json(error)}
@@ -281,6 +318,8 @@ class Worker:
                     continue
                 if target != JobState.SUCCEEDED:
                     stale_paths.append(self.settings.managed_root / "jobs" / "tmp" / job.id / token)
+                if source == JobState.PUBLISHING and target == JobState.FAILED:
+                    stale_paths.extend(self._invalidate_visible_evidence(session, job))
                 session.add(
                     JobEvent(
                         job_id=job.id,
@@ -293,10 +332,11 @@ class Worker:
                     evidence.append((job.id, "cancelled", {"code": "worker_interrupted"}))
                 elif target == JobState.FAILED:
                     evidence.append((job.id, "failed", detail))
+        for claim in finalizing_claims:
+            self._finish_success(claim)
+        self._remove_evidence_paths(stale_paths)
         for job_id, status, error in evidence:
             self._record_terminal_run(job_id, status, error)
-        for stale_path in stale_paths:
-            shutil.rmtree(stale_path, ignore_errors=True)
         self._repair_terminal_evidence()
         self._repair_published_artifacts()
 
@@ -516,6 +556,15 @@ class Worker:
             return changed.rowcount == 1
 
     def _finish_success(self, claim: Claim) -> None:
+        try:
+            self._promote_claim_artifacts(claim)
+        except (AgentError, OSError) as exc:
+            self._finish_failed(
+                claim,
+                "artifact_promotion_failed",
+                str(exc),
+            )
+            return
         with session_scope(self.engine) as session:
             job = session.get_one(Job, claim.job_id)
             if not job.result_json:
@@ -528,8 +577,11 @@ class Worker:
                 {},
                 {},
             )
-        if transitioned:
-            self._repair_published_artifacts()
+        if not transitioned:
+            raise AgentError(
+                "final_success_cas_failed",
+                "Finalizing job lost ownership before terminal success",
+            )
 
     def _finish_cancelled(self, claim: Claim, code: str) -> None:
         transitioned = False
@@ -549,8 +601,10 @@ class Worker:
         error = {"code": code, "message": message}
         transitioned = False
         was_finalizing = False
+        paths: list[Path] = []
         with session_scope(self.engine) as session:
-            was_finalizing = session.get_one(Job, claim.job_id).state == JobState.FINALIZING.value
+            job = session.get_one(Job, claim.job_id)
+            was_finalizing = job.state == JobState.FINALIZING.value
             transitioned = self._owned_terminal(
                 session,
                 claim,
@@ -564,38 +618,47 @@ class Worker:
                 {"error_json": canonical_json(error)},
                 error,
             )
+            if transitioned and was_finalizing:
+                paths = self._invalidate_visible_evidence(session, job)
         if transitioned:
-            if was_finalizing:
-                self._cleanup_visible_evidence(claim.job_id)
+            self._remove_evidence_paths(paths)
             self._record_terminal_run(claim.job_id, "failed", error)
 
     def _cleanup_visible_evidence(self, job_id: str) -> None:
-        paths: list[Path] = []
         with session_scope(self.engine) as session:
             job = session.get_one(Job, job_id)
-            result = json.loads(job.result_json) if job.result_json else {}
-            if staging := result.get("staging_relative_path"):
-                paths.append(self.settings.managed_root / staging)
-            if job.kind == "profile" and result.get("profile_id"):
-                session.execute(delete(DataProfile).where(DataProfile.id == result["profile_id"]))
-            elif job.kind == "gate" and result.get("gate_result_id"):
-                session.execute(
-                    delete(GateResultRow).where(GateResultRow.id == result["gate_result_id"])
-                )
-            elif job.kind == "experiment":
-                run = session.get_one(Run, json.loads(job.payload_json)["run_id"])
-                session.execute(delete(RunMetric).where(RunMetric.run_id == run.id))
-                if run.artifact_relative_path:
-                    paths.append(self.settings.managed_root / run.artifact_relative_path)
-                run.artifact_relative_path = None
-                run.manifest_hash = None
-                run.summary_json = None
-            elif job.kind == "export":
-                export = session.get_one(Export, json.loads(job.payload_json)["export_id"])
-                if export.relative_path:
-                    paths.append(self.settings.managed_root / export.relative_path)
-                export.relative_path = None
-                export.manifest_hash = None
+            paths = self._invalidate_visible_evidence(session, job)
+        self._remove_evidence_paths(paths)
+
+    def _invalidate_visible_evidence(self, session: Session, job: Job) -> list[Path]:
+        paths: list[Path] = []
+        result = json.loads(job.result_json) if job.result_json else {}
+        if staging := result.get("staging_relative_path"):
+            paths.append(self.settings.managed_root / staging)
+        if job.kind == "profile" and result.get("profile_id"):
+            session.execute(delete(DataProfile).where(DataProfile.id == result["profile_id"]))
+        elif job.kind == "gate" and result.get("gate_result_id"):
+            session.execute(
+                delete(GateResultRow).where(GateResultRow.id == result["gate_result_id"])
+            )
+        elif job.kind == "experiment":
+            run = session.get_one(Run, json.loads(job.payload_json)["run_id"])
+            session.execute(delete(RunMetric).where(RunMetric.run_id == run.id))
+            if run.artifact_relative_path:
+                paths.append(self.settings.managed_root / run.artifact_relative_path)
+            run.artifact_relative_path = None
+            run.manifest_hash = None
+            run.summary_json = None
+        elif job.kind == "export":
+            export = session.get_one(Export, json.loads(job.payload_json)["export_id"])
+            if export.relative_path:
+                paths.append(self.settings.managed_root / export.relative_path)
+            export.relative_path = None
+            export.manifest_hash = None
+        return paths
+
+    @staticmethod
+    def _remove_evidence_paths(paths: list[Path]) -> None:
         for path in paths:
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
@@ -671,51 +734,156 @@ class Worker:
         finally:
             process.wait()
 
-    def _publishing_result(self, session: Session, job: Job) -> dict[str, Any] | None:
+    def _legacy_publishing_complete(self, session: Session, job: Job) -> bool:
+        if not job.result_json:
+            return False
         payload = json.loads(job.payload_json)
-        if job.result_json:
-            return cast(dict[str, Any], json.loads(job.result_json))
-        if job.kind == "experiment":
-            run = session.get_one(Run, payload["run_id"])
-            if run.summary_json and run.manifest_hash:
-                return {"run_id": run.id, "summary": json.loads(run.summary_json)}
-        elif job.kind == "export":
-            export = session.get_one(Export, payload["export_id"])
-            if export.relative_path and export.manifest_hash:
-                path = self.settings.managed_root / export.relative_path
-                if path.is_file() and file_hash(path) == export.manifest_hash:
-                    return {
-                        "export_id": export.id,
-                        "relative_path": export.relative_path,
-                        "sha256": export.manifest_hash,
-                        "bytes": path.stat().st_size,
-                    }
-        elif job.kind == "profile":
-            row = session.scalar(
-                select(DataProfile)
-                .where(
-                    DataProfile.dataset_version_id == payload["dataset_version_id"],
-                    DataProfile.mapping_id == payload["mapping_id"],
-                    DataProfile.created_at >= job.created_at,
+        result = json.loads(job.result_json)
+        try:
+            if job.kind == "experiment":
+                run = session.get_one(Run, payload["run_id"])
+                if not run.summary_json or not run.manifest_hash or not run.artifact_relative_path:
+                    return False
+                verify_run_bundle(
+                    self.settings,
+                    Path(run.artifact_relative_path),
+                    run.manifest_hash,
                 )
-                .order_by(DataProfile.created_at.desc())
-                .limit(1)
-            )
-            if row is not None:
-                return {"profile_id": row.id}
-        elif job.kind == "gate":
-            gate_row = session.scalar(
-                select(GateResultRow)
-                .where(
-                    GateResultRow.spec_id == payload["spec_id"],
-                    GateResultRow.created_at >= job.created_at,
+                return True
+            if job.kind == "export":
+                export = session.get_one(Export, payload["export_id"])
+                if not export.relative_path or not export.manifest_hash:
+                    return False
+                with verified_managed_file(
+                    self.settings,
+                    Path(export.relative_path),
+                    export.manifest_hash,
+                    result.get("bytes"),
+                ):
+                    pass
+                return True
+            if job.kind == "profile":
+                profile_id = result.get("profile_id")
+                return (
+                    isinstance(profile_id, str) and session.get(DataProfile, profile_id) is not None
                 )
-                .order_by(GateResultRow.created_at.desc())
-                .limit(1)
-            )
-            if gate_row is not None:
-                return {"gate_result_id": gate_row.id}
-        return None
+            if job.kind == "gate":
+                gate_id = result.get("gate_result_id")
+                return isinstance(gate_id, str) and session.get(GateResultRow, gate_id) is not None
+        except (AgentError, OSError, ValueError):
+            return False
+        return False
+
+    def _promote_claim_artifacts(self, claim: Claim) -> None:
+        with Session(self.engine) as session:
+            job = session.get_one(Job, claim.job_id)
+            if (
+                job.state != JobState.FINALIZING.value
+                or job.worker_id != self.worker_id
+                or job.lease_token != claim.lease_token
+                or not job.result_json
+            ):
+                raise AgentError(
+                    "finalization_lease_lost",
+                    "Finalizing artifact lease is no longer owned",
+                )
+            result = json.loads(job.result_json)
+            payload = json.loads(job.payload_json)
+            if job.kind == "profile":
+                if session.get(DataProfile, result.get("profile_id")) is None:
+                    raise AgentError(
+                        "profile_evidence_missing",
+                        "Finalizing profile evidence is missing",
+                    )
+                return
+            if job.kind == "gate":
+                if session.get(GateResultRow, result.get("gate_result_id")) is None:
+                    raise AgentError(
+                        "gate_evidence_missing",
+                        "Finalizing gate evidence is missing",
+                    )
+                return
+            staging_value = result.get("staging_relative_path")
+            if not isinstance(staging_value, str):
+                raise AgentError(
+                    "staging_evidence_missing",
+                    "Finalizing artifact staging path is missing",
+                )
+            staging_relative = Path(staging_value)
+            if job.kind == "experiment":
+                run = session.get_one(Run, payload["run_id"])
+                if not run.artifact_relative_path or not run.manifest_hash:
+                    raise AgentError(
+                        "run_evidence_missing",
+                        "Finalizing run evidence is incomplete",
+                    )
+                final_relative = Path(run.artifact_relative_path)
+                self._promote_run_bundle(staging_relative, final_relative, run.manifest_hash)
+                return
+            if job.kind == "export":
+                export = session.get_one(Export, payload["export_id"])
+                if not export.relative_path or not export.manifest_hash:
+                    raise AgentError(
+                        "export_evidence_missing",
+                        "Finalizing export evidence is incomplete",
+                    )
+                self._promote_export(
+                    staging_relative,
+                    Path(export.relative_path),
+                    export.manifest_hash,
+                    result.get("bytes"),
+                )
+                return
+            raise AgentError("unsupported_job_kind", f"Unsupported job kind: {job.kind}")
+
+    def _promote_run_bundle(
+        self,
+        staging_relative: Path,
+        final_relative: Path,
+        expected_manifest_hash: str,
+    ) -> None:
+        staging = self.settings.managed_root / staging_relative
+        final = self.settings.managed_root / final_relative
+        if staging.exists():
+            verify_run_bundle(self.settings, staging_relative, expected_manifest_hash)
+            if not final.exists():
+                final.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(staging, final)
+                self._fsync_directory(final.parent)
+        verify_run_bundle(self.settings, final_relative, expected_manifest_hash)
+        self._fsync_directory(final.parent)
+
+    def _promote_export(
+        self,
+        staging_relative: Path,
+        final_relative: Path,
+        expected_hash: str,
+        expected_size: object,
+    ) -> None:
+        size = expected_size if isinstance(expected_size, int) else None
+        staging = self.settings.managed_root / staging_relative
+        final = self.settings.managed_root / final_relative
+        if staging.exists():
+            with verified_managed_file(self.settings, staging_relative, expected_hash, size):
+                pass
+            if not final.exists():
+                final.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(staging, final)
+                self._fsync_directory(final.parent)
+        with verified_managed_file(self.settings, final_relative, expected_hash, size):
+            pass
+        self._fsync_directory(final.parent)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _repair_published_artifacts(self) -> None:
         with Session(self.engine) as session:

@@ -13,10 +13,16 @@ from typing import Any
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from vonavy_agent.domain import JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json, file_hash
-from vonavy_agent.managed_files import verified_managed_file
-from vonavy_agent.persistence import ExperimentSpecRow, GateResultRow, Run
+from vonavy_agent.managed_files import fsync_tree, verified_managed_file
+from vonavy_agent.persistence import (
+    ExperimentSpecRow,
+    GateResultRow,
+    Job,
+    Run,
+)
 from vonavy_agent.settings import Settings
 
 
@@ -48,6 +54,11 @@ def stage_static_export(
                 or not run.artifact_relative_path
                 or not run.manifest_hash
             ):
+                raise AgentError(
+                    "run_not_exportable",
+                    f"Run {run_id} is not a successful published run",
+                )
+            if session.get_one(Job, run.job_id).state != JobState.SUCCEEDED.value:
                 raise AgentError(
                     "run_not_exportable",
                     f"Run {run_id} is not a successful published run",
@@ -130,6 +141,7 @@ const limits=el("section",undefined,"card");limits.append(el("h2","Limitations")
     with zipfile.ZipFile(staging_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in ("index.html", "report.json", "manifest.json"):
             archive.write(stage_dir / name, arcname=name)
+    fsync_tree(stage_dir)
     final_path = settings.managed_root / "exports" / f"experiment-agent-report-{export_id}.zip"
     result = {
         "export_id": export_id,

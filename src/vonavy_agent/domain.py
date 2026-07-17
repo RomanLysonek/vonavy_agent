@@ -11,6 +11,9 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+CURRENT_GATE_POLICY_VERSION = "2"
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
@@ -248,6 +251,7 @@ class GateReason(StrictModel):
 
 class GateReport(StrictModel):
     schema_version: Literal["1.0"] = "1.0"
+    policy_version: Literal["2"] = "2"
     status: Literal["passed", "blocked"]
     reasons: tuple[GateReason, ...] = ()
     warnings: tuple[GateReason, ...] = ()

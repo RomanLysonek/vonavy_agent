@@ -119,18 +119,30 @@ def test_finalizing_run_and_export_evidence_is_not_public(evidence, spec_row) ->
         assert comparison.status_code == 400
         export_response = client.get(f"/api/exports/{export.id}")
         assert export_response.json()["download_ready"] is False
+        assert export_response.json()["sha256"] is None
         download = client.get(f"/api/exports/{export.id}/download")
         assert download.status_code == 409
     with pytest.raises(AgentError, match="not a successful"):
         create_static_export(engine, settings, "hidden-run", [run.id])
 
 
-def test_legacy_publishing_recovers_only_complete_verified_evidence(evidence, spec_row) -> None:
+def test_legacy_publishing_recovers_only_complete_verified_evidence(
+    evidence, spec_row, monkeypatch
+) -> None:
     settings, engine, _, job = successful_run(evidence, spec_row)
+    fsync_calls: list[int] = []
+    original_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
     expire_as(engine, job.id, JobState.PUBLISHING, "legacy-complete")
     Worker(settings, engine).recover()
     with Session(engine) as session:
         assert session.get_one(Job, job.id).state == JobState.SUCCEEDED
+    assert fsync_calls
 
     second_gate = run_gate(engine, evidence[2], spec_row.id)
     incomplete_run, incomplete_job = enqueue_run(

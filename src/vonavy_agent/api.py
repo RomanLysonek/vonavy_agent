@@ -427,7 +427,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     and row.manifest_hash
                     and job.state == JobState.SUCCEEDED.value
                 ),
-                "sha256": row.manifest_hash,
+                "sha256": (row.manifest_hash if job.state == JobState.SUCCEEDED.value else None),
             }
 
     @app.get("/api/exports/{export_id}/download")

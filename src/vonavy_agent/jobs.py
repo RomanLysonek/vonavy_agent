@@ -749,6 +749,9 @@ class Worker:
                     Path(run.artifact_relative_path),
                     run.manifest_hash,
                 )
+                self._fsync_directory(
+                    (self.settings.managed_root / run.artifact_relative_path).parent
+                )
                 return True
             if job.kind == "export":
                 export = session.get_one(Export, payload["export_id"])
@@ -759,8 +762,9 @@ class Worker:
                     Path(export.relative_path),
                     export.manifest_hash,
                     result.get("bytes"),
-                ):
-                    pass
+                ) as export_handle:
+                    os.fsync(export_handle.fileno())
+                self._fsync_directory((self.settings.managed_root / export.relative_path).parent)
                 return True
             if job.kind == "profile":
                 profile_id = result.get("profile_id")
@@ -844,6 +848,12 @@ class Worker:
     ) -> None:
         staging = self.settings.managed_root / staging_relative
         final = self.settings.managed_root / final_relative
+        if final.exists():
+            verify_run_bundle(self.settings, final_relative, expected_manifest_hash)
+            self._fsync_directory(final.parent)
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            return
         if staging.exists():
             verify_run_bundle(self.settings, staging_relative, expected_manifest_hash)
             if not final.exists():
@@ -863,15 +873,27 @@ class Worker:
         size = expected_size if isinstance(expected_size, int) else None
         staging = self.settings.managed_root / staging_relative
         final = self.settings.managed_root / final_relative
+        if final.exists():
+            with verified_managed_file(
+                self.settings, final_relative, expected_hash, size
+            ) as final_handle:
+                os.fsync(final_handle.fileno())
+            self._fsync_directory(final.parent)
+            staging.unlink(missing_ok=True)
+            return
         if staging.exists():
-            with verified_managed_file(self.settings, staging_relative, expected_hash, size):
-                pass
+            with verified_managed_file(
+                self.settings, staging_relative, expected_hash, size
+            ) as staging_handle:
+                os.fsync(staging_handle.fileno())
             if not final.exists():
                 final.parent.mkdir(parents=True, exist_ok=True)
                 os.rename(staging, final)
                 self._fsync_directory(final.parent)
-        with verified_managed_file(self.settings, final_relative, expected_hash, size):
-            pass
+        with verified_managed_file(
+            self.settings, final_relative, expected_hash, size
+        ) as final_handle:
+            os.fsync(final_handle.fileno())
         self._fsync_directory(final.parent)
 
     @staticmethod
@@ -893,21 +915,23 @@ class Worker:
                     Job.result_json.is_not(None),
                 )
             ).all()
-            repairs: list[tuple[Path, Path, str]] = []
+            repairs: list[tuple[str, str, Path, Path, str, object]] = []
             for job in jobs:
                 result = json.loads(job.result_json or "{}")
                 staging = result.get("staging_relative_path")
                 if not isinstance(staging, str):
                     continue
-                staging_path = self.settings.managed_root / staging
                 if job.kind == "experiment":
                     run = session.get_one(Run, json.loads(job.payload_json)["run_id"])
                     if run.artifact_relative_path and run.manifest_hash:
                         repairs.append(
                             (
-                                staging_path,
-                                self.settings.managed_root / run.artifact_relative_path,
+                                job.id,
+                                job.kind,
+                                Path(staging),
+                                Path(run.artifact_relative_path),
                                 run.manifest_hash,
+                                None,
                             )
                         )
                 elif job.kind == "export":
@@ -915,32 +939,66 @@ class Worker:
                     if export.relative_path and export.manifest_hash:
                         repairs.append(
                             (
-                                staging_path,
-                                self.settings.managed_root / export.relative_path,
+                                job.id,
+                                job.kind,
+                                Path(staging),
+                                Path(export.relative_path),
                                 export.manifest_hash,
+                                result.get("bytes"),
                             )
                         )
-        for staging, final, expected_hash in repairs:
-            if not final.exists() and staging.exists():
-                final.parent.mkdir(parents=True, exist_ok=True)
-                os.rename(staging, final)
-            if final.is_dir():
-                relative = final.relative_to(self.settings.managed_root)
-                with verified_managed_file(
-                    self.settings,
-                    relative / "manifest.json",
-                    expected_hash,
-                ):
-                    pass
-            else:
-                relative = final.relative_to(self.settings.managed_root)
-                with verified_managed_file(self.settings, relative, expected_hash):
-                    pass
-            if staging.exists():
-                if staging.is_dir():
-                    shutil.rmtree(staging, ignore_errors=True)
+        for job_id, kind, staging, final, expected_hash, expected_size in repairs:
+            try:
+                if kind == "experiment":
+                    self._promote_run_bundle(staging, final, expected_hash)
                 else:
-                    staging.unlink(missing_ok=True)
+                    self._promote_export(
+                        staging,
+                        final,
+                        expected_hash,
+                        expected_size,
+                    )
+            except (AgentError, OSError) as exc:
+                self._fail_succeeded_evidence(job_id, str(exc))
+
+    def _fail_succeeded_evidence(self, job_id: str, message: str) -> None:
+        error = {
+            "code": "artifact_repair_failed",
+            "message": message,
+        }
+        paths: list[Path] = []
+        transitioned = False
+        with session_scope(self.engine) as session:
+            job = session.get_one(Job, job_id)
+            changed = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(Job)
+                    .where(
+                        Job.id == job_id,
+                        Job.state == JobState.SUCCEEDED.value,
+                    )
+                    .values(
+                        state=JobState.FAILED.value,
+                        error_json=canonical_json(error),
+                        updated_at=datetime.utcnow(),
+                    )
+                ),
+            )
+            transitioned = changed.rowcount == 1
+            if transitioned:
+                paths = self._invalidate_visible_evidence(session, job)
+                session.add(
+                    JobEvent(
+                        job_id=job_id,
+                        from_state=JobState.SUCCEEDED.value,
+                        to_state=JobState.FAILED.value,
+                        detail_json=canonical_json(error),
+                    )
+                )
+        if transitioned:
+            self._remove_evidence_paths(paths)
+            self._record_terminal_run(job_id, "failed", error)
 
     def _repair_terminal_evidence(self) -> None:
         with Session(self.engine) as session:

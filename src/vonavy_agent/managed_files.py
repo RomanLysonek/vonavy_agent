@@ -126,6 +126,7 @@ def verify_run_bundle(
         expected_manifest_hash,
     ) as manifest_handle:
         manifest = json.load(manifest_handle)
+        os.fsync(manifest_handle.fileno())
     outputs = manifest.get("outputs")
     if not isinstance(outputs, dict):
         raise AgentError(
@@ -164,5 +165,10 @@ def verify_run_bundle(
             relative_directory / name,
             evidence["sha256"],
             evidence["bytes"],
-        ):
-            pass
+        ) as output_handle:
+            os.fsync(output_handle.fileno())
+    directory_fd = settings.open_managed_dir_fd(relative_directory)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Experiment Agent / Interview Assignment</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="shell masthead">
+    <div>
+      <p class="eyebrow">NOTINO / Interview Assignment</p>
+      <h1>Experiment Agent</h1>
+      <p class="lede">Leakage-safe local forecasting experiments with evidence you can export.</p>
+    </div>
+    <nav aria-label="Sibling portfolio">
+      <a href="https://romanlysonek.github.io/vonava_predikce/">Prediction</a>
+      <a href="https://romanlysonek.github.io/vonave_anomalie/">Anomalies</a>
+      <a href="https://romanlysonek.github.io/vonavy_chronos/">Chronos</a>
+    </nav>
+  </header>
+
+  <main class="shell">
+    <ol class="steps" aria-label="Workflow">
+      <li class="active">Data</li><li>Profile / Map</li><li>Configure / Gate</li>
+      <li>Run / Monitor</li><li>Compare</li><li>Export</li>
+    </ol>
+
+    <div id="notice" class="notice" role="status" aria-live="polite">Ready. Core workflow stays on this machine.</div>
+
+    <section class="panel" id="data-panel">
+      <div class="panel-head"><span>01</span><div><h2>Data</h2><p>Copy a CSV or Parquet snapshot into immutable managed storage.</p></div></div>
+      <form id="upload-form" class="form-grid">
+        <label>Dataset name<input id="dataset-name" name="dataset_name" value="Interview demand demo" required maxlength="200"></label>
+        <label>File<input id="dataset-file" name="file" type="file" accept=".csv,.parquet" required></label>
+        <button type="submit">Ingest immutable version</button>
+      </form>
+      <div id="dataset-result" class="result muted">No dataset version selected.</div>
+    </section>
+
+    <section class="panel" id="mapping-panel">
+      <div class="panel-head"><span>02</span><div><h2>Profile / Map</h2><p>Roles and availability are explicit; nothing is inferred silently.</p></div></div>
+      <form id="mapping-form" class="form-grid">
+        <label>Timestamp column<input id="timestamp-column" value="date" required></label>
+        <label>Entity column<input id="entity-column" value="store" placeholder="Leave empty for one series"></label>
+        <label>Target column<input id="target-column" value="demand" required></label>
+        <label>Target availability
+          <select id="target-availability"><option value="available_at_event_time">Available after event day</option><option value="column">Timestamp column</option></select>
+        </label>
+        <label>Target availability column<input id="target-availability-column" placeholder="Required only for column policy"></label>
+        <label class="wide">Candidate features JSON
+          <textarea id="features-json" rows="5">[
+  {"name":"promotion","role":"known_future","availability":{"kind":"known_at_origin"}},
+  {"name":"region","role":"static","availability":{"kind":"always"}}
+]</textarea>
+        </label>
+        <button type="submit">Save mapping &amp; profile</button>
+      </form>
+      <div id="profile-result" class="result muted">Ingest a dataset first.</div>
+    </section>
+
+    <section class="panel" id="configure-panel">
+      <div class="panel-head"><span>03</span><div><h2>Configure / Gate</h2><p>Calibration selects; test evidence remains audit-only.</p></div></div>
+      <form id="spec-form" class="form-grid">
+        <label>Train start<input id="train-start" type="date" required></label>
+        <label>Train end<input id="train-end" type="date" required></label>
+        <label>Calibration start<input id="cal-start" type="date" required></label>
+        <label>Calibration end<input id="cal-end" type="date" required></label>
+        <label>Test start<input id="test-start" type="date" required></label>
+        <label>Test end<input id="test-end" type="date" required></label>
+        <label>Horizon days<input id="horizon" type="number" value="7" min="1" max="90"></label>
+        <label>Training window days<input id="training-window" type="number" value="90" min="14" max="3650"></label>
+        <label>Calibration origin<input id="cal-origin" type="date" required></label>
+        <label>Test origin<input id="test-origin" type="date" required></label>
+        <label>Evaluation as of<input id="evaluation-as-of" type="date" required></label>
+        <label>Minimum coverage<input id="minimum-coverage" type="number" value="0.8" min="0" max="1" step="0.05"></label>
+        <fieldset class="wide models"><legend>Models</legend>
+          <label><input type="checkbox" id="model-seasonal" checked> Same-weekday seasonal naive</label>
+          <label><input type="checkbox" id="model-moving" checked> 28-day moving average</label>
+          <label><input type="checkbox" id="model-ridge" checked> Direct Ridge</label>
+        </fieldset>
+        <button type="submit">Create spec &amp; run mandatory gate</button>
+      </form>
+      <div id="gate-result" class="result muted">Profile data before configuring an experiment.</div>
+    </section>
+
+    <section class="panel" id="run-panel">
+      <div class="panel-head"><span>04</span><div><h2>Run / Monitor</h2><p>HTTP only enqueues; a restart-safe worker executes separately.</p></div></div>
+      <label class="confirm"><input id="run-confirm" type="checkbox"> I reviewed the current gate and confirm this exact spec.</label>
+      <div class="actions"><button id="run-button" disabled>Enqueue experiment</button><button id="planner-button" class="secondary" disabled>Propose next experiments</button></div>
+      <div id="run-result" class="result muted">A passing gate is required.</div>
+      <div id="planner-result" class="result muted">Planner has not inspected this evidence.</div>
+    </section>
+
+    <section class="panel" id="compare-panel">
+      <div class="panel-head"><span>05</span><div><h2>Compare</h2><p>All models are scored on the same availability-eligible rows.</p></div></div>
+      <div class="actions"><button id="refresh-runs" class="secondary">Refresh runs</button><button id="compare-button">Compare selected</button></div>
+      <div id="runs-result" class="result muted">No successful runs loaded.</div>
+      <div id="compare-result" class="result muted">Select one or more successful runs.</div>
+    </section>
+
+    <section class="panel" id="export-panel">
+      <div class="panel-head"><span>06</span><div><h2>Export</h2><p>Download static HTML + JSON evidence that needs no server.</p></div></div>
+      <button id="export-button">Export selected runs</button>
+      <div id="export-result" class="result muted">No export created.</div>
+    </section>
+  </main>
+  <footer class="shell">Local-first / deterministic / no cloud service required</footer>
+  <script src="/app.js" defer></script>
+</body>
+</html>

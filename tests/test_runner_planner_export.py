@@ -80,6 +80,7 @@ def test_ridge_predictions_do_not_use_future_targets(evidence) -> None:
     frame["_entity"] = frame["store"].astype("string")
     frame["_target"] = frame["demand"].astype(float)
     frame["_target_available"] = frame["_date"] + pd.Timedelta(days=1)
+    frame["_observation_available"] = True
     from conftest import make_spec
 
     spec = make_spec(version, mapping_row, profile, models=(RidgeDirectConfig(),))

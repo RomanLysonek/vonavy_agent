@@ -41,7 +41,10 @@ The first version supports regular daily panel demand:
 - one timestamp column;
 - one optional entity column;
 - a numeric target;
-- explicit target and feature availability policies;
+- explicit target information-known-at and feature availability policies;
+- an optional, separate product/observation-availability boolean plus an
+  explicit `assume_available`, `available_only`, or `require_available` scoring
+  policy;
 - feature roles `past_only`, `known_future`, `static`, and `excluded`.
 
 For daily aggregates, `available_at_event_time` means the value becomes eligible

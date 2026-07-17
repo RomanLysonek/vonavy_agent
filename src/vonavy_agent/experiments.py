@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from vonavy_agent.datasets import DatasetRegistry
+from vonavy_agent.datasets import DatasetRegistry, observation_availability
 from vonavy_agent.domain import (
     AvailabilityKind,
     DatasetMappingSpec,
@@ -73,12 +74,21 @@ def _available_at(
     raise AssertionError(f"Unhandled availability kind: {kind}")
 
 
-def run_gate(
+@dataclass(frozen=True)
+class GateComputation:
+    spec_id: str
+    spec_hash: str
+    profile_hash: str
+    status: str
+    canonical_json: str
+    confirmation_token: str | None
+
+
+def compute_gate(
     engine: Engine,
     registry: DatasetRegistry,
     spec_row_id: str,
-    before_publish: Callable[[], None] | None = None,
-) -> GateResultRow:
+) -> GateComputation:
     with Session(engine) as session:
         spec_row = session.get(ExperimentSpecRow, spec_row_id)
         if spec_row is None:
@@ -111,6 +121,17 @@ def run_gate(
 
     if mapping.target_column != spec.target_column or mapping.entity_column != spec.entity_column:
         block("mapping_spec_mismatch", "Target or entity mapping differs from the experiment spec")
+    if (
+        mapping.observation_availability_column is None
+        and spec.scoring_availability_policy != "assume_available"
+    ) or (
+        mapping.observation_availability_column is not None
+        and spec.scoring_availability_policy == "assume_available"
+    ):
+        block(
+            "observation_availability_policy_mismatch",
+            "Scoring availability policy must explicitly match the product-availability mapping",
+        )
     mapped_features = {feature.name: feature for feature in mapping.features}
     for feature in spec.features:
         if feature.name not in mapped_features or mapped_features[feature.name] != feature:
@@ -218,9 +239,28 @@ def run_gate(
             "Target availability contains invalid values",
             int(invalid_availability.sum()),
         )
+    premature_target_availability = (
+        relevant & target_available.notna() & (target_available < timestamps + pd.Timedelta(days=1))
+    )
+    if premature_target_availability.any():
+        block(
+            "target_availability_precedes_event",
+            "Target known-at timestamps cannot precede their event timestamps",
+            int(premature_target_availability.sum()),
+        )
+    observed = observation_availability(frame, mapping.observation_availability_column)
+    invalid_observation_availability = relevant & observed.isna()
+    if invalid_observation_availability.any():
+        block(
+            "invalid_observation_availability",
+            "Product/observation availability must be an explicit boolean value",
+            int(invalid_observation_availability.sum()),
+        )
     expected_rows = 0
     score_rows = 0
     feature_origin_failures: dict[str, int] = {}
+    required_unavailable = 0
+    required_unavailable_examples: list[str] = []
     entity_values = sorted(str(value) for value in entities.dropna().unique())
     for origin in spec.origins:
         origin_ts = pd.Timestamp(origin.date, tz="UTC")
@@ -239,11 +279,24 @@ def run_gate(
                         feature_origin_failures.get(feature.name, 0) + 1
                     )
             for horizon in range(1, spec.horizon_days + 1):
-                expected_rows += 1
                 forecast_date = pd.Timestamp.fromordinal(origin.date.toordinal() + horizon - 1)
                 row_mask = entity_mask & (dates == forecast_date)
+                row_observed = (
+                    int(row_mask.sum()) == 1
+                    and observed[row_mask].notna().all()
+                    and bool(observed[row_mask].iloc[0])
+                )
+                if spec.scoring_availability_policy == "available_only" and not row_observed:
+                    continue
+                expected_rows += 1
+                if spec.scoring_availability_policy == "require_available" and not row_observed:
+                    required_unavailable += 1
+                    required_unavailable_examples.append(
+                        f"{entity}@{forecast_date.date().isoformat()}"
+                    )
                 if (
                     int(row_mask.sum()) == 1
+                    and row_observed
                     and target[row_mask].notna().all()
                     and (target_available[row_mask] <= spec.evaluation_as_of).all()
                 ):
@@ -256,6 +309,13 @@ def run_gate(
                         feature_origin_failures[feature.name] = (
                             feature_origin_failures.get(feature.name, 0) + 1
                         )
+    if required_unavailable:
+        block(
+            "required_observation_unavailable",
+            "One or more required scoring rows are product-unavailable",
+            required_unavailable,
+            required_unavailable_examples,
+        )
     for feature_name, count in sorted(feature_origin_failures.items()):
         block(
             "feature_unavailable_at_origin",
@@ -343,19 +403,47 @@ def run_gate(
         else None
     )
     report = unsigned.model_copy(update={"confirmation_token": token})
+    return GateComputation(
+        spec_id=spec_row.id,
+        spec_hash=spec_row.spec_hash,
+        profile_hash=profile_row.profile_hash,
+        status=status,
+        canonical_json=canonical_json(report.model_dump(mode="json")),
+        confirmation_token=token,
+    )
+
+
+def publish_gate(
+    session: Session,
+    computation: GateComputation,
+    row_id: str | None = None,
+) -> GateResultRow:
+    row = GateResultRow(
+        spec_id=computation.spec_id,
+        spec_hash=computation.spec_hash,
+        profile_hash=computation.profile_hash,
+        status=computation.status,
+        canonical_json=computation.canonical_json,
+        confirmation_token=computation.confirmation_token,
+    )
+    if row_id is not None:
+        row.id = row_id
+    session.add(row)
+    session.flush()
+    return row
+
+
+def run_gate(
+    engine: Engine,
+    registry: DatasetRegistry,
+    spec_row_id: str,
+    before_publish: Callable[[], None] | None = None,
+) -> GateResultRow:
+    computation = compute_gate(engine, registry, spec_row_id)
     if before_publish is not None:
         before_publish()
     with session_scope(engine) as session:
-        row = GateResultRow(
-            spec_id=spec_row.id,
-            spec_hash=spec_row.spec_hash,
-            profile_hash=profile_row.profile_hash,
-            status=status,
-            canonical_json=canonical_json(report.model_dump(mode="json")),
-            confirmation_token=token,
-        )
-        session.add(row)
-        session.flush()
+        row = publish_gate(session, computation)
         row_id = row.id
     with Session(engine) as session:
         return session.get_one(GateResultRow, row_id)

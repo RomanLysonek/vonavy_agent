@@ -48,6 +48,7 @@
           <select id="target-availability"><option value="available_at_event_time">Available after event day</option><option value="column">Timestamp column</option></select>
         </label>
         <label>Target availability column<input id="target-availability-column" placeholder="Required only for column policy"></label>
+        <label>Product availability column<input id="observation-availability-column" placeholder="Optional boolean column; never interpreted as demand"></label>
         <label class="wide">Candidate features JSON
           <textarea id="features-json" rows="5">[
   {"name":"promotion","role":"known_future","availability":{"kind":"known_at_origin"}},
@@ -74,6 +75,9 @@
         <label>Test origin<input id="test-origin" type="date" required></label>
         <label>Evaluation as of<input id="evaluation-as-of" type="date" required></label>
         <label>Minimum coverage<input id="minimum-coverage" type="number" value="0.8" min="0" max="1" step="0.05"></label>
+        <label>Product availability scoring
+          <select id="scoring-availability-policy"><option value="assume_available">Assume available (no mapped column)</option><option value="available_only">Score available rows only</option><option value="require_available">Require every scoring row available</option></select>
+        </label>
         <fieldset class="wide models"><legend>Models</legend>
           <label><input type="checkbox" id="model-seasonal" checked> Same-weekday seasonal naive</label>
           <label><input type="checkbox" id="model-moving" checked> 28-day moving average</label>

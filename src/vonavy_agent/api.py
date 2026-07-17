@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -11,7 +11,7 @@ from typing import Annotated
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -27,7 +27,13 @@ from vonavy_agent.datasets import DatasetRegistry
 from vonavy_agent.domain import DatasetMappingSpec, ExperimentSpec
 from vonavy_agent.errors import AgentError
 from vonavy_agent.experiments import create_experiment_spec
-from vonavy_agent.jobs import enqueue_job, enqueue_run, request_cancellation
+from vonavy_agent.jobs import (
+    enqueue_export,
+    enqueue_job,
+    enqueue_run,
+    request_cancellation,
+)
+from vonavy_agent.managed_files import verified_managed_file
 from vonavy_agent.persistence import (
     DataProfile,
     Dataset,
@@ -40,7 +46,6 @@ from vonavy_agent.persistence import (
     RunMetric,
     create_db_engine,
     new_id,
-    session_scope,
 )
 from vonavy_agent.planner import confirm_proposal, propose_experiments
 from vonavy_agent.settings import Settings
@@ -391,19 +396,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.post("/api/exports")
-    def enqueue_export(request: ExportRequest) -> dict[str, object]:
+    def create_export_job(request: ExportRequest) -> dict[str, object]:
         export_id = new_id()
-        job = enqueue_job(
-            engine, "export", {"export_id": export_id, "run_ids": sorted(set(request.run_ids))}
-        )
-        with session_scope(engine) as session:
-            session.add(
-                Export(
-                    id=export_id,
-                    job_id=job.id,
-                    run_ids_json=json.dumps(sorted(set(request.run_ids))),
-                )
-            )
+        _, job = enqueue_export(engine, export_id, request.run_ids)
         return {"export_id": export_id, "job": _job_json(job)}
 
     @app.get("/api/exports/{export_id}")
@@ -421,16 +416,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
 
     @app.get("/api/exports/{export_id}/download")
-    def download_export(export_id: str) -> FileResponse:
+    def download_export(export_id: str) -> StreamingResponse:
         with Session(engine) as session:
             row = session.get(Export, export_id)
-            if row is None or not row.relative_path:
+            if row is None or not row.relative_path or not row.manifest_hash:
                 raise AgentError("export_not_ready", "Export is not ready", status_code=409)
-            path = (settings.managed_root / row.relative_path).resolve()
-        root = settings.managed_root.resolve()
-        if root not in path.parents or not path.is_file():
-            raise AgentError("export_missing", "Published export file is missing", status_code=500)
-        return FileResponse(path, filename=path.name, media_type="application/zip")
+            relative = Path(row.relative_path)
+            expected_hash = row.manifest_hash
+        verified = verified_managed_file(settings, relative, expected_hash)
+        handle = verified.__enter__()
+
+        def content() -> Iterator[bytes]:
+            try:
+                while chunk := handle.read(1024 * 1024):
+                    yield chunk
+            finally:
+                verified.__exit__(None, None, None)
+
+        return StreamingResponse(
+            content(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{relative.name}"'},
+        )
 
     web_root = Path(__file__).resolve().parent / "web"
     app.mount("/", StaticFiles(directory=web_root, html=True), name="web")

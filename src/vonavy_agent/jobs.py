@@ -14,13 +14,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import IO, Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session
 
 from vonavy_agent.domain import TERMINAL_JOB_STATES, JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json, file_hash
+from vonavy_agent.managed_files import verified_managed_file
 from vonavy_agent.persistence import (
     DataProfile,
     DatasetMapping,
@@ -31,6 +32,7 @@ from vonavy_agent.persistence import (
     Job,
     JobEvent,
     Run,
+    RunMetric,
     session_scope,
 )
 from vonavy_agent.settings import Settings
@@ -112,6 +114,35 @@ def enqueue_run(
         return session.get_one(Run, run_id), session.get_one(Job, job_id)
 
 
+def enqueue_export(
+    engine: Engine,
+    export_id: str,
+    run_ids: list[str],
+) -> tuple[Export, Job]:
+    unique_run_ids = sorted(set(run_ids))
+    with session_scope(engine) as session:
+        job = Job(kind="export", payload_json="{}")
+        session.add(job)
+        session.flush()
+        export = Export(
+            id=export_id,
+            job_id=job.id,
+            run_ids_json=canonical_json(unique_run_ids),
+        )
+        session.add(export)
+        job.payload_json = canonical_json({"export_id": export_id, "run_ids": unique_run_ids})
+        session.add(
+            JobEvent(
+                job_id=job.id,
+                from_state=None,
+                to_state=JobState.QUEUED.value,
+            )
+        )
+        job_id = job.id
+    with Session(engine) as session:
+        return session.get_one(Export, export_id), session.get_one(Job, job_id)
+
+
 def request_cancellation(engine: Engine, job_id: str, settings: Settings | None = None) -> Job:
     cancelled_while_queued = False
     for _ in range(3):
@@ -122,7 +153,7 @@ def request_cancellation(engine: Engine, job_id: str, settings: Settings | None 
             state = JobState(job.state)
             if state in TERMINAL_JOB_STATES:
                 raise AgentError("job_terminal", "Terminal jobs cannot be cancelled")
-            if state == JobState.PUBLISHING:
+            if state in {JobState.PUBLISHING, JobState.FINALIZING}:
                 raise AgentError(
                     "job_publishing",
                     "Job evidence is already being atomically published",
@@ -181,6 +212,7 @@ class Worker:
     def recover(self) -> None:
         now = datetime.utcnow()
         evidence: list[tuple[str, str, dict[str, Any]]] = []
+        stale_paths: list[Path] = []
         with session_scope(self.engine) as session:
             stale = session.scalars(
                 select(Job).where(
@@ -189,6 +221,7 @@ class Worker:
                             JobState.RUNNING.value,
                             JobState.CANCELLING.value,
                             JobState.PUBLISHING.value,
+                            JobState.FINALIZING.value,
                         ]
                     ),
                     Job.lease_expires_at < now,
@@ -202,23 +235,20 @@ class Worker:
                 values: dict[str, Any]
                 detail: dict[str, Any]
                 recovered_result = (
-                    self._publishing_result(session, job) if source == JobState.PUBLISHING else None
+                    self._publishing_result(session, job) if source == JobState.FINALIZING else None
                 )
                 if recovered_result is not None:
                     target = JobState.SUCCEEDED
-                    values = {
-                        "result_json": canonical_json(recovered_result),
-                        "error_json": None,
-                    }
-                    detail = {"reason": "recovered_published_result"}
+                    values = {"result_json": canonical_json(recovered_result)}
+                    detail = {"reason": "recovered_finalized_result"}
                 elif source == JobState.CANCELLING or job.cancel_requested:
                     target = JobState.CANCELLED
                     values = {}
                     detail = {"reason": "worker_interrupted"}
-                elif (
-                    job.attempt >= self.settings.worker_max_attempts
-                    or source == JobState.PUBLISHING
-                ):
+                elif job.attempt >= self.settings.worker_max_attempts or source in {
+                    JobState.PUBLISHING,
+                    JobState.FINALIZING,
+                }:
                     target = JobState.FAILED
                     error = {"code": "worker_interrupted", "attempts": job.attempt}
                     values = {"error_json": canonical_json(error)}
@@ -249,6 +279,8 @@ class Worker:
                 )
                 if changed.rowcount != 1:
                     continue
+                if target != JobState.SUCCEEDED:
+                    stale_paths.append(self.settings.managed_root / "jobs" / "tmp" / job.id / token)
                 session.add(
                     JobEvent(
                         job_id=job.id,
@@ -263,7 +295,10 @@ class Worker:
                     evidence.append((job.id, "failed", detail))
         for job_id, status, error in evidence:
             self._record_terminal_run(job_id, status, error)
+        for stale_path in stale_paths:
+            shutil.rmtree(stale_path, ignore_errors=True)
         self._repair_terminal_evidence()
+        self._repair_published_artifacts()
 
     def run_once(self) -> bool:
         claim = self._claim()
@@ -368,6 +403,7 @@ class Worker:
         stderr.start()
         started = time.monotonic()
         outcome: tuple[str, str, str] | None = None
+        finalised = False
         try:
             while process.poll() is None:
                 time.sleep(0.1)
@@ -377,9 +413,16 @@ class Worker:
                 if time.monotonic() - started > wall_seconds:
                     outcome = ("failed", "wall_timeout", f"Exceeded {wall_seconds} seconds")
                     break
-                if not self._heartbeat(claim):
+                if not finalised and not self._heartbeat(claim):
+                    with Session(self.engine) as session:
+                        state = session.get_one(Job, claim.job_id).state
+                    if state == JobState.SUCCEEDED.value:
+                        finalised = True
+                        continue
                     outcome = ("lost", "lease_lost", "Worker no longer owns the job lease")
                     break
+                if finalised:
+                    continue
                 with Session(self.engine) as session:
                     job = session.get_one(Job, claim.job_id)
                     if job.lease_token != claim.lease_token or job.worker_id != self.worker_id:
@@ -399,6 +442,9 @@ class Worker:
             stderr.join()
             process.stdout.close()
             process.stderr.close()
+        if stdout.overflow or stderr.overflow:
+            self._finish_failed(claim, "output_limit", "Executor output exceeded 1 MB")
+            return
         if outcome is not None:
             kind, code, message = outcome
             if kind == "cancelled":
@@ -456,6 +502,7 @@ class Worker:
                                 JobState.RUNNING.value,
                                 JobState.CANCELLING.value,
                                 JobState.PUBLISHING.value,
+                                JobState.FINALIZING.value,
                             ]
                         ),
                     )
@@ -473,14 +520,16 @@ class Worker:
             job = session.get_one(Job, claim.job_id)
             if not job.result_json:
                 raise AgentError("missing_job_result", "Publishing job did not persist a result")
-            self._owned_terminal(
+            transitioned = self._owned_terminal(
                 session,
                 claim,
-                {JobState.PUBLISHING},
+                {JobState.FINALIZING},
                 JobState.SUCCEEDED,
                 {},
                 {},
             )
+        if transitioned:
+            self._repair_published_artifacts()
 
     def _finish_cancelled(self, claim: Claim, code: str) -> None:
         transitioned = False
@@ -499,17 +548,59 @@ class Worker:
     def _finish_failed(self, claim: Claim, code: str, message: str) -> None:
         error = {"code": code, "message": message}
         transitioned = False
+        was_finalizing = False
         with session_scope(self.engine) as session:
+            was_finalizing = session.get_one(Job, claim.job_id).state == JobState.FINALIZING.value
             transitioned = self._owned_terminal(
                 session,
                 claim,
-                {JobState.RUNNING, JobState.CANCELLING, JobState.PUBLISHING},
+                {
+                    JobState.RUNNING,
+                    JobState.CANCELLING,
+                    JobState.PUBLISHING,
+                    JobState.FINALIZING,
+                },
                 JobState.FAILED,
                 {"error_json": canonical_json(error)},
                 error,
             )
         if transitioned:
+            if was_finalizing:
+                self._cleanup_visible_evidence(claim.job_id)
             self._record_terminal_run(claim.job_id, "failed", error)
+
+    def _cleanup_visible_evidence(self, job_id: str) -> None:
+        paths: list[Path] = []
+        with session_scope(self.engine) as session:
+            job = session.get_one(Job, job_id)
+            result = json.loads(job.result_json) if job.result_json else {}
+            if staging := result.get("staging_relative_path"):
+                paths.append(self.settings.managed_root / staging)
+            if job.kind == "profile" and result.get("profile_id"):
+                session.execute(delete(DataProfile).where(DataProfile.id == result["profile_id"]))
+            elif job.kind == "gate" and result.get("gate_result_id"):
+                session.execute(
+                    delete(GateResultRow).where(GateResultRow.id == result["gate_result_id"])
+                )
+            elif job.kind == "experiment":
+                run = session.get_one(Run, json.loads(job.payload_json)["run_id"])
+                session.execute(delete(RunMetric).where(RunMetric.run_id == run.id))
+                if run.artifact_relative_path:
+                    paths.append(self.settings.managed_root / run.artifact_relative_path)
+                run.artifact_relative_path = None
+                run.manifest_hash = None
+                run.summary_json = None
+            elif job.kind == "export":
+                export = session.get_one(Export, json.loads(job.payload_json)["export_id"])
+                if export.relative_path:
+                    paths.append(self.settings.managed_root / export.relative_path)
+                export.relative_path = None
+                export.manifest_hash = None
+        for path in paths:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
 
     def _owned_terminal(
         self,
@@ -558,20 +649,26 @@ class Worker:
 
     @staticmethod
     def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            process.wait()
-            return
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
+            if process.poll() is None:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGTERM)
+                    else:
+                        process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        if os.name == "posix":
+                            os.killpg(process.pid, signal.SIGKILL)
+                        else:
+                            process.kill()
+                    except ProcessLookupError:
+                        pass
+        finally:
             process.wait()
 
     def _publishing_result(self, session: Session, job: Job) -> dict[str, Any] | None:
@@ -619,6 +716,63 @@ class Worker:
             if gate_row is not None:
                 return {"gate_result_id": gate_row.id}
         return None
+
+    def _repair_published_artifacts(self) -> None:
+        with Session(self.engine) as session:
+            jobs = session.scalars(
+                select(Job).where(
+                    Job.state == JobState.SUCCEEDED.value,
+                    Job.result_json.is_not(None),
+                )
+            ).all()
+            repairs: list[tuple[Path, Path, str]] = []
+            for job in jobs:
+                result = json.loads(job.result_json or "{}")
+                staging = result.get("staging_relative_path")
+                if not isinstance(staging, str):
+                    continue
+                staging_path = self.settings.managed_root / staging
+                if job.kind == "experiment":
+                    run = session.get_one(Run, json.loads(job.payload_json)["run_id"])
+                    if run.artifact_relative_path and run.manifest_hash:
+                        repairs.append(
+                            (
+                                staging_path,
+                                self.settings.managed_root / run.artifact_relative_path,
+                                run.manifest_hash,
+                            )
+                        )
+                elif job.kind == "export":
+                    export = session.get_one(Export, json.loads(job.payload_json)["export_id"])
+                    if export.relative_path and export.manifest_hash:
+                        repairs.append(
+                            (
+                                staging_path,
+                                self.settings.managed_root / export.relative_path,
+                                export.manifest_hash,
+                            )
+                        )
+        for staging, final, expected_hash in repairs:
+            if not final.exists() and staging.exists():
+                final.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(staging, final)
+            if final.is_dir():
+                relative = final.relative_to(self.settings.managed_root)
+                with verified_managed_file(
+                    self.settings,
+                    relative / "manifest.json",
+                    expected_hash,
+                ):
+                    pass
+            else:
+                relative = final.relative_to(self.settings.managed_root)
+                with verified_managed_file(self.settings, relative, expected_hash):
+                    pass
+            if staging.exists():
+                if staging.is_dir():
+                    shutil.rmtree(staging, ignore_errors=True)
+                else:
+                    staging.unlink(missing_ok=True)
 
     def _repair_terminal_evidence(self) -> None:
         with Session(self.engine) as session:

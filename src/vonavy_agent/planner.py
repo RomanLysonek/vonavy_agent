@@ -62,7 +62,7 @@ def propose_experiments(engine: Engine, spec_id: str) -> PlannerProposal:
             }
         )
     active_features = list(spec.selected_features())
-    if active_features:
+    if active_features and any(model.kind == "ridge_direct" for model in spec.models):
         ablated = spec.model_copy(update={"feature_allow_list": ()})
         proposals.append(
             {

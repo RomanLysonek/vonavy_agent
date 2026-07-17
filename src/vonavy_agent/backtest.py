@@ -27,7 +27,7 @@ from sqlalchemy import delete
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from vonavy_agent.datasets import DatasetRegistry
+from vonavy_agent.datasets import DatasetRegistry, observation_availability
 from vonavy_agent.domain import (
     AvailabilityKind,
     DatasetMappingSpec,
@@ -48,7 +48,6 @@ from vonavy_agent.persistence import (
     Job,
     Run,
     RunMetric,
-    session_scope,
 )
 from vonavy_agent.settings import Settings
 
@@ -62,6 +61,15 @@ class PreparedData:
     frame: pd.DataFrame
     mapping: DatasetMappingSpec
     spec: ExperimentSpec
+
+
+@dataclass(frozen=True)
+class StagedRun:
+    summary: dict[str, Any]
+    staging_dir: Path
+    final_dir: Path
+    manifest_hash: str
+    already_visible: bool = False
 
 
 def _prepare_data(
@@ -83,6 +91,9 @@ def _prepare_data(
     frame["_target"] = pd.to_numeric(frame[mapping.target_column], errors="raise").astype(float)
     frame["_target_available"] = _availability_series(
         frame, mapping.target_availability.kind, mapping.target_availability.column
+    )
+    frame["_observation_available"] = observation_availability(
+        frame, mapping.observation_availability_column
     )
     frame = frame.sort_values(["_entity", "_date"], kind="stable").reset_index(drop=True)
     return PreparedData(frame=frame, mapping=mapping, spec=spec)
@@ -113,7 +124,13 @@ def _eligible_target(
     row: pd.Series | None,
     cutoff: pd.Timestamp,
 ) -> float | None:
-    if row is None or pd.isna(row["_target"]) or row["_target_available"] > cutoff:
+    if (
+        row is None
+        or pd.isna(row["_target"])
+        or row["_target_available"] > cutoff
+        or pd.isna(row["_observation_available"])
+        or not bool(row["_observation_available"])
+    ):
         return None
     return float(row["_target"])
 
@@ -428,9 +445,10 @@ def run_backtest(
     settings: Settings,
     job_id: str,
     run_id: str,
+    stage_key: str,
     ownership_check: Callable[[], None] | None = None,
     before_publish: Callable[[], None] | None = None,
-) -> dict[str, Any]:
+) -> StagedRun:
     registry = DatasetRegistry(settings, engine)
     with Session(engine) as session:
         run = session.get_one(Run, run_id)
@@ -447,12 +465,14 @@ def run_backtest(
             raise AgentError("invalid_summary", "Published run summary must be a JSON object")
         if before_publish is not None:
             before_publish()
-        _persist_run(engine, run_id, final_dir, result)
-        return cast(dict[str, Any], result)
-    attempt = 0
-    with Session(engine) as session:
-        attempt = session.get_one(Job, job_id).attempt
-    temp_dir = settings.managed_root / "jobs" / "tmp" / job_id / str(attempt)
+        return StagedRun(
+            summary=cast(dict[str, Any], result),
+            staging_dir=final_dir,
+            final_dir=final_dir,
+            manifest_hash=file_hash(final_dir / "manifest.json"),
+            already_visible=True,
+        )
+    temp_dir = settings.managed_root / "jobs" / "tmp" / job_id / stage_key / "run"
     shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True)
     started = time.monotonic()
@@ -462,7 +482,6 @@ def run_backtest(
     expected_rows = {"calibration": 0, "test": 0}
     expected_origins: dict[tuple[str, str], int] = {}
     expected_horizons: dict[tuple[str, int], int] = {}
-    entity_count = int(prepared.frame["_entity"].nunique())
     for origin_spec in spec.origins:
         if ownership_check is not None:
             ownership_check()
@@ -470,13 +489,22 @@ def run_backtest(
             with Session(engine) as session:
                 if session.get_one(Job, job_id).cancel_requested:
                     raise RunCancelled
-        expected_rows[origin_spec.role] += entity_count * spec.horizon_days
-        expected_origins[(origin_spec.role, origin_spec.date.isoformat())] = (
-            entity_count * spec.horizon_days
-        )
+        origin_expected = 0
         for expected_horizon in range(1, spec.horizon_days + 1):
+            forecast_date = date.fromordinal(origin_spec.date.toordinal() + expected_horizon - 1)
+            horizon_expected = 0
+            for entity in sorted(str(value) for value in prepared.frame["_entity"].unique()):
+                actual_row = lookup.get((entity, forecast_date))
+                if actual_row is None:
+                    continue
+                observed = bool(actual_row["_observation_available"])
+                if spec.scoring_availability_policy != "available_only" or observed:
+                    horizon_expected += 1
+            expected_rows[origin_spec.role] += horizon_expected
+            origin_expected += horizon_expected
             key = (origin_spec.role, expected_horizon)
-            expected_horizons[key] = expected_horizons.get(key, 0) + entity_count
+            expected_horizons[key] = expected_horizons.get(key, 0) + horizon_expected
+        expected_origins[(origin_spec.role, origin_spec.date.isoformat())] = origin_expected
         for seed in spec.seeds:
             for model in spec.models:
                 for horizon in range(1, spec.horizon_days + 1):
@@ -493,9 +521,11 @@ def run_backtest(
                         actual_row = lookup.get((entity, forecast_date))
                         if actual_row is None:
                             continue
-                        if actual_row["_target_available"] > pd.Timestamp(
-                            spec.evaluation_as_of
-                        ).tz_localize(None):
+                        actual = _eligible_target(
+                            actual_row,
+                            pd.Timestamp(spec.evaluation_as_of).tz_localize(None),
+                        )
+                        if actual is None:
                             continue
                         predictions.append(
                             {
@@ -507,7 +537,7 @@ def run_backtest(
                                 "date": forecast_date.isoformat(),
                                 "model": model.kind,
                                 "prediction": prediction,
-                                "actual": float(actual_row["_target"]),
+                                "actual": actual,
                             }
                         )
     prediction_frame = pd.DataFrame(
@@ -525,7 +555,7 @@ def run_backtest(
         ],
     )
     configured_models = tuple(sorted(model.kind for model in spec.models))
-    metric_records = _metric_records(
+    internal_metric_records = _metric_records(
         prediction_frame,
         expected_rows,
         expected_origins,
@@ -535,7 +565,7 @@ def run_backtest(
     )
     runtime = time.monotonic() - started
     for model_name in sorted({configured.kind for configured in spec.models}):
-        metric_records.append(
+        internal_metric_records.append(
             {
                 "role": "all",
                 "model": model_name,
@@ -549,20 +579,35 @@ def run_backtest(
                 "unsupported_reason": None,
             }
         )
+    public_metric_records = [
+        record for record in internal_metric_records if record["metric"] in spec.metrics
+    ]
+    diagnostic_coverage = [
+        {
+            "role": record["role"],
+            "model": record["model"],
+            "seed": record["seed"],
+            "rows": record["row_count"],
+            "coverage": record["coverage"],
+        }
+        for record in internal_metric_records
+        if record["metric"] == "coverage" and record["origin"] is None and record["horizon"] is None
+    ]
     summary = {
         "schema_version": "1.0",
         "run_id": run_id,
         "expected_rows": expected_rows,
         "prediction_rows": len(prediction_frame),
         "configured_models": list(configured_models),
-        "metrics": metric_records,
+        "metrics": public_metric_records,
+        "diagnostics": {"common_row_coverage": diagnostic_coverage},
         "runtime_seconds": runtime,
     }
     (temp_dir / "spec.json").write_text(spec_row.canonical_json, encoding="utf-8")
     (temp_dir / "gate.json").write_text(gate_row.canonical_json, encoding="utf-8")
     (temp_dir / "profile.json").write_text(profile_row.canonical_json, encoding="utf-8")
     prediction_frame.to_parquet(temp_dir / "predictions.parquet", index=False)
-    (temp_dir / "metrics.json").write_text(canonical_json(metric_records), encoding="utf-8")
+    (temp_dir / "metrics.json").write_text(canonical_json(public_metric_records), encoding="utf-8")
     (temp_dir / "summary.json").write_text(canonical_json(summary), encoding="utf-8")
     environment = _environment(settings)
     (temp_dir / "environment.json").write_text(canonical_json(environment), encoding="utf-8")
@@ -595,10 +640,12 @@ def run_backtest(
     (temp_dir / "manifest.json").write_text(canonical_json(manifest), encoding="utf-8")
     if before_publish is not None:
         before_publish()
-    final_dir.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(temp_dir, final_dir)
-    _persist_run(engine, run_id, final_dir, summary)
-    return summary
+    return StagedRun(
+        summary=summary,
+        staging_dir=temp_dir,
+        final_dir=final_dir,
+        manifest_hash=file_hash(temp_dir / "manifest.json"),
+    )
 
 
 def _dataset_hash(engine: Engine, version_id: str) -> str:
@@ -708,13 +755,16 @@ def _source_tree_hash(paths: list[str]) -> str | None:
     return digest.hexdigest()
 
 
-def _persist_run(engine: Engine, run_id: str, final_dir: Path, summary: dict[str, Any]) -> None:
-    manifest_hash = file_hash(final_dir / "manifest.json")
-    with session_scope(engine) as session:
-        run = session.get_one(Run, run_id)
-        run.artifact_relative_path = str(Path("runs") / run_id)
-        run.manifest_hash = manifest_hash
-        run.summary_json = canonical_json(summary)
-        session.execute(delete(RunMetric).where(RunMetric.run_id == run_id))
-        for record in summary["metrics"]:
-            session.add(RunMetric(run_id=run_id, **record))
+def persist_run(
+    session: Session,
+    run_id: str,
+    manifest_hash: str,
+    summary: dict[str, Any],
+) -> None:
+    run = session.get_one(Run, run_id)
+    run.artifact_relative_path = str(Path("runs") / run_id)
+    run.manifest_hash = manifest_hash
+    run.summary_json = canonical_json(summary)
+    session.execute(delete(RunMetric).where(RunMetric.run_id == run_id))
+    for record in summary["metrics"]:
+        session.add(RunMetric(run_id=run_id, **record))

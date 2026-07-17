@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
-import tempfile
+from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 from pydantic import Field, model_validator
 from sqlalchemy.engine import Engine
@@ -14,7 +12,8 @@ from sqlalchemy.orm import Session
 
 from vonavy_agent.domain import ExperimentSpec, StrictModel
 from vonavy_agent.errors import AgentError
-from vonavy_agent.hashing import canonical_json, file_hash
+from vonavy_agent.hashing import canonical_json
+from vonavy_agent.managed_files import publish_bytes
 from vonavy_agent.persistence import AdapterSnapshot, session_scope
 from vonavy_agent.settings import Settings
 
@@ -129,55 +128,56 @@ def dry_run_invocation(
 def import_adapter_snapshot(
     engine: Engine,
     settings: Settings,
-    stream: object,
+    stream: BinaryIO,
     original_name: str,
 ) -> AdapterSnapshot:
     if Path(original_name).name != original_name or Path(original_name).suffix.lower() != ".json":
         raise AgentError("invalid_snapshot_name", "Adapter snapshots must be plain JSON basenames")
-    temp_root = settings.managed_root / "jobs" / "tmp"
-    fd, temp_name = tempfile.mkstemp(prefix="adapter-", suffix=".json", dir=temp_root)
-    path = Path(temp_name)
+    content = bytearray()
+    while chunk := stream.read(1024 * 1024):
+        content.extend(chunk)
+        if len(content) > min(settings.max_upload_bytes, 10 * 1024 * 1024):
+            raise AgentError("snapshot_too_large", "Adapter snapshot exceeds 10 MB")
     try:
-        with os.fdopen(fd, "wb") as output:
-            total = 0
-            while chunk := stream.read(1024 * 1024):  # type: ignore[attr-defined]
-                total += len(chunk)
-                if total > min(settings.max_upload_bytes, 10 * 1024 * 1024):
-                    raise AgentError("snapshot_too_large", "Adapter snapshot exceeds 10 MB")
-                output.write(chunk)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise AgentError("invalid_snapshot_json", f"Invalid adapter snapshot: {exc}") from exc
-        kind = payload.get("manifest_kind")
-        parsed: CapabilityManifest | ExternalResultManifest
-        if kind == "capability":
-            parsed = CapabilityManifest.model_validate(payload)
-        elif kind == "result":
-            parsed = ExternalResultManifest.model_validate(payload)
-        else:
-            raise AgentError("unknown_manifest_kind", "Unknown adapter manifest kind")
-        sha256 = file_hash(path)
-        destination = settings.managed_root / "imports" / f"{sha256}.json"
-        if not destination.exists():
-            staging = destination.with_suffix(".tmp")
-            shutil.copyfile(path, staging)
-            os.replace(staging, destination)
-        with session_scope(engine) as session:
-            row = AdapterSnapshot(
-                adapter_kind=parsed.adapter_kind,
-                manifest_kind=parsed.manifest_kind,
-                schema_version=parsed.schema_version,
-                source_sha256=sha256,
-                canonical_json=canonical_json(parsed.model_dump(mode="json")),
-            )
-            session.add(row)
-            session.flush()
-            row_id = row.id
-        with Session(engine) as session:
-            return session.get_one(AdapterSnapshot, row_id)
-    finally:
-        path.unlink(missing_ok=True)
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise AgentError("invalid_snapshot_json", f"Invalid adapter snapshot: {exc}") from exc
+    kind = payload.get("manifest_kind")
+    parsed: CapabilityManifest | ExternalResultManifest
+    if kind == "capability":
+        parsed = CapabilityManifest.model_validate(payload)
+    elif kind == "result":
+        parsed = ExternalResultManifest.model_validate(payload)
+    else:
+        raise AgentError("unknown_manifest_kind", "Unknown adapter manifest kind")
+    source_hash = sha256(content).hexdigest()
+    try:
+        publish_bytes(
+            settings,
+            Path("imports"),
+            f"{source_hash}.json",
+            bytes(content),
+            source_hash,
+        )
+    except OSError as exc:
+        raise AgentError(
+            "adapter_snapshot_integrity",
+            "Adapter snapshot destination is not a safe managed file",
+            status_code=500,
+        ) from exc
+    with session_scope(engine) as session:
+        row = AdapterSnapshot(
+            adapter_kind=parsed.adapter_kind,
+            manifest_kind=parsed.manifest_kind,
+            schema_version=parsed.schema_version,
+            source_sha256=source_hash,
+            canonical_json=canonical_json(parsed.model_dump(mode="json")),
+        )
+        session.add(row)
+        session.flush()
+        row_id = row.id
+    with Session(engine) as session:
+        return session.get_one(AdapterSnapshot, row_id)
 
 
 def adapter_capabilities(engine: Engine) -> list[dict[str, object]]:

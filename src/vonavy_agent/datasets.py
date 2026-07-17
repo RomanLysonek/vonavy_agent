@@ -7,6 +7,7 @@ import stat
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from hashlib import sha256 as new_sha256
 from itertools import pairwise
 from pathlib import Path
@@ -63,6 +64,16 @@ def _read_frame(path: Path, media_type: str) -> pd.DataFrame:
         return pd.read_csv(path, encoding="utf-8")
     except (OSError, UnicodeError, pd.errors.ParserError) as exc:
         raise AgentError("invalid_csv", f"Could not read UTF-8 CSV: {exc}") from exc
+
+
+def observation_availability(frame: pd.DataFrame, column: str | None) -> pd.Series:
+    if column is None:
+        return pd.Series(True, index=frame.index, dtype="boolean")
+    values = frame[column]
+    if pd.api.types.is_bool_dtype(values):
+        return values.astype("boolean")
+    normalised = values.astype("string").str.strip().str.lower()
+    return normalised.map({"true": True, "false": False, "1": True, "0": False}).astype("boolean")
 
 
 class DatasetRegistry:
@@ -420,6 +431,8 @@ class DatasetRegistry:
             required = {mapping.timestamp_column, mapping.target_column}
             if mapping.entity_column:
                 required.add(mapping.entity_column)
+            if mapping.observation_availability_column:
+                required.add(mapping.observation_availability_column)
             required.update(feature.name for feature in mapping.features)
             for availability in [
                 mapping.target_availability,
@@ -447,14 +460,20 @@ class DatasetRegistry:
             return session.get_one(DatasetMapping, row_id)
 
 
-def build_profile(
+@dataclass(frozen=True)
+class ProfileComputation:
+    dataset_version_id: str
+    mapping_id: str
+    profile_hash: str
+    canonical_json: str
+
+
+def compute_profile(
     registry: DatasetRegistry,
     version_id: str,
     mapping_id: str,
     max_categories: int,
-    before_publish: Callable[[], None] | None = None,
-) -> DataProfile:
-
+) -> ProfileComputation:
     with Session(registry.engine) as session:
         mapping_row = session.get(DatasetMapping, mapping_id)
         if mapping_row is None or mapping_row.dataset_version_id != version_id:
@@ -500,7 +519,7 @@ def build_profile(
     missingness = {name: int(frame[name].isna().sum()) for name in frame.columns}
     for name in frame.columns:
         series = frame[name]
-        if pd.api.types.is_numeric_dtype(series):
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
             numeric_series = pd.to_numeric(series, errors="coerce")
             nonfinite = numeric_series.notna() & ~np.isfinite(numeric_series)
             finite = numeric_series[np.isfinite(numeric_series)].dropna()
@@ -558,6 +577,18 @@ def build_profile(
             }
         else:
             availability_lags[name] = {"policy": policy.kind.value}
+    observed = observation_availability(frame, mapping.observation_availability_column)
+    observation_profile = {
+        "column": mapping.observation_availability_column,
+        "assumption": (
+            "explicit_column"
+            if mapping.observation_availability_column
+            else "all_rows_product_available"
+        ),
+        "available_rows": int(observed.eq(True).sum()),
+        "unavailable_rows": int(observed.eq(False).sum()),
+        "invalid_rows": int(observed.isna().sum()),
+    }
     profile = {
         "schema_version": "1.0",
         "dataset_version_id": version_id,
@@ -581,19 +612,47 @@ def build_profile(
         "numeric": numeric,
         "categorical": categorical,
         "availability_lags": availability_lags,
+        "observation_availability": observation_profile,
     }
     profile_hash = canonical_hash(profile)
+    return ProfileComputation(
+        dataset_version_id=version_id,
+        mapping_id=mapping_id,
+        profile_hash=profile_hash,
+        canonical_json=canonical_json(profile),
+    )
+
+
+def publish_profile(
+    session: Session,
+    computation: ProfileComputation,
+    row_id: str | None = None,
+) -> DataProfile:
+    row = DataProfile(
+        dataset_version_id=computation.dataset_version_id,
+        mapping_id=computation.mapping_id,
+        profile_hash=computation.profile_hash,
+        canonical_json=computation.canonical_json,
+    )
+    if row_id is not None:
+        row.id = row_id
+    session.add(row)
+    session.flush()
+    return row
+
+
+def build_profile(
+    registry: DatasetRegistry,
+    version_id: str,
+    mapping_id: str,
+    max_categories: int,
+    before_publish: Callable[[], None] | None = None,
+) -> DataProfile:
+    computation = compute_profile(registry, version_id, mapping_id, max_categories)
     if before_publish is not None:
         before_publish()
     with session_scope(registry.engine) as session:
-        row = DataProfile(
-            dataset_version_id=version_id,
-            mapping_id=mapping_id,
-            profile_hash=profile_hash,
-            canonical_json=canonical_json(profile),
-        )
-        session.add(row)
-        session.flush()
+        row = publish_profile(session, computation)
         row_id = row.id
     with Session(registry.engine) as session:
         return session.get_one(DataProfile, row_id)

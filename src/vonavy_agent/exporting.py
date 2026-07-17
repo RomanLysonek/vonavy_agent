@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,41 +15,57 @@ from sqlalchemy.orm import Session
 
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json, file_hash
-from vonavy_agent.persistence import (
-    ExperimentSpecRow,
-    GateResultRow,
-    Run,
-)
+from vonavy_agent.managed_files import verified_managed_file
+from vonavy_agent.persistence import ExperimentSpecRow, GateResultRow, Run
 from vonavy_agent.settings import Settings
 
 
-def create_static_export(
+@dataclass(frozen=True)
+class StagedExport:
+    result: dict[str, Any]
+    staging_path: Path
+    final_path: Path
+
+
+def safe_embedded_json(value: str) -> str:
+    return value.replace("<", "\\u003c")
+
+
+def stage_static_export(
     engine: Engine,
     settings: Settings,
     export_id: str,
     run_ids: list[str],
-    before_publish: Callable[[], None] | None = None,
-) -> dict[str, Any]:
+    stage_dir: Path,
+) -> StagedExport:
     reports: list[dict[str, Any]] = []
     with Session(engine) as session:
         for run_id in sorted(set(run_ids)):
             run = session.get(Run, run_id)
-            if run is None or not run.summary_json or not run.artifact_relative_path:
+            if (
+                run is None
+                or not run.summary_json
+                or not run.artifact_relative_path
+                or not run.manifest_hash
+            ):
                 raise AgentError(
-                    "run_not_exportable", f"Run {run_id} is not a successful published run"
+                    "run_not_exportable",
+                    f"Run {run_id} is not a successful published run",
                 )
             spec = session.get_one(ExperimentSpecRow, run.spec_id)
             gate = session.get_one(GateResultRow, run.gate_result_id)
-            artifact = settings.managed_root / run.artifact_relative_path
+            manifest_relative = Path(run.artifact_relative_path) / "manifest.json"
+            with verified_managed_file(
+                settings, manifest_relative, run.manifest_hash
+            ) as manifest_handle:
+                manifest = json.load(manifest_handle)
             reports.append(
                 {
                     "run_id": run.id,
                     "summary": json.loads(run.summary_json),
                     "spec": json.loads(spec.canonical_json),
                     "gate": json.loads(gate.canonical_json),
-                    "manifest": json.loads(
-                        (artifact / "manifest.json").read_text(encoding="utf-8")
-                    ),
+                    "manifest": manifest,
                 }
             )
     report = {
@@ -56,19 +74,17 @@ def create_static_export(
         "runs": reports,
         "limitations": [
             "Calibration evidence is for development selection; test evidence is audit-only.",
-            "Coverage is based on rows common to every compared model.",
+            "Coverage is based on rows common to every compared model and the explicit product-availability scoring policy.",
             "Unlabelled anomaly outputs, when imported, are exceedance/alert rates, not false-alarm rates.",
             "Chronos is not executed by this built-in vertical slice.",
         ],
     }
-    export_dir = settings.managed_root / "exports"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(tempfile.mkdtemp(prefix=f"{export_id}-", dir=export_dir))
-    try:
-        report_json = canonical_json(report)
-        (work_dir / "report.json").write_text(report_json, encoding="utf-8")
-        embedded = report_json.replace("</", "<\\/")
-        document = f"""<!doctype html>
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True)
+    report_json = canonical_json(report)
+    (stage_dir / "report.json").write_text(report_json, encoding="utf-8")
+    embedded = safe_embedded_json(report_json)
+    document = f"""<!doctype html>
 <html lang="en-GB">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -96,36 +112,55 @@ for(const r of rows){{const tr=el("tr");for(const x of [r.model,r.metric,r.value
 c.append(el("h3","Provenance"));c.append(el("code",JSON.stringify(run.manifest.source)));root.append(c)}}
 const limits=el("section",undefined,"card");limits.append(el("h2","Limitations"));const ul=el("ul");for(const x of d.limitations)ul.append(el("li",x));limits.append(ul);root.append(limits);
 </script></body></html>"""
-        (work_dir / "index.html").write_text(document, encoding="utf-8")
-        manifest = {
-            "schema_version": "1.0",
-            "export_id": export_id,
-            "run_ids": sorted(set(run_ids)),
-            "outputs": {
-                name: {
-                    "sha256": file_hash(work_dir / name),
-                    "bytes": (work_dir / name).stat().st_size,
-                }
-                for name in ("index.html", "report.json")
-            },
-        }
-        (work_dir / "manifest.json").write_text(canonical_json(manifest), encoding="utf-8")
-        zip_temp = export_dir / f".{export_id}.tmp"
-        with zipfile.ZipFile(zip_temp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for name in ("index.html", "report.json", "manifest.json"):
-                archive.write(work_dir / name, arcname=name)
-        final = export_dir / f"experiment-agent-report-{export_id}.zip"
-        if before_publish is not None:
-            before_publish()
-        os.replace(zip_temp, final)
-        return {
-            "export_id": export_id,
-            "relative_path": str(Path("exports") / final.name),
-            "sha256": file_hash(final),
-            "bytes": final.stat().st_size,
-            "manifest": manifest,
-        }
-    finally:
-        import shutil
+    (stage_dir / "index.html").write_text(document, encoding="utf-8")
+    manifest = {
+        "schema_version": "1.0",
+        "export_id": export_id,
+        "run_ids": sorted(set(run_ids)),
+        "outputs": {
+            name: {
+                "sha256": file_hash(stage_dir / name),
+                "bytes": (stage_dir / name).stat().st_size,
+            }
+            for name in ("index.html", "report.json")
+        },
+    }
+    (stage_dir / "manifest.json").write_text(canonical_json(manifest), encoding="utf-8")
+    staging_zip = stage_dir / "report.zip"
+    with zipfile.ZipFile(staging_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in ("index.html", "report.json", "manifest.json"):
+            archive.write(stage_dir / name, arcname=name)
+    final_path = settings.managed_root / "exports" / f"experiment-agent-report-{export_id}.zip"
+    result = {
+        "export_id": export_id,
+        "relative_path": str(Path("exports") / final_path.name),
+        "staging_relative_path": str(staging_zip.relative_to(settings.managed_root)),
+        "sha256": file_hash(staging_zip),
+        "bytes": staging_zip.stat().st_size,
+        "manifest": manifest,
+    }
+    return StagedExport(result=result, staging_path=staging_zip, final_path=final_path)
 
-        shutil.rmtree(work_dir, ignore_errors=True)
+
+def create_static_export(
+    engine: Engine,
+    settings: Settings,
+    export_id: str,
+    run_ids: list[str],
+    before_publish: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    stage_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"direct-export-{export_id}-",
+            dir=settings.managed_root / "jobs" / "tmp",
+        )
+    )
+    staged = stage_static_export(engine, settings, export_id, run_ids, stage_dir)
+    if before_publish is not None:
+        before_publish()
+    staged.final_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staged.staging_path, staged.final_path)
+    result = dict(staged.result)
+    result.pop("staging_relative_path", None)
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    return result

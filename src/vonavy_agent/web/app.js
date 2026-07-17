@@ -50,6 +50,7 @@ $("mapping-form").addEventListener("submit",async event=>{
       target_column:$("target-column").value,
       frequency:"D",
       target_availability:targetAvailability,
+      observation_availability_column:$("observation-availability-column").value||null,
       features:JSON.parse($("features-json").value)
     };
     state.mapping=await api(`/api/dataset-versions/${state.version.id}/mappings`,jsonOptions(mapping));
@@ -88,6 +89,7 @@ $("spec-form").addEventListener("submit",async event=>{
       models,seeds:[42],
       metrics:["wape","mae","rmse","bias","coverage","runtime"],
       evaluation_as_of:`${$("evaluation-as-of").value}T23:59:59Z`,minimum_coverage:Number($("minimum-coverage").value),
+      scoring_availability_policy:$("scoring-availability-policy").value,
       resources:{max_rows:500000,max_entities:5000,max_origins:50,max_models:3,wall_seconds:900,memory_mb:4096,threads:1}
     };
     state.spec=await api("/api/specs",jsonOptions(spec));

@@ -66,16 +66,26 @@ class DatasetMappingSpec(StrictModel):
     target_column: str
     frequency: Literal["D"] = "D"
     target_availability: AvailabilityPolicy
+    observation_availability_column: str | None = None
     features: tuple[FeatureMapping, ...] = ()
 
     @model_validator(mode="after")
     def unique_columns(self) -> DatasetMappingSpec:
+        if self.target_availability.kind not in {
+            AvailabilityKind.COLUMN,
+            AvailabilityKind.EVENT_TIME,
+        }:
+            raise ValueError(
+                "target availability must be event-time or an explicit known-at column"
+            )
         feature_names = [feature.name for feature in self.features]
         if len(feature_names) != len(set(feature_names)):
             raise ValueError("feature names must be unique")
         reserved = {self.timestamp_column, self.target_column}
         if self.entity_column:
             reserved.add(self.entity_column)
+        if self.observation_availability_column:
+            reserved.add(self.observation_availability_column)
         if reserved.intersection(feature_names):
             raise ValueError("timestamp, entity, and target columns cannot also be features")
         return self
@@ -147,6 +157,9 @@ class ExperimentSpec(StrictModel):
     target_column: str
     features: tuple[FeatureMapping, ...] = ()
     feature_allow_list: tuple[str, ...] | None = None
+    scoring_availability_policy: Literal[
+        "assume_available", "available_only", "require_available"
+    ] = "assume_available"
     models: tuple[ModelConfig, ...]
     seeds: tuple[Annotated[int, Field(ge=0, le=2**31 - 1)], ...] = (42,)
     metrics: tuple[Literal["wape", "mae", "rmse", "bias", "coverage", "runtime"], ...] = (
@@ -247,6 +260,7 @@ class JobState(StrEnum):
     RUNNING = "running"
     CANCELLING = "cancelling"
     PUBLISHING = "publishing"
+    FINALIZING = "finalizing"
     CANCELLED = "cancelled"
     SUCCEEDED = "succeeded"
     FAILED = "failed"

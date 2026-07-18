@@ -282,11 +282,7 @@ class DatasetRegistry:
         if mode == "append":
             with Session(self.engine) as session:
                 parent = session.get(DatasetVersion, parent_version_id)
-                if (
-                    parent is None
-                    or parent.dataset_id != dataset_id
-                    or parent.owner_id != owner_id
-                ):
+                if parent is None or parent.dataset_id != dataset_id or parent.owner_id != owner_id:
                     raise AgentError(
                         "invalid_parent", "Append parent does not belong to the dataset"
                     )

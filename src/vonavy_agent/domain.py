@@ -359,7 +359,7 @@ RunSpec: TypeAlias = Annotated[
     EvaluationSpec | ForecastSpec | InferenceSpec,
     Field(discriminator="mode"),
 ]
-RUN_SPEC_ADAPTER = TypeAdapter(RunSpec)
+RUN_SPEC_ADAPTER: TypeAdapter[RunSpec] = TypeAdapter(RunSpec)
 
 
 def parse_run_spec(payload: object) -> RunSpec:

@@ -14,7 +14,6 @@ from vonavy_agent.errors import AgentError
 from vonavy_agent.experiments import create_experiment_spec
 from vonavy_agent.hashing import canonical_hash, canonical_json
 from vonavy_agent.identity import LOCAL_OWNER_ID
-from vonavy_agent.policy import ResourcePolicy
 from vonavy_agent.persistence import (
     DataProfile,
     ExperimentSpecRow,
@@ -24,6 +23,7 @@ from vonavy_agent.persistence import (
     RunMetric,
     session_scope,
 )
+from vonavy_agent.policy import ResourcePolicy
 
 
 def propose_experiments(
@@ -119,10 +119,7 @@ def propose_experiments(
                     "spec": window_spec.model_dump(mode="json"),
                 }
             )
-    capabilities = {
-        item["adapter_kind"]: item
-        for item in adapter_capabilities(engine, owner_id)
-    }
+    capabilities = {item["adapter_kind"]: item for item in adapter_capabilities(engine, owner_id)}
     anomaly = capabilities["anomaly"]
     if anomaly["available"] and len(proposals) < 3:
         proposals.append(

@@ -316,9 +316,7 @@ def create_app(
                 raise AgentError(
                     "spec_not_found", "Experiment spec does not exist", status_code=404
                 )
-        return _job_json(
-            enqueue_job(engine, "gate", {"spec_id": spec_id}, identity.owner_id)
-        )
+        return _job_json(enqueue_job(engine, "gate", {"spec_id": spec_id}, identity.owner_id))
 
     @app.get("/api/gates/{gate_id}")
     def get_gate(gate_id: str, identity: Identity) -> dict[str, object]:
@@ -343,9 +341,7 @@ def create_app(
     def list_runs(identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             runs = session.scalars(
-                select(Run)
-                .where(Run.owner_id == identity.owner_id)
-                .order_by(Run.created_at.desc())
+                select(Run).where(Run.owner_id == identity.owner_id).order_by(Run.created_at.desc())
             ).all()
             jobs = {
                 job.id: job
@@ -376,9 +372,7 @@ def create_app(
 
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str, identity: Identity) -> dict[str, object]:
-        return _job_json(
-            request_cancellation(engine, job_id, settings, identity.owner_id)
-        )
+        return _job_json(request_cancellation(engine, job_id, settings, identity.owner_id))
 
     @app.post("/api/comparisons")
     def comparison(request: ComparisonRequest, identity: Identity) -> dict[str, object]:

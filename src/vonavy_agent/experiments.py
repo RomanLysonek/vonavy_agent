@@ -22,7 +22,6 @@ from vonavy_agent.eligibility import expected_grid
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_hash, canonical_json
 from vonavy_agent.identity import LOCAL_OWNER_ID
-from vonavy_agent.policy import ResourcePolicy
 from vonavy_agent.persistence import (
     DataProfile,
     DatasetMapping,
@@ -31,6 +30,7 @@ from vonavy_agent.persistence import (
     GateResultRow,
     session_scope,
 )
+from vonavy_agent.policy import ResourcePolicy
 
 
 def create_experiment_spec(

@@ -1,0 +1,11 @@
+{
+  "name": "vonavy-agent-infra-tooling",
+  "private": true,
+  "version": "0.1.0",
+  "devDependencies": {
+    "aws-cdk": "2.1131.0"
+  },
+  "scripts": {
+    "cdk": "cdk"
+  }
+}

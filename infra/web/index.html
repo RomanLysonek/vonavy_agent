@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>VOŇAVÝ AGENT</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">NOTINO FORECASTING WORKBENCH</p>
+      <h1>VOŇAVÝ AGENT</h1>
+      <p class="lead">Invite-only dataset intake for leakage-safe forecasting experiments.</p>
+    </header>
+
+    <section id="signed-out" class="card">
+      <h2>Sign in</h2>
+      <p>Use the reviewer account issued by the project owner.</p>
+      <button id="login" type="button">Continue with Cognito</button>
+    </section>
+
+    <section id="signed-in" class="hidden">
+      <div class="card identity-row">
+        <div>
+          <p class="label">Authenticated subject</p>
+          <strong id="identity"></strong>
+        </div>
+        <button id="logout" type="button" class="secondary">Sign out</button>
+      </div>
+
+      <section class="card">
+        <h2>Upload dataset</h2>
+        <p>CSV or Parquet. The browser uploads directly into private, encrypted S3 storage.</p>
+        <p id="upload-policy" class="policy"></p>
+        <form id="upload-form">
+          <label>
+            Dataset name
+            <input id="dataset-name" maxlength="200" required placeholder="Interview demand panel">
+          </label>
+          <label>
+            Data file
+            <input id="dataset-file" type="file" accept=".csv,.parquet" required>
+          </label>
+          <button id="upload-button" type="submit">Create upload</button>
+        </form>
+        <pre id="status" aria-live="polite"></pre>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Your datasets</h2>
+            <p>Only objects owned by the authenticated Cognito subject are returned.</p>
+          </div>
+          <button id="refresh" type="button" class="secondary">Refresh</button>
+        </div>
+        <div id="datasets"></div>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vonavy-agent-infra"
+version = "0.1.0"
+description = "AWS CDK control plane for vonavy-agent"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "aws-cdk-lib==2.261.0",
+  "constructs>=10.4,<11",
+]
+
+[project.optional-dependencies]
+dev = [
+  "boto3>=1.40,<2",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["vonavy_infra"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["vonavy_infra"]
+
+[[tool.mypy.overrides]]
+module = ["aws_cdk.*", "constructs.*"]
+ignore_missing_imports = true

@@ -21,21 +21,39 @@ from vonavy_agent.domain import (
 from vonavy_agent.eligibility import expected_grid
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_hash, canonical_json
+from vonavy_agent.identity import LOCAL_OWNER_ID
+from vonavy_agent.policy import ResourcePolicy
 from vonavy_agent.persistence import (
     DataProfile,
     DatasetMapping,
+    DatasetVersion,
     ExperimentSpecRow,
     GateResultRow,
     session_scope,
 )
 
 
-def create_experiment_spec(engine: Engine, spec: ExperimentSpec) -> ExperimentSpecRow:
+def create_experiment_spec(
+    engine: Engine,
+    spec: ExperimentSpec,
+    owner_id: str = LOCAL_OWNER_ID,
+    resource_policy: ResourcePolicy | None = None,
+) -> ExperimentSpecRow:
+    if resource_policy is not None:
+        resource_policy.validate(spec.resources)
     payload = spec.model_dump(mode="json")
     with session_scope(engine) as session:
         profile = session.get(DataProfile, spec.profile_id)
         mapping = session.get(DatasetMapping, spec.mapping_id)
-        if profile is None or mapping is None:
+        version = session.get(DatasetVersion, spec.dataset_version_id)
+        if (
+            profile is None
+            or mapping is None
+            or version is None
+            or profile.owner_id != owner_id
+            or mapping.owner_id != owner_id
+            or version.owner_id != owner_id
+        ):
             raise AgentError(
                 "evidence_not_found", "Mapping or profile does not exist", status_code=404
             )
@@ -46,6 +64,7 @@ def create_experiment_spec(engine: Engine, spec: ExperimentSpec) -> ExperimentSp
         ):
             raise AgentError("evidence_mismatch", "Dataset, mapping, and profile do not match")
         row = ExperimentSpecRow(
+            owner_id=owner_id,
             spec_hash=canonical_hash(payload),
             canonical_json=canonical_json(payload),
             dataset_version_id=spec.dataset_version_id,
@@ -77,6 +96,7 @@ def _available_at(
 
 @dataclass(frozen=True)
 class GateComputation:
+    owner_id: str
     spec_id: str
     spec_hash: str
     profile_hash: str
@@ -89,19 +109,28 @@ def compute_gate(
     engine: Engine,
     registry: DatasetRegistry,
     spec_row_id: str,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> GateComputation:
     with Session(engine) as session:
         spec_row = session.get(ExperimentSpecRow, spec_row_id)
-        if spec_row is None:
+        if spec_row is None or spec_row.owner_id != owner_id:
             raise AgentError("spec_not_found", "Experiment spec does not exist", status_code=404)
         spec = ExperimentSpec.model_validate_json(spec_row.canonical_json)
         profile_row = session.get_one(DataProfile, spec.profile_id)
         mapping_row = session.get_one(DatasetMapping, spec.mapping_id)
+        if profile_row.owner_id != owner_id or mapping_row.owner_id != owner_id:
+            raise AgentError(
+                "evidence_not_found",
+                "Mapping or profile does not exist",
+                status_code=404,
+            )
         mapping = DatasetMappingSpec.model_validate_json(mapping_row.canonical_json)
         profile = json.loads(profile_row.canonical_json)
-        frame = registry.read_materialized_frame(session, spec.dataset_version_id).reset_index(
-            drop=True
-        )
+        frame = registry.read_materialized_frame(
+            session,
+            spec.dataset_version_id,
+            owner_id,
+        ).reset_index(drop=True)
     reasons: list[GateReason] = []
     warnings: list[GateReason] = []
 
@@ -413,6 +442,7 @@ def compute_gate(
     )
     report = unsigned.model_copy(update={"confirmation_token": token})
     return GateComputation(
+        owner_id=owner_id,
         spec_id=spec_row.id,
         spec_hash=spec_row.spec_hash,
         profile_hash=profile_row.profile_hash,
@@ -428,6 +458,7 @@ def publish_gate(
     row_id: str | None = None,
 ) -> GateResultRow:
     row = GateResultRow(
+        owner_id=computation.owner_id,
         spec_id=computation.spec_id,
         spec_hash=computation.spec_hash,
         profile_hash=computation.profile_hash,
@@ -447,8 +478,9 @@ def run_gate(
     registry: DatasetRegistry,
     spec_row_id: str,
     before_publish: Callable[[], None] | None = None,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> GateResultRow:
-    computation = compute_gate(engine, registry, spec_row_id)
+    computation = compute_gate(engine, registry, spec_row_id, owner_id)
     if before_publish is not None:
         before_publish()
     with session_scope(engine) as session:

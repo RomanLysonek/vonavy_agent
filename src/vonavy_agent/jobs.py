@@ -25,6 +25,7 @@ from vonavy_agent.domain import (
 )
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json, file_hash
+from vonavy_agent.identity import LOCAL_OWNER_ID
 from vonavy_agent.managed_files import verified_managed_file, verify_run_bundle
 from vonavy_agent.persistence import (
     DataProfile,
@@ -76,9 +77,14 @@ class StreamCollector:
                 self.overflow = True
 
 
-def enqueue_job(engine: Engine, kind: str, payload: dict[str, Any]) -> Job:
+def enqueue_job(
+    engine: Engine,
+    kind: str,
+    payload: dict[str, Any],
+    owner_id: str = LOCAL_OWNER_ID,
+) -> Job:
     with session_scope(engine) as session:
-        job = Job(kind=kind, payload_json=canonical_json(payload))
+        job = Job(owner_id=owner_id, kind=kind, payload_json=canonical_json(payload))
         session.add(job)
         session.flush()
         session.add(JobEvent(job_id=job.id, from_state=None, to_state=JobState.QUEUED.value))
@@ -92,11 +98,13 @@ def enqueue_run(
     spec_id: str,
     gate_result_id: str,
     confirmation_token: str,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> tuple[Run, Job]:
     with session_scope(engine) as session:
         gate = session.get(GateResultRow, gate_result_id)
         if (
             gate is None
+            or gate.owner_id != owner_id
             or gate.spec_id != spec_id
             or gate.status != "passed"
             or gate.confirmation_token != confirmation_token
@@ -105,16 +113,24 @@ def enqueue_run(
                 "gate_confirmation_invalid",
                 "A current passing gate and its exact confirmation token are required",
             )
+        spec_row = session.get(ExperimentSpecRow, spec_id)
+        if spec_row is None or spec_row.owner_id != owner_id:
+            raise AgentError("spec_not_found", "Experiment spec does not exist", status_code=404)
         gate_payload = json.loads(gate.canonical_json)
         if gate_payload.get("policy_version") != CURRENT_GATE_POLICY_VERSION:
             raise AgentError(
                 "gate_policy_legacy",
                 "Gate evidence predates current leakage and availability policy; recompute it",
             )
-        job = Job(kind="experiment", payload_json="{}")
+        job = Job(owner_id=owner_id, kind="experiment", payload_json="{}")
         session.add(job)
         session.flush()
-        run = Run(job_id=job.id, spec_id=spec_id, gate_result_id=gate_result_id)
+        run = Run(
+            owner_id=owner_id,
+            job_id=job.id,
+            spec_id=spec_id,
+            gate_result_id=gate_result_id,
+        )
         session.add(run)
         session.flush()
         job.payload_json = canonical_json({"run_id": run.id})
@@ -128,14 +144,19 @@ def enqueue_export(
     engine: Engine,
     export_id: str,
     run_ids: list[str],
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> tuple[Export, Job]:
     unique_run_ids = sorted(set(run_ids))
     with session_scope(engine) as session:
-        job = Job(kind="export", payload_json="{}")
+        runs = session.scalars(select(Run).where(Run.id.in_(unique_run_ids))).all()
+        if len(runs) != len(unique_run_ids) or any(run.owner_id != owner_id for run in runs):
+            raise AgentError("run_not_found", "One or more runs do not exist", status_code=404)
+        job = Job(owner_id=owner_id, kind="export", payload_json="{}")
         session.add(job)
         session.flush()
         export = Export(
             id=export_id,
+            owner_id=owner_id,
             job_id=job.id,
             run_ids_json=canonical_json(unique_run_ids),
         )
@@ -153,12 +174,17 @@ def enqueue_export(
         return session.get_one(Export, export_id), session.get_one(Job, job_id)
 
 
-def request_cancellation(engine: Engine, job_id: str, settings: Settings | None = None) -> Job:
+def request_cancellation(
+    engine: Engine,
+    job_id: str,
+    settings: Settings | None = None,
+    owner_id: str = LOCAL_OWNER_ID,
+) -> Job:
     cancelled_while_queued = False
     for _ in range(3):
         with session_scope(engine) as session:
             job = session.get(Job, job_id)
-            if job is None:
+            if job is None or job.owner_id != owner_id:
                 raise AgentError("job_not_found", "Job does not exist", status_code=404)
             state = JobState(job.state)
             if state in TERMINAL_JOB_STATES:

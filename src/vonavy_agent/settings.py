@@ -8,6 +8,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from vonavy_agent.policy import ResourcePolicy
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VONAVY_AGENT_", extra="ignore")
@@ -15,12 +17,34 @@ class Settings(BaseSettings):
     managed_root: Path = Field(default=Path(".vonavy-agent"))
     host: str = "127.0.0.1"
     port: int = 8765
+    local_owner_id: str = "local"
     max_upload_bytes: int = 250 * 1024 * 1024
     max_profile_categories: int = 20
+
+    # Trusted server policy. Client-supplied ExperimentSpec.resources may request
+    # less, but never more, than these ceilings.
+    policy_max_rows: int = 500_000
+    policy_max_entities: int = 5_000
+    policy_max_origins: int = 50
+    policy_max_models: int = 3
+    policy_max_wall_seconds: int = 3_600
+    policy_max_memory_mb: int = 8_192
+
     worker_lease_seconds: int = 30
     worker_poll_seconds: float = 0.5
     worker_max_attempts: int = 2
     supervise_worker: bool = True
+
+    @property
+    def resource_policy(self) -> ResourcePolicy:
+        return ResourcePolicy(
+            max_rows=self.policy_max_rows,
+            max_entities=self.policy_max_entities,
+            max_origins=self.policy_max_origins,
+            max_models=self.policy_max_models,
+            max_wall_seconds=self.policy_max_wall_seconds,
+            max_memory_mb=self.policy_max_memory_mb,
+        )
 
     @property
     def database_path(self) -> Path:

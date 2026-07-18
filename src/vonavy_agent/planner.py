@@ -13,6 +13,8 @@ from vonavy_agent.domain import ExperimentSpec, JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.experiments import create_experiment_spec
 from vonavy_agent.hashing import canonical_hash, canonical_json
+from vonavy_agent.identity import LOCAL_OWNER_ID
+from vonavy_agent.policy import ResourcePolicy
 from vonavy_agent.persistence import (
     DataProfile,
     ExperimentSpecRow,
@@ -24,19 +26,26 @@ from vonavy_agent.persistence import (
 )
 
 
-def propose_experiments(engine: Engine, spec_id: str) -> PlannerProposal:
+def propose_experiments(
+    engine: Engine,
+    spec_id: str,
+    owner_id: str = LOCAL_OWNER_ID,
+) -> PlannerProposal:
     with Session(engine) as session:
         spec_row = session.get(ExperimentSpecRow, spec_id)
-        if spec_row is None:
+        if spec_row is None or spec_row.owner_id != owner_id:
             raise AgentError("spec_not_found", "Experiment spec does not exist", status_code=404)
         spec = ExperimentSpec.model_validate_json(spec_row.canonical_json)
         profile = session.get_one(DataProfile, spec.profile_id)
+        if profile.owner_id != owner_id:
+            raise AgentError("profile_not_found", "Profile does not exist", status_code=404)
         profile_json = json.loads(profile.canonical_json)
         prior_runs = session.scalars(
             select(Run)
             .join(Job, Job.id == Run.job_id)
             .where(
                 Run.spec_id == spec_id,
+                Run.owner_id == owner_id,
                 Run.summary_json.is_not(None),
                 Job.state == JobState.SUCCEEDED.value,
             )
@@ -110,7 +119,10 @@ def propose_experiments(engine: Engine, spec_id: str) -> PlannerProposal:
                     "spec": window_spec.model_dump(mode="json"),
                 }
             )
-    capabilities = {item["adapter_kind"]: item for item in adapter_capabilities(engine)}
+    capabilities = {
+        item["adapter_kind"]: item
+        for item in adapter_capabilities(engine, owner_id)
+    }
     anomaly = capabilities["anomaly"]
     if anomaly["available"] and len(proposals) < 3:
         proposals.append(
@@ -180,6 +192,7 @@ def propose_experiments(engine: Engine, spec_id: str) -> PlannerProposal:
     }
     with session_scope(engine) as session:
         row = PlannerProposal(
+            owner_id=owner_id,
             input_hash=payload["input_hash"],
             canonical_json=canonical_json(payload),
         )
@@ -190,10 +203,16 @@ def propose_experiments(engine: Engine, spec_id: str) -> PlannerProposal:
         return session.get_one(PlannerProposal, row_id)
 
 
-def confirm_proposal(engine: Engine, proposal_id: str, rank: int) -> ExperimentSpecRow:
+def confirm_proposal(
+    engine: Engine,
+    proposal_id: str,
+    rank: int,
+    owner_id: str = LOCAL_OWNER_ID,
+    resource_policy: ResourcePolicy | None = None,
+) -> ExperimentSpecRow:
     with session_scope(engine) as session:
         proposal = session.get(PlannerProposal, proposal_id)
-        if proposal is None:
+        if proposal is None or proposal.owner_id != owner_id:
             raise AgentError(
                 "proposal_not_found", "Planner proposal does not exist", status_code=404
             )
@@ -207,7 +226,7 @@ def confirm_proposal(engine: Engine, proposal_id: str, rank: int) -> ExperimentS
         if selected is None:
             raise AgentError("proposal_rank_not_found", "Requested proposal rank does not exist")
         spec = ExperimentSpec.model_validate(selected["spec"])
-    row = create_experiment_spec(engine, spec)
+    row = create_experiment_spec(engine, spec, owner_id, resource_policy)
     with session_scope(engine) as session:
         session.get_one(PlannerProposal, proposal_id).confirmed_spec_id = row.id
     return row

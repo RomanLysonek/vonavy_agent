@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from vonavy_agent.domain import ExperimentSpec, StrictModel
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json
+from vonavy_agent.identity import LOCAL_OWNER_ID
 from vonavy_agent.managed_files import publish_bytes
 from vonavy_agent.persistence import AdapterSnapshot, session_scope
 from vonavy_agent.settings import Settings
@@ -130,6 +131,7 @@ def import_adapter_snapshot(
     settings: Settings,
     stream: BinaryIO,
     original_name: str,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> AdapterSnapshot:
     if Path(original_name).name != original_name or Path(original_name).suffix.lower() != ".json":
         raise AgentError("invalid_snapshot_name", "Adapter snapshots must be plain JSON basenames")
@@ -167,6 +169,7 @@ def import_adapter_snapshot(
         ) from exc
     with session_scope(engine) as session:
         row = AdapterSnapshot(
+            owner_id=owner_id,
             adapter_kind=parsed.adapter_kind,
             manifest_kind=parsed.manifest_kind,
             schema_version=parsed.schema_version,
@@ -180,7 +183,10 @@ def import_adapter_snapshot(
         return session.get_one(AdapterSnapshot, row_id)
 
 
-def adapter_capabilities(engine: Engine) -> list[dict[str, object]]:
+def adapter_capabilities(
+    engine: Engine,
+    owner_id: str = LOCAL_OWNER_ID,
+) -> list[dict[str, object]]:
     defaults: dict[str, dict[str, object]] = {
         "anomaly": CapabilityManifest(
             adapter_kind="anomaly",
@@ -196,7 +202,11 @@ def adapter_capabilities(engine: Engine) -> list[dict[str, object]]:
         ).model_dump(mode="json"),
     }
     with Session(engine) as session:
-        rows = session.query(AdapterSnapshot).filter_by(manifest_kind="capability").all()
+        rows = (
+            session.query(AdapterSnapshot)
+            .filter_by(owner_id=owner_id, manifest_kind="capability")
+            .all()
+        )
     for row in sorted(rows, key=lambda item: item.created_at):
         defaults[row.adapter_kind] = json.loads(row.canonical_json)
     return [defaults[name] for name in sorted(defaults)]

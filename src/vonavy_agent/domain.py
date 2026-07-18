@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -144,8 +144,9 @@ class ResourceLimits(StrictModel):
     threads: Literal[1] = 1
 
 
-class ExperimentSpec(StrictModel):
+class EvaluationSpec(StrictModel):
     schema_version: Literal["1.0"] = "1.0"
+    mode: Literal["evaluation"] = "evaluation"
     dataset_version_id: str
     mapping_id: str
     profile_id: str
@@ -185,7 +186,7 @@ class ExperimentSpec(StrictModel):
         return value.astimezone(UTC)
 
     @model_validator(mode="after")
-    def validate_boundaries(self) -> ExperimentSpec:
+    def validate_boundaries(self) -> EvaluationSpec:
         if not (self.train.end < self.calibration.start <= self.calibration.end < self.test.start):
             raise ValueError(
                 "train, calibration, and test must be chronological and non-overlapping"
@@ -239,6 +240,130 @@ class ExperimentSpec(StrictModel):
             else {feature.name for feature in self.features if feature.role != FeatureRole.EXCLUDED}
         )
         return tuple(feature for feature in self.features if feature.name in allowed)
+
+
+# Backwards-compatible name for the current local evaluation workflow.
+ExperimentSpec: TypeAlias = EvaluationSpec
+
+
+class ForecastSpec(StrictModel):
+    schema_version: Literal["1.0"] = "1.0"
+    mode: Literal["forecast"] = "forecast"
+    dataset_version_id: str
+    mapping_id: str
+    profile_id: str
+    frequency: Literal["D"] = "D"
+    training_end: date
+    forecast: DateRange
+    training_window_days: Annotated[int, Field(ge=14, le=3_650)]
+    entity_column: str | None = None
+    target_column: str
+    features: tuple[FeatureMapping, ...] = ()
+    feature_allow_list: tuple[str, ...] | None = None
+    models: tuple[ModelConfig, ...]
+    seeds: tuple[Annotated[int, Field(ge=0, le=2**31 - 1)], ...] = (42,)
+    information_cutoff: datetime
+    resources: ResourceLimits = ResourceLimits()
+
+    @field_validator("information_cutoff")
+    @classmethod
+    def aware_information_cutoff(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("information_cutoff must include an explicit timezone")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_forecast_contract(self) -> ForecastSpec:
+        if self.training_end >= self.forecast.start:
+            raise ValueError("forecast dates must start after the final training date")
+        if self.horizon_days > 90:
+            raise ValueError("forecast horizon must not exceed 90 days")
+        if self.information_cutoff.date() > self.forecast.start:
+            raise ValueError("information cutoff must not be after the first forecast date")
+        if not self.models:
+            raise ValueError("at least one model is required")
+        if len(self.models) > self.resources.max_models:
+            raise ValueError("model count exceeds resource limit")
+        if len({model.kind for model in self.models}) != len(self.models):
+            raise ValueError("model kinds must be unique")
+        if not self.seeds or len(self.seeds) != len(set(self.seeds)):
+            raise ValueError("seeds must be present and unique")
+        self._validate_feature_selection()
+        return self
+
+    def _validate_feature_selection(self) -> None:
+        mapped = {feature.name: feature for feature in self.features}
+        if self.feature_allow_list is None:
+            return
+        if len(self.feature_allow_list) != len(set(self.feature_allow_list)):
+            raise ValueError("feature allow-list entries must be unique")
+        unknown = set(self.feature_allow_list) - set(mapped)
+        if unknown:
+            raise ValueError(f"feature allow-list contains unknown features: {sorted(unknown)}")
+        excluded = [
+            name for name in self.feature_allow_list if mapped[name].role == FeatureRole.EXCLUDED
+        ]
+        if excluded:
+            raise ValueError(f"excluded features cannot be active: {excluded}")
+
+    @property
+    def horizon_days(self) -> int:
+        return (self.forecast.end - self.forecast.start).days + 1
+
+    def selected_features(self) -> tuple[FeatureMapping, ...]:
+        allowed = (
+            set(self.feature_allow_list)
+            if self.feature_allow_list is not None
+            else {feature.name for feature in self.features if feature.role != FeatureRole.EXCLUDED}
+        )
+        return tuple(feature for feature in self.features if feature.name in allowed)
+
+
+class InferenceSpec(StrictModel):
+    schema_version: Literal["1.0"] = "1.0"
+    mode: Literal["inference"] = "inference"
+    model_artifact_id: str = Field(min_length=1)
+    model_adapter_kind: str = Field(min_length=1)
+    dataset_version_id: str
+    mapping_id: str
+    profile_id: str
+    frequency: Literal["D"] = "D"
+    forecast: DateRange
+    entity_column: str | None = None
+    target_column: str
+    features: tuple[FeatureMapping, ...] = ()
+    information_cutoff: datetime
+    resources: ResourceLimits = ResourceLimits()
+
+    @field_validator("information_cutoff")
+    @classmethod
+    def aware_information_cutoff(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("information_cutoff must include an explicit timezone")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_inference_contract(self) -> InferenceSpec:
+        if self.horizon_days > 90:
+            raise ValueError("forecast horizon must not exceed 90 days")
+        if self.information_cutoff.date() > self.forecast.start:
+            raise ValueError("information cutoff must not be after the first forecast date")
+        return self
+
+    @property
+    def horizon_days(self) -> int:
+        return (self.forecast.end - self.forecast.start).days + 1
+
+
+RunSpec: TypeAlias = Annotated[
+    EvaluationSpec | ForecastSpec | InferenceSpec,
+    Field(discriminator="mode"),
+]
+RUN_SPEC_ADAPTER = TypeAdapter(RunSpec)
+
+
+def parse_run_spec(payload: object) -> RunSpec:
+    return RUN_SPEC_ADAPTER.validate_python(payload)
 
 
 class GateReason(StrictModel):

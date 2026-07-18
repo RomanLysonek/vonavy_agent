@@ -6,11 +6,11 @@ import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeAlias
 
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +27,7 @@ from vonavy_agent.datasets import DatasetRegistry
 from vonavy_agent.domain import DatasetMappingSpec, ExperimentSpec, JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.experiments import create_experiment_spec
+from vonavy_agent.identity import IdentityContext, IdentityProvider, LocalIdentityProvider
 from vonavy_agent.jobs import (
     enqueue_export,
     enqueue_job,
@@ -86,6 +87,23 @@ class ExportRequest(RequestModel):
     run_ids: list[str] = Field(min_length=1)
 
 
+def _current_identity(request: Request) -> IdentityContext:
+    provider: IdentityProvider = request.app.state.identity_provider
+    return provider.resolve(request.headers)
+
+
+Identity: TypeAlias = Annotated[IdentityContext, Depends(_current_identity)]
+
+
+def _require_local_filesystem(identity: IdentityContext) -> None:
+    if identity.authentication_mode != "local":
+        raise AgentError(
+            "local_endpoint_unavailable",
+            "The managed local inbox is unavailable outside local mode",
+            status_code=404,
+        )
+
+
 def migrate(settings: Settings) -> None:
     settings.ensure_directories()
     config = Config()
@@ -94,8 +112,12 @@ def migrate(settings: Settings) -> None:
     command.upgrade(config, "head")
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    identity_provider: IdentityProvider | None = None,
+) -> FastAPI:
     settings = settings or Settings()
+    identity_provider = identity_provider or LocalIdentityProvider(settings.local_owner_id)
     settings.ensure_directories()
     migrate(settings)
     engine = create_db_engine(settings.database_path)
@@ -128,9 +150,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except subprocess.TimeoutExpired:
                     worker_process.kill()
 
-    app = FastAPI(title="Experiment Agent", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Experiment Agent", version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.engine = engine
+    app.state.identity_provider = identity_provider
 
     @app.exception_handler(AgentError)
     async def agent_error_handler(_: Request, exc: AgentError) -> JSONResponse:
@@ -147,34 +170,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
-        return {"status": "ok", "version": "0.1.0", "worker_supervised": settings.supervise_worker}
+        return {"status": "ok", "version": "0.2.0", "worker_supervised": settings.supervise_worker}
 
     @app.get("/api/capabilities")
-    def capabilities() -> dict[str, object]:
+    def capabilities(identity: Identity) -> dict[str, object]:
         return {
             "frequency": ["D"],
             "models": ["seasonal_naive", "moving_average", "ridge_direct"],
             "metrics": ["wape", "mae", "rmse", "bias", "coverage", "runtime"],
-            "adapters": adapter_capabilities(engine),
+            "adapters": adapter_capabilities(engine, identity.owner_id),
         }
 
     @app.get("/api/inbox")
-    def inbox() -> dict[str, object]:
+    def inbox(identity: Identity) -> dict[str, object]:
+        _require_local_filesystem(identity)
         return {"files": registry.list_inbox()}
 
     @app.post("/api/inbox/import")
-    def import_inbox(request: InboxImportRequest) -> dict[str, object]:
+    def import_inbox(request: InboxImportRequest, identity: Identity) -> dict[str, object]:
+        _require_local_filesystem(identity)
         version = registry.import_inbox(
             request.name,
             request.dataset_name,
             request.mode,
             request.dataset_id,
             request.parent_version_id,
+            identity.owner_id,
         )
         return _version_json(version)
 
     @app.post("/api/datasets/upload")
     def upload_dataset(
+        identity: Identity,
         file: Annotated[UploadFile, File()],
         dataset_name: Annotated[str, Form()],
         mode: Annotated[str, Form()] = "snapshot",
@@ -188,17 +215,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             mode=mode,
             dataset_id=dataset_id,
             parent_version_id=parent_version_id,
+            owner_id=identity.owner_id,
         )
         return _version_json(version)
 
     @app.get("/api/datasets")
-    def list_datasets() -> dict[str, object]:
+    def list_datasets(identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
-            datasets = session.scalars(select(Dataset).order_by(Dataset.created_at)).all()
+            datasets = session.scalars(
+                select(Dataset)
+                .where(Dataset.owner_id == identity.owner_id)
+                .order_by(Dataset.created_at)
+            ).all()
             versions = session.scalars(
-                select(DatasetVersion).order_by(
-                    DatasetVersion.dataset_id, DatasetVersion.version_number
-                )
+                select(DatasetVersion)
+                .where(DatasetVersion.owner_id == identity.owner_id)
+                .order_by(DatasetVersion.dataset_id, DatasetVersion.version_number)
             ).all()
         by_dataset: dict[str, list[dict[str, object]]] = {}
         for version in versions:
@@ -216,18 +248,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/dataset-versions/{version_id}")
-    def get_version(version_id: str) -> dict[str, object]:
+    def get_version(version_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             version = session.get(DatasetVersion, version_id)
-            if version is None:
+            if version is None or version.owner_id != identity.owner_id:
                 raise AgentError(
                     "dataset_version_not_found", "Dataset version does not exist", status_code=404
                 )
             return _version_json(version)
 
     @app.post("/api/dataset-versions/{version_id}/mappings")
-    def create_mapping(version_id: str, mapping: DatasetMappingSpec) -> dict[str, object]:
-        row = registry.create_mapping(version_id, mapping)
+    def create_mapping(
+        version_id: str,
+        mapping: DatasetMappingSpec,
+        identity: Identity,
+    ) -> dict[str, object]:
+        row = registry.create_mapping(version_id, mapping, identity.owner_id)
         return {
             "id": row.id,
             "dataset_version_id": row.dataset_version_id,
@@ -236,15 +272,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/api/profiles")
-    def enqueue_profile(request: ProfileRequest) -> dict[str, object]:
-        job = enqueue_job(engine, "profile", request.model_dump())
+    def enqueue_profile(request: ProfileRequest, identity: Identity) -> dict[str, object]:
+        job = enqueue_job(engine, "profile", request.model_dump(), identity.owner_id)
         return _job_json(job)
 
     @app.get("/api/profiles/{profile_id}")
-    def get_profile(profile_id: str) -> dict[str, object]:
+    def get_profile(profile_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             row = session.get(DataProfile, profile_id)
-            if row is None:
+            if row is None or row.owner_id != identity.owner_id:
                 raise AgentError("profile_not_found", "Profile does not exist", status_code=404)
             return {
                 "id": row.id,
@@ -253,87 +289,115 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
 
     @app.post("/api/specs")
-    def create_spec(spec: ExperimentSpec) -> dict[str, object]:
-        row = create_experiment_spec(engine, spec)
+    def create_spec(spec: ExperimentSpec, identity: Identity) -> dict[str, object]:
+        row = create_experiment_spec(
+            engine,
+            spec,
+            identity.owner_id,
+            settings.resource_policy,
+        )
         return _spec_json(row)
 
     @app.get("/api/specs/{spec_id}")
-    def get_spec(spec_id: str) -> dict[str, object]:
+    def get_spec(spec_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             row = session.get(ExperimentSpecRow, spec_id)
-            if row is None:
+            if row is None or row.owner_id != identity.owner_id:
                 raise AgentError(
                     "spec_not_found", "Experiment spec does not exist", status_code=404
                 )
             return _spec_json(row)
 
     @app.post("/api/specs/{spec_id}/gate")
-    def enqueue_gate(spec_id: str) -> dict[str, object]:
+    def enqueue_gate(spec_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
-            if session.get(ExperimentSpecRow, spec_id) is None:
+            row = session.get(ExperimentSpecRow, spec_id)
+            if row is None or row.owner_id != identity.owner_id:
                 raise AgentError(
                     "spec_not_found", "Experiment spec does not exist", status_code=404
                 )
-        return _job_json(enqueue_job(engine, "gate", {"spec_id": spec_id}))
+        return _job_json(
+            enqueue_job(engine, "gate", {"spec_id": spec_id}, identity.owner_id)
+        )
 
     @app.get("/api/gates/{gate_id}")
-    def get_gate(gate_id: str) -> dict[str, object]:
+    def get_gate(gate_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             row = session.get(GateResultRow, gate_id)
-            if row is None:
+            if row is None or row.owner_id != identity.owner_id:
                 raise AgentError("gate_not_found", "Gate result does not exist", status_code=404)
             return {"id": row.id, "spec_id": row.spec_id, "report": json.loads(row.canonical_json)}
 
     @app.post("/api/runs")
-    def create_run(request: RunRequest) -> dict[str, object]:
+    def create_run(request: RunRequest, identity: Identity) -> dict[str, object]:
         run, job = enqueue_run(
             engine,
             request.spec_id,
             request.gate_result_id,
             request.confirmation_token,
+            identity.owner_id,
         )
         return {"run_id": run.id, "job": _job_json(job)}
 
     @app.get("/api/runs")
-    def list_runs() -> dict[str, object]:
+    def list_runs(identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
-            runs = session.scalars(select(Run).order_by(Run.created_at.desc())).all()
-            jobs = {job.id: job for job in session.scalars(select(Job)).all()}
+            runs = session.scalars(
+                select(Run)
+                .where(Run.owner_id == identity.owner_id)
+                .order_by(Run.created_at.desc())
+            ).all()
+            jobs = {
+                job.id: job
+                for job in session.scalars(
+                    select(Job).where(Job.owner_id == identity.owner_id)
+                ).all()
+            }
         return {"runs": [_run_json(run, jobs[run.job_id]) for run in runs]}
 
     @app.get("/api/runs/{run_id}")
-    def get_run(run_id: str) -> dict[str, object]:
+    def get_run(run_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             run = session.get(Run, run_id)
-            if run is None:
+            if run is None or run.owner_id != identity.owner_id:
                 raise AgentError("run_not_found", "Run does not exist", status_code=404)
-            return _run_json(run, session.get_one(Job, run.job_id))
+            job = session.get_one(Job, run.job_id)
+            if job.owner_id != identity.owner_id:
+                raise AgentError("run_not_found", "Run does not exist", status_code=404)
+            return _run_json(run, job)
 
     @app.get("/api/jobs/{job_id}")
-    def get_job(job_id: str) -> dict[str, object]:
+    def get_job(job_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             job = session.get(Job, job_id)
-            if job is None:
+            if job is None or job.owner_id != identity.owner_id:
                 raise AgentError("job_not_found", "Job does not exist", status_code=404)
             return _job_json(job)
 
     @app.post("/api/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str) -> dict[str, object]:
-        return _job_json(request_cancellation(engine, job_id, settings))
+    def cancel_job(job_id: str, identity: Identity) -> dict[str, object]:
+        return _job_json(
+            request_cancellation(engine, job_id, settings, identity.owner_id)
+        )
 
     @app.post("/api/comparisons")
-    def comparison(request: ComparisonRequest) -> dict[str, object]:
+    def comparison(request: ComparisonRequest, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             runs = [session.get(Run, run_id) for run_id in request.run_ids]
             jobs = {
                 job.id: job
                 for job in session.scalars(
-                    select(Job).where(Job.id.in_([run.job_id for run in runs if run is not None]))
+                    select(Job).where(
+                        Job.id.in_([run.job_id for run in runs if run is not None]),
+                        Job.owner_id == identity.owner_id,
+                    )
                 ).all()
             }
             if any(
                 run is None
+                or run.owner_id != identity.owner_id
                 or run.summary_json is None
+                or run.job_id not in jobs
                 or jobs[run.job_id].state != JobState.SUCCEEDED.value
                 for run in runs
             ):
@@ -365,21 +429,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/api/planner/proposals/{spec_id}")
-    def planner_proposals(spec_id: str) -> dict[str, object]:
-        row = propose_experiments(engine, spec_id)
+    def planner_proposals(spec_id: str, identity: Identity) -> dict[str, object]:
+        row = propose_experiments(engine, spec_id, identity.owner_id)
         return {"id": row.id, "proposal": json.loads(row.canonical_json)}
 
     @app.post("/api/planner/proposals/{proposal_id}/confirm")
-    def planner_confirm(proposal_id: str, request: ProposalConfirmRequest) -> dict[str, object]:
-        return _spec_json(confirm_proposal(engine, proposal_id, request.rank))
+    def planner_confirm(
+        proposal_id: str,
+        request: ProposalConfirmRequest,
+        identity: Identity,
+    ) -> dict[str, object]:
+        return _spec_json(
+            confirm_proposal(
+                engine,
+                proposal_id,
+                request.rank,
+                identity.owner_id,
+                settings.resource_policy,
+            )
+        )
 
     @app.get("/api/adapters")
-    def adapters() -> dict[str, object]:
-        return {"adapters": adapter_capabilities(engine)}
+    def adapters(identity: Identity) -> dict[str, object]:
+        return {"adapters": adapter_capabilities(engine, identity.owner_id)}
 
     @app.post("/api/adapters/import")
-    def adapter_import(file: Annotated[UploadFile, File()]) -> dict[str, object]:
-        row = import_adapter_snapshot(engine, settings, file.file, file.filename or "")
+    def adapter_import(
+        identity: Identity,
+        file: Annotated[UploadFile, File()],
+    ) -> dict[str, object]:
+        row = import_adapter_snapshot(
+            engine,
+            settings,
+            file.file,
+            file.filename or "",
+            identity.owner_id,
+        )
         return {
             "id": row.id,
             "adapter_kind": row.adapter_kind,
@@ -389,7 +474,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/api/adapters/{adapter_kind}/dry-run")
-    def adapter_dry_run(adapter_kind: str) -> dict[str, object]:
+    def adapter_dry_run(adapter_kind: str, identity: Identity) -> dict[str, object]:
+        del identity
         if adapter_kind not in {"anomaly", "chronos"}:
             raise AgentError("adapter_unknown", "Unknown adapter kind")
         cwd = (settings.managed_root / "imports").resolve()
@@ -407,18 +493,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.post("/api/exports")
-    def create_export_job(request: ExportRequest) -> dict[str, object]:
+    def create_export_job(request: ExportRequest, identity: Identity) -> dict[str, object]:
         export_id = new_id()
-        _, job = enqueue_export(engine, export_id, request.run_ids)
+        _, job = enqueue_export(engine, export_id, request.run_ids, identity.owner_id)
         return {"export_id": export_id, "job": _job_json(job)}
 
     @app.get("/api/exports/{export_id}")
-    def get_export(export_id: str) -> dict[str, object]:
+    def get_export(export_id: str, identity: Identity) -> dict[str, object]:
         with Session(engine) as session:
             row = session.get(Export, export_id)
-            if row is None:
+            if row is None or row.owner_id != identity.owner_id:
                 raise AgentError("export_not_found", "Export does not exist", status_code=404)
             job = session.get_one(Job, row.job_id)
+            if job.owner_id != identity.owner_id:
+                raise AgentError("export_not_found", "Export does not exist", status_code=404)
             return {
                 "id": row.id,
                 "job": _job_json(job),
@@ -431,13 +519,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
 
     @app.get("/api/exports/{export_id}/download")
-    def download_export(export_id: str) -> StreamingResponse:
+    def download_export(export_id: str, identity: Identity) -> StreamingResponse:
         with Session(engine) as session:
             row = session.get(Export, export_id)
-            if row is None or not row.relative_path or not row.manifest_hash:
+            if row is None or row.owner_id != identity.owner_id:
+                raise AgentError("export_not_found", "Export does not exist", status_code=404)
+            if not row.relative_path or not row.manifest_hash:
                 raise AgentError("export_not_ready", "Export is not ready", status_code=409)
             job = session.get_one(Job, row.job_id)
-            if job.state != JobState.SUCCEEDED.value:
+            if job.owner_id != identity.owner_id or job.state != JobState.SUCCEEDED.value:
                 raise AgentError("export_not_ready", "Export is not ready", status_code=409)
             relative = Path(row.relative_path)
             expected_hash = row.manifest_hash

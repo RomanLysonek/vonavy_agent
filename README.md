@@ -1,5 +1,7 @@
 # Experiment Agent
 
+> Current development line: Phase 0 cloud-neutral boundaries. Local evaluation remains fully supported; AWS deployment is not implemented yet.
+
 Local, deterministic forecasting experiment workbench for the NOTINO interview
 portfolio. It copies permitted CSV/Parquet data into immutable content-addressed
 storage, profiles and maps availability, blocks leakage before execution, runs
@@ -114,6 +116,17 @@ hashes tracked and untracked executed files while excluding ignored runtime
 artifacts. Unavailable provenance is represented explicitly rather than
 fabricated.
 
-SQLite is intentionally sufficient for a single interviewer/author on one
-laptop. Airflow, Celery, Redis, Kubernetes, authentication theatre, LLMs,
-arbitrary shell, cloud connectors, and editable sibling imports are non-goals.
+SQLite remains the local metadata adapter. Local mode resolves every request to
+one explicit owner named `local`; the API and persistence layer are now
+owner-scoped so a future Cognito adapter can provide real multi-user isolation.
+The server also enforces trusted resource ceilings above the resource envelope
+requested by a client specification.
+
+The domain distinguishes historical `EvaluationSpec`, unseen-future
+`ForecastSpec`, and stored-model `InferenceSpec`. Only evaluation is executable
+in this local slice. AWS storage, metadata, identity, and Batch implementations
+will be added behind the interfaces in `vonavy_agent.ports`; they are not
+simulated by the current local runner. See `docs/phase-0-cloud-boundaries.md`.
+
+Airflow, Celery, Redis, Kubernetes, arbitrary shell, uploaded code execution,
+and editable sibling imports remain non-goals.

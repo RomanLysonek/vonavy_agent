@@ -41,6 +41,7 @@ from vonavy_agent.domain import (
 from vonavy_agent.eligibility import expected_grid
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_hash, canonical_json, file_hash
+from vonavy_agent.identity import LOCAL_OWNER_ID
 from vonavy_agent.managed_files import fsync_tree
 from vonavy_agent.persistence import (
     DataProfile,
@@ -79,9 +80,14 @@ def _prepare_data(
     registry: DatasetRegistry,
     spec: ExperimentSpec,
     mapping: DatasetMappingSpec,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> PreparedData:
     with Session(engine) as session:
-        frame = registry.read_materialized_frame(session, spec.dataset_version_id).copy()
+        frame = registry.read_materialized_frame(
+            session,
+            spec.dataset_version_id,
+            owner_id,
+        ).copy()
     frame["_date"] = (
         pd.to_datetime(frame[mapping.timestamp_column], errors="raise", utc=True)
         .dt.tz_convert(None)
@@ -450,14 +456,24 @@ def run_backtest(
     stage_key: str,
     ownership_check: Callable[[], None] | None = None,
     before_publish: Callable[[], None] | None = None,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> StagedRun:
     registry = DatasetRegistry(settings, engine)
     with Session(engine) as session:
-        run = session.get_one(Run, run_id)
+        run = session.get(Run, run_id)
+        if run is None or run.owner_id != owner_id:
+            raise AgentError("run_not_found", "Run does not exist", status_code=404)
         spec_row = session.get_one(ExperimentSpecRow, run.spec_id)
         gate_row = session.get_one(GateResultRow, run.gate_result_id)
         profile_row = session.get_one(DataProfile, spec_row.profile_id)
         mapping_row = session.get_one(DatasetMapping, spec_row.mapping_id)
+        if (
+            spec_row.owner_id != owner_id
+            or gate_row.owner_id != owner_id
+            or profile_row.owner_id != owner_id
+            or mapping_row.owner_id != owner_id
+        ):
+            raise AgentError("run_not_found", "Run does not exist", status_code=404)
         spec = ExperimentSpec.model_validate_json(spec_row.canonical_json)
         mapping = DatasetMappingSpec.model_validate_json(mapping_row.canonical_json)
     final_dir = settings.managed_root / "runs" / run_id
@@ -478,7 +494,7 @@ def run_backtest(
     shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True)
     started = time.monotonic()
-    prepared = _prepare_data(engine, registry, spec, mapping)
+    prepared = _prepare_data(engine, registry, spec, mapping, owner_id)
     lookup = _lookup(prepared.frame)
     predictions: list[dict[str, Any]] = []
     expected_rows = {"calibration": 0, "test": 0}
@@ -624,7 +640,7 @@ def run_backtest(
         "schema_version": "1.0",
         "run_id": run_id,
         "source": _source_revision(),
-        "dataset_hash": _dataset_hash(engine, spec.dataset_version_id),
+        "dataset_hash": _dataset_hash(engine, spec.dataset_version_id, owner_id),
         "mapping_hash": mapping_row.mapping_hash,
         "profile_hash": profile_row.profile_hash,
         "spec_hash": spec_row.spec_hash,
@@ -651,11 +667,22 @@ def run_backtest(
     )
 
 
-def _dataset_hash(engine: Engine, version_id: str) -> str:
+def _dataset_hash(
+    engine: Engine,
+    version_id: str,
+    owner_id: str = LOCAL_OWNER_ID,
+) -> str:
     from vonavy_agent.persistence import DatasetVersion
 
     with Session(engine) as session:
-        return session.get_one(DatasetVersion, version_id).materialized_blob_sha256
+        version = session.get(DatasetVersion, version_id)
+        if version is None or version.owner_id != owner_id:
+            raise AgentError(
+                "dataset_version_not_found",
+                "Dataset version does not exist",
+                status_code=404,
+            )
+        return version.materialized_blob_sha256
 
 
 def _environment(settings: Settings) -> dict[str, Any]:

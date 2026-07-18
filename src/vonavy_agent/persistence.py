@@ -10,6 +10,8 @@ from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text, create
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
+from vonavy_agent.identity import LOCAL_OWNER_ID
+
 
 class Base(DeclarativeBase):
     pass
@@ -21,6 +23,7 @@ def new_id() -> str:
 
 class Dataset(Base):
     __tablename__ = "datasets"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
@@ -37,6 +40,7 @@ class Blob(Base):
 
 class DatasetVersion(Base):
     __tablename__ = "dataset_versions"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"))
     version_number: Mapped[int] = mapped_column(Integer)
@@ -51,6 +55,7 @@ class DatasetVersion(Base):
 
 class DatasetMapping(Base):
     __tablename__ = "dataset_mappings"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     dataset_version_id: Mapped[str] = mapped_column(ForeignKey("dataset_versions.id"))
     mapping_hash: Mapped[str] = mapped_column(String(64), index=True)
@@ -60,6 +65,7 @@ class DatasetMapping(Base):
 
 class DataProfile(Base):
     __tablename__ = "data_profiles"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     dataset_version_id: Mapped[str] = mapped_column(ForeignKey("dataset_versions.id"))
     mapping_id: Mapped[str] = mapped_column(ForeignKey("dataset_mappings.id"))
@@ -70,6 +76,7 @@ class DataProfile(Base):
 
 class ExperimentSpecRow(Base):
     __tablename__ = "experiment_specs"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     spec_hash: Mapped[str] = mapped_column(String(64), index=True)
     canonical_json: Mapped[str] = mapped_column(Text)
@@ -81,6 +88,7 @@ class ExperimentSpecRow(Base):
 
 class GateResultRow(Base):
     __tablename__ = "gate_results"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     spec_id: Mapped[str] = mapped_column(ForeignKey("experiment_specs.id"))
     spec_hash: Mapped[str] = mapped_column(String(64))
@@ -93,6 +101,7 @@ class GateResultRow(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     kind: Mapped[str] = mapped_column(String(30))
     state: Mapped[str] = mapped_column(String(20), default="queued", index=True)
@@ -120,6 +129,7 @@ class JobEvent(Base):
 
 class Run(Base):
     __tablename__ = "runs"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), unique=True)
     spec_id: Mapped[str] = mapped_column(ForeignKey("experiment_specs.id"))
@@ -148,6 +158,7 @@ class RunMetric(Base):
 
 class PlannerProposal(Base):
     __tablename__ = "planner_proposals"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     input_hash: Mapped[str] = mapped_column(String(64))
     canonical_json: Mapped[str] = mapped_column(Text)
@@ -159,6 +170,7 @@ class PlannerProposal(Base):
 
 class AdapterSnapshot(Base):
     __tablename__ = "adapter_snapshots"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     adapter_kind: Mapped[str] = mapped_column(String(30))
     manifest_kind: Mapped[str] = mapped_column(String(30))
@@ -170,6 +182,7 @@ class AdapterSnapshot(Base):
 
 class Export(Base):
     __tablename__ = "exports"
+    owner_id: Mapped[str] = mapped_column(String(128), default=LOCAL_OWNER_ID, index=True)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), unique=True)
     run_ids_json: Mapped[str] = mapped_column(Text)

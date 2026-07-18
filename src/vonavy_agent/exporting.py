@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from vonavy_agent.domain import JobState
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_json, file_hash
+from vonavy_agent.identity import LOCAL_OWNER_ID
 from vonavy_agent.managed_files import fsync_tree, verified_managed_file
 from vonavy_agent.persistence import (
     ExperimentSpecRow,
@@ -43,6 +44,7 @@ def stage_static_export(
     export_id: str,
     run_ids: list[str],
     stage_dir: Path,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> StagedExport:
     reports: list[dict[str, Any]] = []
     with Session(engine) as session:
@@ -50,6 +52,7 @@ def stage_static_export(
             run = session.get(Run, run_id)
             if (
                 run is None
+                or run.owner_id != owner_id
                 or not run.summary_json
                 or not run.artifact_relative_path
                 or not run.manifest_hash
@@ -58,13 +61,19 @@ def stage_static_export(
                     "run_not_exportable",
                     f"Run {run_id} is not a successful published run",
                 )
-            if session.get_one(Job, run.job_id).state != JobState.SUCCEEDED.value:
+            job = session.get_one(Job, run.job_id)
+            if job.owner_id != owner_id or job.state != JobState.SUCCEEDED.value:
                 raise AgentError(
                     "run_not_exportable",
                     f"Run {run_id} is not a successful published run",
                 )
             spec = session.get_one(ExperimentSpecRow, run.spec_id)
             gate = session.get_one(GateResultRow, run.gate_result_id)
+            if spec.owner_id != owner_id or gate.owner_id != owner_id:
+                raise AgentError(
+                    "run_not_exportable",
+                    f"Run {run_id} is not a successful published run",
+                )
             manifest_relative = Path(run.artifact_relative_path) / "manifest.json"
             with verified_managed_file(
                 settings, manifest_relative, run.manifest_hash
@@ -160,6 +169,7 @@ def create_static_export(
     export_id: str,
     run_ids: list[str],
     before_publish: Callable[[], None] | None = None,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> dict[str, Any]:
     stage_dir = Path(
         tempfile.mkdtemp(
@@ -167,7 +177,14 @@ def create_static_export(
             dir=settings.managed_root / "jobs" / "tmp",
         )
     )
-    staged = stage_static_export(engine, settings, export_id, run_ids, stage_dir)
+    staged = stage_static_export(
+        engine,
+        settings,
+        export_id,
+        run_ids,
+        stage_dir,
+        owner_id,
+    )
     if before_publish is not None:
         before_publish()
     staged.final_path.parent.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,7 @@ from vonavy_agent.domain import (
 )
 from vonavy_agent.errors import AgentError
 from vonavy_agent.hashing import canonical_hash, canonical_json, file_hash
+from vonavy_agent.identity import LOCAL_OWNER_ID
 from vonavy_agent.persistence import (
     Blob,
     DataProfile,
@@ -105,6 +106,7 @@ class DatasetRegistry:
         mode: str = "snapshot",
         dataset_id: str | None = None,
         parent_version_id: str | None = None,
+        owner_id: str = LOCAL_OWNER_ID,
     ) -> DatasetVersion:
         safe_name = _safe_original_name(inbox_name)
         source_fd = self.settings.open_managed_file(Path("inbox") / safe_name)
@@ -137,6 +139,7 @@ class DatasetRegistry:
                 mode=mode,
                 dataset_id=dataset_id,
                 parent_version_id=parent_version_id,
+                owner_id=owner_id,
             )
         finally:
             os.close(source_fd)
@@ -152,6 +155,7 @@ class DatasetRegistry:
         mode: str = "snapshot",
         dataset_id: str | None = None,
         parent_version_id: str | None = None,
+        owner_id: str = LOCAL_OWNER_ID,
     ) -> DatasetVersion:
         safe_name = _safe_original_name(original_name)
         temp_path, _ = self._stage_stream(stream, Path(safe_name).suffix.lower())
@@ -163,6 +167,7 @@ class DatasetRegistry:
                 mode=mode,
                 dataset_id=dataset_id,
                 parent_version_id=parent_version_id,
+                owner_id=owner_id,
             )
         finally:
             temp_path.unlink(missing_ok=True)
@@ -201,6 +206,7 @@ class DatasetRegistry:
         mode: str,
         dataset_id: str | None,
         parent_version_id: str | None,
+        owner_id: str,
     ) -> DatasetVersion:
         if not dataset_name.strip() or len(dataset_name) > 200:
             raise AgentError("invalid_dataset_name", "Dataset name must contain 1-200 characters")
@@ -215,10 +221,10 @@ class DatasetRegistry:
             raise AgentError("invalid_schema", "Dataset columns must be present and unique")
         source_blob = self._publish_blob(temp_path, media_type)
         materialized_blob, materialized_rows = self._materialize(
-            frame, mode, dataset_id, parent_version_id
+            frame, mode, dataset_id, parent_version_id, owner_id
         )
         with session_scope(self.engine) as session:
-            dataset = self._resolve_dataset(session, dataset_name, dataset_id, mode)
+            dataset = self._resolve_dataset(session, dataset_name, dataset_id, mode, owner_id)
             version_number = (
                 session.scalar(
                     select(func.coalesce(func.max(DatasetVersion.version_number), 0)).where(
@@ -228,6 +234,7 @@ class DatasetRegistry:
                 or 0
             ) + 1
             version = DatasetVersion(
+                owner_id=owner_id,
                 dataset_id=dataset.id,
                 version_number=version_number,
                 parent_id=parent_version_id,
@@ -249,15 +256,16 @@ class DatasetRegistry:
         dataset_name: str,
         dataset_id: str | None,
         mode: str,
+        owner_id: str,
     ) -> Dataset:
         if dataset_id:
             dataset = session.get(Dataset, dataset_id)
-            if dataset is None:
+            if dataset is None or dataset.owner_id != owner_id:
                 raise AgentError("dataset_not_found", "Dataset does not exist", status_code=404)
             return dataset
         if mode == "append":
             raise AgentError("missing_dataset", "Append requires an existing dataset")
-        dataset = Dataset(name=dataset_name.strip())
+        dataset = Dataset(owner_id=owner_id, name=dataset_name.strip())
         session.add(dataset)
         session.flush()
         return dataset
@@ -268,12 +276,13 @@ class DatasetRegistry:
         mode: str,
         dataset_id: str | None,
         parent_version_id: str | None,
+        owner_id: str,
     ) -> tuple[Blob, int]:
         frame = incoming
         if mode == "append":
             with Session(self.engine) as session:
                 parent = session.get(DatasetVersion, parent_version_id)
-                if parent is None or parent.dataset_id != dataset_id:
+                if parent is None or parent.dataset_id != dataset_id or parent.owner_id != owner_id:
                     raise AgentError(
                         "invalid_parent", "Append parent does not belong to the dataset"
                     )
@@ -401,9 +410,14 @@ class DatasetRegistry:
         with os.fdopen(fd, "rb") as handle:
             yield handle
 
-    def materialized_path(self, session: Session, version_id: str) -> Path:
+    def materialized_path(
+        self,
+        session: Session,
+        version_id: str,
+        owner_id: str = LOCAL_OWNER_ID,
+    ) -> Path:
         version = session.get(DatasetVersion, version_id)
-        if version is None:
+        if version is None or version.owner_id != owner_id:
             raise AgentError(
                 "dataset_version_not_found", "Dataset version does not exist", status_code=404
             )
@@ -412,9 +426,14 @@ class DatasetRegistry:
             pass
         return self.settings.managed_root / blob.relative_path
 
-    def read_materialized_frame(self, session: Session, version_id: str) -> pd.DataFrame:
+    def read_materialized_frame(
+        self,
+        session: Session,
+        version_id: str,
+        owner_id: str = LOCAL_OWNER_ID,
+    ) -> pd.DataFrame:
         version = session.get(DatasetVersion, version_id)
-        if version is None:
+        if version is None or version.owner_id != owner_id:
             raise AgentError(
                 "dataset_version_not_found", "Dataset version does not exist", status_code=404
             )
@@ -422,9 +441,20 @@ class DatasetRegistry:
         with self._open_verified_blob(blob) as handle:
             return pd.read_parquet(handle)
 
-    def create_mapping(self, version_id: str, mapping: DatasetMappingSpec) -> DatasetMapping:
+    def create_mapping(
+        self,
+        version_id: str,
+        mapping: DatasetMappingSpec,
+        owner_id: str = LOCAL_OWNER_ID,
+    ) -> DatasetMapping:
         with session_scope(self.engine) as session:
-            version = session.get_one(DatasetVersion, version_id)
+            version = session.get(DatasetVersion, version_id)
+            if version is None or version.owner_id != owner_id:
+                raise AgentError(
+                    "dataset_version_not_found",
+                    "Dataset version does not exist",
+                    status_code=404,
+                )
             blob = session.get_one(Blob, version.materialized_blob_sha256)
             with self._open_verified_blob(blob) as handle:
                 columns = set(pq.read_schema(handle).names)
@@ -449,6 +479,7 @@ class DatasetRegistry:
                 )
             payload = mapping.model_dump(mode="json")
             row = DatasetMapping(
+                owner_id=owner_id,
                 dataset_version_id=version_id,
                 mapping_hash=canonical_hash(payload),
                 canonical_json=canonical_json(payload),
@@ -462,6 +493,7 @@ class DatasetRegistry:
 
 @dataclass(frozen=True)
 class ProfileComputation:
+    owner_id: str
     dataset_version_id: str
     mapping_id: str
     profile_hash: str
@@ -473,13 +505,18 @@ def compute_profile(
     version_id: str,
     mapping_id: str,
     max_categories: int,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> ProfileComputation:
     with Session(registry.engine) as session:
         mapping_row = session.get(DatasetMapping, mapping_id)
-        if mapping_row is None or mapping_row.dataset_version_id != version_id:
+        if (
+            mapping_row is None
+            or mapping_row.dataset_version_id != version_id
+            or mapping_row.owner_id != owner_id
+        ):
             raise AgentError("mapping_not_found", "Mapping does not belong to the dataset version")
         mapping = DatasetMappingSpec.model_validate_json(mapping_row.canonical_json)
-        frame = registry.read_materialized_frame(session, version_id)
+        frame = registry.read_materialized_frame(session, version_id, owner_id)
     timestamps = pd.to_datetime(frame[mapping.timestamp_column], errors="coerce", utc=True)
     invalid_timestamps = int(timestamps.isna().sum())
     dates = timestamps.dt.tz_convert(None).dt.normalize()
@@ -616,6 +653,7 @@ def compute_profile(
     }
     profile_hash = canonical_hash(profile)
     return ProfileComputation(
+        owner_id=owner_id,
         dataset_version_id=version_id,
         mapping_id=mapping_id,
         profile_hash=profile_hash,
@@ -629,6 +667,7 @@ def publish_profile(
     row_id: str | None = None,
 ) -> DataProfile:
     row = DataProfile(
+        owner_id=computation.owner_id,
         dataset_version_id=computation.dataset_version_id,
         mapping_id=computation.mapping_id,
         profile_hash=computation.profile_hash,
@@ -647,8 +686,15 @@ def build_profile(
     mapping_id: str,
     max_categories: int,
     before_publish: Callable[[], None] | None = None,
+    owner_id: str = LOCAL_OWNER_ID,
 ) -> DataProfile:
-    computation = compute_profile(registry, version_id, mapping_id, max_categories)
+    computation = compute_profile(
+        registry,
+        version_id,
+        mapping_id,
+        max_categories,
+        owner_id,
+    )
     if before_publish is not None:
         before_publish()
     with session_scope(registry.engine) as session:

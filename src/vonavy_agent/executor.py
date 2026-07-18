@@ -155,6 +155,7 @@ def execute(context: ExecutionContext) -> dict[str, Any]:
         job = session.get_one(Job, context.job_id)
         payload = json.loads(job.payload_json)
         kind = job.kind
+        owner_id = job.owner_id
     result: dict[str, Any]
     if kind == "profile":
         profile_computation = compute_profile(
@@ -162,6 +163,7 @@ def execute(context: ExecutionContext) -> dict[str, Any]:
             payload["dataset_version_id"],
             payload["mapping_id"],
             context.settings.max_profile_categories,
+            owner_id,
         )
         profile_id = new_id()
         context.begin_publish()
@@ -175,6 +177,7 @@ def execute(context: ExecutionContext) -> dict[str, Any]:
             context.engine,
             DatasetRegistry(context.settings, context.engine),
             payload["spec_id"],
+            owner_id,
         )
         gate_id = new_id()
         context.begin_publish()
@@ -195,6 +198,7 @@ def execute(context: ExecutionContext) -> dict[str, Any]:
             / context.job_id
             / context.lease_token
             / "export",
+            owner_id,
         )
         result = staged_export.result
         context.begin_publish()
@@ -219,6 +223,7 @@ def execute(context: ExecutionContext) -> dict[str, Any]:
             context.lease_token,
             ownership_check=context.assert_running,
             before_publish=context.begin_publish,
+            owner_id=owner_id,
         )
         result = {
             "run_id": run.id,

@@ -113,7 +113,11 @@ class ControlPlaneStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, env=env, description=description)
         self.config = config
-        removal_policy = RemovalPolicy.RETAIN if config.protect_data else RemovalPolicy.DESTROY
+        durable_removal_policy = (
+            RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE
+            if config.protect_data
+            else RemovalPolicy.DESTROY
+        )
 
         upload_bucket = s3.Bucket(
             self,
@@ -122,7 +126,7 @@ class ControlPlaneStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
             versioned=False,
-            removal_policy=removal_policy,
+            removal_policy=durable_removal_policy,
             auto_delete_objects=not config.protect_data,
             lifecycle_rules=[
                 s3.LifecycleRule(
@@ -143,7 +147,7 @@ class ControlPlaneStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
             versioned=True,
-            removal_policy=removal_policy,
+            removal_policy=durable_removal_policy,
             auto_delete_objects=not config.protect_data,
             lifecycle_rules=[
                 s3.LifecycleRule(
@@ -170,7 +174,7 @@ class ControlPlaneStack(Stack):
             ),
             time_to_live_attribute="expires_at",
             deletion_protection=config.protect_data,
-            removal_policy=removal_policy,
+            removal_policy=durable_removal_policy,
         )
 
         web_bucket = s3.Bucket(
@@ -179,8 +183,8 @@ class ControlPlaneStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
-            removal_policy=removal_policy,
-            auto_delete_objects=not config.protect_data,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
         )
 
         web_security_headers = cloudfront.ResponseHeadersPolicy(
@@ -277,7 +281,7 @@ class ControlPlaneStack(Stack):
                 temp_password_validity=Duration.days(3),
             ),
             deletion_protection=config.protect_data,
-            removal_policy=removal_policy,
+            removal_policy=durable_removal_policy,
         )
         api_resource_scope = cognito.ResourceServerScope(
             scope_name="api",
@@ -315,7 +319,7 @@ class ControlPlaneStack(Stack):
             self,
             "ControlPlaneLogs",
             retention=logs.RetentionDays.TWO_WEEKS,
-            removal_policy=removal_policy,
+            removal_policy=durable_removal_policy,
         )
         control_plane_function = lambda_.Function(
             self,
@@ -326,7 +330,6 @@ class ControlPlaneStack(Stack):
             code=lambda_.Code.from_asset(str(Path(__file__).parents[1] / "lambda/control_plane")),
             timeout=Duration.seconds(15),
             memory_size=256,
-            reserved_concurrent_executions=2,
             log_group=control_plane_log_group,
             environment={
                 "UPLOAD_BUCKET": upload_bucket.bucket_name,
@@ -406,7 +409,7 @@ class ControlPlaneStack(Stack):
             self,
             "ApiAccessLogs",
             retention=logs.RetentionDays.TWO_WEEKS,
-            removal_policy=removal_policy,
+            removal_policy=durable_removal_policy,
         )
         api_access_log_format = (
             '{"requestId":"$context.requestId",'

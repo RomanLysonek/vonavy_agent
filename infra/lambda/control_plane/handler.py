@@ -160,19 +160,30 @@ def _route(event: dict[str, Any]) -> tuple[str, str]:
     return method.upper(), path
 
 
+def _slot_is_reserved(item: dict[str, Any], now: int) -> bool:
+    status = item.get("status")
+    if status == "pending":
+        return int(item.get("expires_at", 0)) > now
+    return status not in {"released", "free", "expired"}
+
+
 def _next_owner_upload_slot(table: Any, owner: str, requested_bytes: int) -> int:
     response = table.query(
         KeyConditionExpression=Key("pk").eq(f"USER#{owner}") & Key("sk").begins_with("SLOT#"),
         ConsistentRead=True,
-        ProjectionExpression="slot_number, expected_size",
+        ProjectionExpression="slot_number, expected_size, #status, expires_at",
+        ExpressionAttributeNames={"#status": "status"},
     )
     items = response.get("Items", [])
     used_slots: set[int] = set()
     reserved_bytes = 0
+    now = int(time.time())
     for item in items:
         slot_number = int(item["slot_number"])
         if not 0 <= slot_number < MAX_DATASETS_PER_OWNER:
             raise ApiError("quota_state_invalid", "Stored quota state is invalid", 500)
+        if not _slot_is_reserved(item, now):
+            continue
         used_slots.add(slot_number)
         reserved_bytes += int(item["expected_size"])
 
@@ -193,6 +204,67 @@ def _next_owner_upload_slot(table: Any, owner: str, requested_bytes: int) -> int
     return next(slot for slot in range(MAX_DATASETS_PER_OWNER) if slot not in used_slots)
 
 
+def _transaction_cancel_codes(exc: ClientError) -> list[str]:
+    reasons = exc.response.get("CancellationReasons")
+    if not isinstance(reasons, list):
+        return []
+    codes: list[str] = []
+    for reason in reasons:
+        if isinstance(reason, dict):
+            code = reason.get("Code")
+            codes.append(code if isinstance(code, str) else "None")
+        else:
+            codes.append("Unknown")
+    return codes
+
+
+def _is_transaction_canceled(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") == "TransactionCanceledException"
+
+
+def _handle_create_upload_transaction_cancel(
+    exc: ClientError,
+    *,
+    upload_id: str,
+    dataset_id: str,
+) -> None:
+    codes = _transaction_cancel_codes(exc)
+    request_id = exc.response.get("ResponseMetadata", {}).get("RequestId")
+    if (
+        codes
+        and codes[0] == "ConditionalCheckFailed"
+        and all(code in {"None", "ConditionalCheckFailed"} for code in codes[1:])
+    ):
+        raise ApiError(
+            "upload_slot_busy",
+            "Upload capacity changed concurrently; retry the request",
+            409,
+        ) from exc
+    LOGGER.warning(
+        "Create-upload DynamoDB transaction was canceled",
+        extra={
+            "route": "POST /api/upload-sessions",
+            "aws_request_id": request_id,
+            "cancellation_codes": codes,
+            "upload_id": upload_id,
+            "dataset_id": dataset_id,
+            "action_order": ["slot", "dataset", "upload"],
+        },
+    )
+    if "TransactionConflict" in codes:
+        raise ApiError(
+            "upload_transaction_conflict",
+            "Upload metadata changed concurrently; retry the request",
+            503,
+        ) from exc
+    raise ApiError(
+        "upload_transaction_failed",
+        "Upload metadata could not be reserved",
+        503,
+        {"requestId": request_id},
+    ) from exc
+
+
 def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
     owner, email = _identity(event)
     dataset_name, filename, media_type, size_bytes = _validate_upload(_parse_body(event))
@@ -200,7 +272,7 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
     created_at = datetime.now(UTC).isoformat()
     owner_pk = f"USER#{owner}"
 
-    for attempt in range(5):
+    for _attempt in range(5):
         slot_number = _next_owner_upload_slot(table, owner, size_bytes)
         now = int(time.time())
         pending_expires_at = now + 86400
@@ -213,23 +285,38 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
             table.meta.client.transact_write_items(
                 TransactItems=[
                     {
-                        "Put": {
+                        "Update": {
                             "TableName": METADATA_TABLE,
-                            "Item": {
-                                "pk": {"S": owner_pk},
-                                "sk": {"S": slot_key},
-                                "entity_type": {"S": "UPLOAD_SLOT"},
-                                "owner_sub": {"S": owner},
-                                "slot_number": {"N": str(slot_number)},
-                                "dataset_id": {"S": dataset_id},
-                                "upload_id": {"S": upload_id},
-                                "expected_size": {"N": str(size_bytes)},
-                                "status": {"S": "pending"},
-                                "created_at": {"S": created_at},
-                                "updated_at": {"S": created_at},
-                                "expires_at": {"N": str(pending_expires_at)},
+                            "Key": {"pk": {"S": owner_pk}, "sk": {"S": slot_key}},
+                            "UpdateExpression": (
+                                "SET entity_type = :entity, owner_sub = :owner, "
+                                "slot_number = :slot, dataset_id = :dataset, upload_id = :upload, "
+                                "expected_size = :size, #status = :pending, "
+                                "created_at = if_not_exists(created_at, :created), "
+                                "updated_at = :updated, expires_at = :expires"
+                            ),
+                            "ConditionExpression": (
+                                "attribute_not_exists(pk) "
+                                "OR #status IN (:released, :free, :expired) "
+                                "OR (#status = :pending AND expires_at <= :now)"
+                            ),
+                            "ExpressionAttributeNames": {"#status": "status"},
+                            "ExpressionAttributeValues": {
+                                ":entity": {"S": "UPLOAD_SLOT"},
+                                ":owner": {"S": owner},
+                                ":slot": {"N": str(slot_number)},
+                                ":dataset": {"S": dataset_id},
+                                ":upload": {"S": upload_id},
+                                ":size": {"N": str(size_bytes)},
+                                ":pending": {"S": "pending"},
+                                ":released": {"S": "released"},
+                                ":free": {"S": "free"},
+                                ":expired": {"S": "expired"},
+                                ":created": {"S": created_at},
+                                ":updated": {"S": created_at},
+                                ":expires": {"N": str(pending_expires_at)},
+                                ":now": {"N": str(now)},
                             },
-                            "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
                         }
                     },
                     {
@@ -284,14 +371,12 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
                 ]
             )
         except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
-                if attempt < 4:
-                    continue
-                raise ApiError(
-                    "upload_slot_busy",
-                    "Upload capacity changed concurrently; retry the request",
-                    409,
-                ) from exc
+            if _is_transaction_canceled(exc):
+                _handle_create_upload_transaction_cancel(
+                    exc,
+                    upload_id=upload_id,
+                    dataset_id=dataset_id,
+                )
             raise
         break
 

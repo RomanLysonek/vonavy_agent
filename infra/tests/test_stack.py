@@ -51,6 +51,18 @@ def _resource_mentions(statement: dict[str, Any], fragment: str) -> bool:
     return fragment in _json_text(statement.get("Resource"))
 
 
+def _resource_by_logical_id_prefix(
+    template: Template, resource_type: str, prefix: str
+) -> dict[str, Any]:
+    matches = {
+        logical_id: resource
+        for logical_id, resource in template.find_resources(resource_type).items()
+        if logical_id.startswith(prefix)
+    }
+    assert len(matches) == 1, matches.keys()
+    return next(iter(matches.values()))
+
+
 def test_stack_is_serverless_and_has_no_network_compute() -> None:
     template = _template()
     template.resource_count_is("AWS::EC2::Instance", 0)
@@ -199,12 +211,21 @@ def test_lambda_separates_staging_and_immutable_data_permissions() -> None:
     } <= _actions(data_statement)
 
 
-def test_lambda_has_bounded_concurrency_and_upload_policy() -> None:
+def test_lambda_uses_unreserved_concurrency_and_upload_policy() -> None:
     template = _template()
+    functions = template.find_resources("AWS::Lambda::Function")
+    control_plane_functions = [
+        resource
+        for logical_id, resource in functions.items()
+        if logical_id.startswith("ControlPlaneFunction")
+    ]
+    assert len(control_plane_functions) == 1
+    control_plane_function = control_plane_functions[0]
+
+    assert "ReservedConcurrentExecutions" not in control_plane_function["Properties"]
     template.has_resource_properties(
         "AWS::Lambda::Function",
         {
-            "ReservedConcurrentExecutions": 2,
             "MemorySize": 256,
             "Timeout": 15,
             "Environment": {
@@ -221,6 +242,39 @@ def test_lambda_has_bounded_concurrency_and_upload_policy() -> None:
             },
         },
     )
+
+
+def test_durable_resources_are_rollback_safe_and_retained_after_create() -> None:
+    template = _template()
+    resources = [
+        ("AWS::S3::Bucket", "UploadBucket"),
+        ("AWS::S3::Bucket", "DataBucket"),
+        ("AWS::DynamoDB::Table", "MetadataTable"),
+        ("AWS::Cognito::UserPool", "UserPool"),
+        ("AWS::Logs::LogGroup", "ApiAccessLogs"),
+        ("AWS::Logs::LogGroup", "ControlPlaneLogs"),
+    ]
+
+    for resource_type, logical_id_prefix in resources:
+        resource = _resource_by_logical_id_prefix(template, resource_type, logical_id_prefix)
+        assert resource["DeletionPolicy"] == "RetainExceptOnCreate"
+        assert resource["UpdateReplacePolicy"] == "Retain"
+
+
+def test_static_web_bucket_is_destroyed_with_auto_delete_helper() -> None:
+    template = _template()
+    web_bucket = _resource_by_logical_id_prefix(template, "AWS::S3::Bucket", "WebBucket")
+    assert web_bucket["DeletionPolicy"] == "Delete"
+    assert web_bucket["UpdateReplacePolicy"] == "Delete"
+
+    auto_delete_resources = template.find_resources("Custom::S3AutoDeleteObjects")
+    web_bucket_auto_delete_resources = [
+        resource
+        for resource in auto_delete_resources.values()
+        if _json_text(resource.get("Properties", {}).get("BucketName"))
+        == _json_text({"Ref": "WebBucket12880F5B"})
+    ]
+    assert len(web_bucket_auto_delete_resources) == 1
 
 
 def test_every_api_route_requires_jwt_and_custom_scope() -> None:

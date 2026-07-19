@@ -1,6 +1,6 @@
 # Experiment Agent
 
-> Current development line: Phase 0 cloud-neutral boundaries. Local evaluation remains fully supported; AWS deployment is not implemented yet.
+> Current development line: Phase 1 serverless control plane. Local evaluation remains fully supported; the AWS slice is implemented for synthesis and review but must not be deployed before its CDK/IAM diff is approved.
 
 Local, deterministic forecasting experiment workbench for the NOTINO interview
 portfolio. It copies permitted CSV/Parquet data into immutable content-addressed
@@ -130,3 +130,25 @@ simulated by the current local runner. See `docs/phase-0-cloud-boundaries.md`.
 
 Airflow, Celery, Redis, Kubernetes, arbitrary shell, uploaded code execution,
 and editable sibling imports remain non-goals.
+
+
+## AWS control plane
+
+The `infra/` CDK application implements the first scale-to-zero AWS slice:
+
+- private CloudFront-hosted static UI;
+- invite-only Cognito authorization-code login with PKCE;
+- API Gateway HTTP API with JWT scope enforcement;
+- bounded Lambda API;
+- owner-scoped DynamoDB metadata;
+- a private unversioned S3 staging bucket plus private versioned final-data storage;
+- short-lived direct browser-to-S3 uploads with exact-size POST policy, hard
+  server-owned slot limits, immutable final copies, and lifecycle expiry.
+
+This phase creates no EC2, NAT Gateway, RDS, SageMaker, AWS Batch, training, or
+GPU resources. It is not yet deployed. The executor must generate and commit
+`infra/uv.lock` and `infra/package-lock.json`, pass all root and infrastructure
+quality gates, synthesize the stack, and return the complete IAM diff before
+`cdk bootstrap` or `cdk deploy` is considered. See
+`docs/phase-1-serverless-control-plane.md` and
+`ops/phase-1-synth-and-review.md`.

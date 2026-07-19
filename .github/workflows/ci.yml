@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -11,6 +12,7 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
@@ -23,3 +25,38 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
       - run: uv run pytest
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+      - name: Require committed infrastructure locks
+        run: test -f infra/uv.lock && test -f infra/package-lock.json
+      - run: uv sync --frozen --extra dev
+        working-directory: infra
+      - run: npm ci
+        working-directory: infra
+      - run: uv run ruff check .
+        working-directory: infra
+      - run: uv run ruff format --check .
+        working-directory: infra
+      - run: uv run mypy vonavy_infra
+        working-directory: infra
+      - run: uv run pytest
+        working-directory: infra
+      - run: node --check web/app.js
+        working-directory: infra
+      - run: npm exec cdk synth
+        working-directory: infra
+        env:
+          CDK_DEFAULT_REGION: eu-central-1
+          VONAVY_ENVIRONMENT: ci
+          VONAVY_PROTECT_DATA: "true"

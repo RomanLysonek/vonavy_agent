@@ -1,0 +1,7 @@
+.cdk.staging/
+.venv/
+cdk.out/
+node_modules/
+.pytest_cache/
+__pycache__/
+*.py[cod]

@@ -8,3 +8,11 @@ __pycache__/
 *.py[cod]
 coverage.xml
 htmlcov/
+infra/.cdk.staging/
+infra/.venv/
+infra/cdk.out/
+infra/node_modules/
+
+# Local CDK review evidence
+/phase*-cdk-diff.txt
+/phase*-cdk-security-diff.txt

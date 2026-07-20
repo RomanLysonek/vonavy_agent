@@ -3,23 +3,23 @@ from __future__ import annotations
 import argparse
 from datetime import date, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pandas as pd
-import uvicorn
-
-from vonavy_agent.api import create_app, migrate
-from vonavy_agent.jobs import Worker
-from vonavy_agent.persistence import create_db_engine
-from vonavy_agent.settings import Settings
+if TYPE_CHECKING:
+    from vonavy_agent.settings import Settings
 
 
 def _settings(args: argparse.Namespace) -> Settings:
+    from vonavy_agent.settings import Settings
+
     if getattr(args, "managed_root", None):
         return Settings(managed_root=Path(args.managed_root))
     return Settings()
 
 
 def demo_data(destination: Path) -> None:
+    import pandas as pd
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     start = date(2025, 1, 1)
     rows: list[dict[str, object]] = []
@@ -60,11 +60,26 @@ def main() -> None:
     migration.add_argument("--managed-root")
     demo = subparsers.add_parser("demo-data")
     demo.add_argument("destination", type=Path)
+    validate = subparsers.add_parser("validate-dataset")
+    validate.add_argument("--request", required=True, type=Path)
+    validate.add_argument("--result", required=True)
+    validate.add_argument("--workspace", type=Path)
     args = parser.parse_args()
     if args.command == "demo-data":
         demo_data(args.destination)
         print(f"Wrote synthetic daily panel data to {args.destination}")
         return
+    if args.command == "validate-dataset":
+        from vonavy_agent.validation_worker.cli import run_cli as run_validation_cli
+
+        raise SystemExit(run_validation_cli(args.request, args.result, args.workspace))
+
+    import uvicorn
+
+    from vonavy_agent.api import create_app, migrate
+    from vonavy_agent.jobs import Worker
+    from vonavy_agent.persistence import create_db_engine
+
     settings = _settings(args)
     migrate(settings)
     if args.command == "migrate":

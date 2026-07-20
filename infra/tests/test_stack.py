@@ -344,6 +344,10 @@ def test_validation_job_definition_is_bounded_fargate() -> None:
     assert properties["PlatformCapabilities"] == ["FARGATE"]
     assert properties["Timeout"]["AttemptDurationSeconds"] == 900
     assert properties["RetryStrategy"]["Attempts"] == 1
+    assert "PropagateTags" not in properties
+    assert not any(
+        "batch:TagResource" in _actions(statement) for statement in _policy_statements(_template())
+    )
     assert '"Type":"VCPU","Value":"1"' in serialized
     assert '"Type":"MEMORY","Value":"2048"' in serialized
     assert "VONAVY_DATA_BUCKET" in serialized

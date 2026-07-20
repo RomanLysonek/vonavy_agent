@@ -1083,8 +1083,6 @@ def _create_validation_job(event: dict[str, Any], dataset_id: str) -> tuple[int,
                     }
                 ]
             },
-            tags={"project": "vonavy-agent", "phase": "2b", "validationJobId": job_id},
-            propagateTags=True,
         )
     except ClientError as exc:
         _release_validation_slot_after_submission_failure(

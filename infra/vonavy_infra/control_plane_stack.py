@@ -293,7 +293,6 @@ class ControlPlaneStack(Stack):
             container=validation_container,
             retry_attempts=1,
             timeout=Duration.seconds(config.validation_job_timeout_seconds),
-            propagate_tags=True,
         )
         validation_compute_environment = batch.FargateComputeEnvironment(
             self,

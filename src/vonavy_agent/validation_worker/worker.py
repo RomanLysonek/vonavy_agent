@@ -27,6 +27,7 @@ from vonavy_agent.validation_contracts import (
 )
 from vonavy_agent.validation_worker.artifacts import (
     ArtifactReader,
+    ArtifactTooLargeError,
     UnsafeArtifactPathError,
 )
 from vonavy_agent.validation_worker.profiling import (
@@ -248,6 +249,17 @@ def validate_request(
             started_monotonic=started_monotonic,
             start_cpu=start_cpu,
             errors=(_issue(exc.code, exc.message, column=exc.column),),
+            input_identity=input_identity,
+            data_format=data_format,
+        )
+    except ArtifactTooLargeError:
+        return _result(
+            request,
+            status=ValidationStatus.INVALID,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            start_cpu=start_cpu,
+            errors=(_issue("input_too_large", "Input exceeds the configured byte limit"),),
             input_identity=input_identity,
             data_format=data_format,
         )

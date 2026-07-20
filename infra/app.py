@@ -30,6 +30,11 @@ config = DeploymentConfig(
     upload_retention_days=int(os.getenv("VONAVY_UPLOAD_RETENTION_DAYS", "14")),
     protect_data=_boolean("VONAVY_PROTECT_DATA", True),
     local_callback_url=os.getenv("VONAVY_LOCAL_CALLBACK_URL", "http://localhost:5173/"),
+    validation_job_timeout_seconds=int(os.getenv("VONAVY_VALIDATION_JOB_TIMEOUT_SECONDS", "900")),
+    validation_max_active_jobs_per_owner=int(
+        os.getenv("VONAVY_VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER", "1")
+    ),
+    source_revision=os.getenv("VONAVY_SOURCE_REVISION", "unknown"),
 )
 
 ControlPlaneStack(

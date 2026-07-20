@@ -33,3 +33,8 @@ pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
   main { padding-top: 36px; }
   .identity-row, .section-heading { align-items: flex-start; flex-direction: column; }
 }
+.dataset-actions { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+.validation-status { color: #bfdbfe; font-size: 14px; }
+@media (max-width: 620px) {
+  .dataset-actions { align-items: flex-start; flex-direction: column; }
+}

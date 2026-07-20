@@ -1,6 +1,6 @@
 # Experiment Agent
 
-> Current development line: Phase 2A dataset validation worker. The Phase 1 serverless control plane is deployed and end-to-end certified; local evaluation remains fully supported.
+> Current development line: Phase 2B ephemeral AWS dataset validation. The Phase 1 control plane is certified, and the Phase 2A validator remains available locally.
 
 Local, deterministic forecasting experiment workbench for the NOTINO interview
 portfolio. It copies permitted CSV/Parquet data into immutable content-addressed
@@ -143,9 +143,9 @@ requested by a client specification.
 
 The domain distinguishes historical `EvaluationSpec`, unseen-future
 `ForecastSpec`, and stored-model `InferenceSpec`. Only evaluation is executable
-in this local slice. AWS storage, metadata, identity, and Batch implementations
-will be added behind the interfaces in `vonavy_agent.ports`; they are not
-simulated by the current local runner. See `docs/phase-0-cloud-boundaries.md`.
+in the local experiment runner. Phase 2B adds a separate S3/Batch adapter for
+dataset validation; forecasting and inference workers will be added behind the
+existing boundaries in later phases. See `docs/phase-0-cloud-boundaries.md`.
 
 Airflow, Celery, Redis, Kubernetes, arbitrary shell, uploaded code execution,
 and editable sibling imports remain non-goals.
@@ -153,7 +153,7 @@ and editable sibling imports remain non-goals.
 
 ## AWS control plane
 
-The `infra/` CDK application implements the first scale-to-zero AWS slice:
+The `infra/` CDK application implements the authenticated control plane and the first ephemeral CPU execution lane:
 
 - private CloudFront-hosted static UI;
 - invite-only Cognito authorization-code login with PKCE;
@@ -162,11 +162,15 @@ The `infra/` CDK application implements the first scale-to-zero AWS slice:
 - owner-scoped DynamoDB metadata;
 - a private unversioned S3 staging bucket plus private versioned final-data storage;
 - short-lived direct browser-to-S3 uploads with exact-size POST policy, hard
-  server-owned slot limits, immutable final copies, and lifecycle expiry.
+  server-owned slot limits, immutable final copies, and lifecycle expiry;
+- owner-scoped, idempotent validation-job APIs;
+- one-vCPU scale-to-zero AWS Batch Fargate validation using the Phase 2A worker;
+- versioned validation reports in S3 with polling-based status reconciliation.
 
 The Phase 1 stack is deployed and certified across Cognito OAuth/PKCE,
 authenticated API access, presigned S3 upload, owner isolation, DynamoDB state,
 versioned final storage, CloudFront UI display, idempotent completion, and exact
-cleanup. It still creates no EC2, NAT Gateway, RDS, SageMaker, AWS Batch,
-training, or GPU resources. See `docs/phase-1-serverless-control-plane.md` and
-`ops/phase-1-synth-and-review.md`.
+cleanup. Phase 2B adds no EC2 instances, NAT Gateway, RDS, SageMaker, training,
+or GPU resources. It must be synthesized and reviewed before deployment. See
+`docs/phase-1-serverless-control-plane.md`, `docs/phase-2b-aws-validation.md`,
+`ops/phase-1-synth-and-review.md`, and `ops/phase-2b-synth-and-review.md`.

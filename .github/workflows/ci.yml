@@ -54,9 +54,22 @@ jobs:
         working-directory: infra
       - run: node --check web/app.js
         working-directory: infra
+      - name: Build Phase 2B validation image
+        run: >-
+          docker build
+          --file Dockerfile.validation-batch
+          --build-arg VCS_REF="$GITHUB_SHA"
+          --tag vonavy-agent-validation-batch:ci
+          .
+      - name: Verify Phase 2B validation image boundary
+        run: |
+          test "$(docker image inspect vonavy-agent-validation-batch:ci --format '{{.Config.User}}')" = "10001:10001"
+          test "$(docker image inspect vonavy-agent-validation-batch:ci --format '{{json .Config.ExposedPorts}}')" = "null"
+          test "$(docker image inspect vonavy-agent-validation-batch:ci --format '{{json .Config.Entrypoint}}')" = '["python","-m","vonavy_agent.validation_worker.aws_batch"]'
       - run: npm exec cdk synth
         working-directory: infra
         env:
           CDK_DEFAULT_REGION: eu-central-1
           VONAVY_ENVIRONMENT: ci
           VONAVY_PROTECT_DATA: "true"
+          VONAVY_SOURCE_REVISION: ${{ github.sha }}

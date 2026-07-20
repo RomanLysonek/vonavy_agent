@@ -24,7 +24,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+aws = [
+  "boto3>=1.40,<2",
+]
 dev = [
+  "boto3>=1.40,<2",
   "httpx>=0.28,<1",
   "mypy>=1.14,<2",
   "pandas-stubs>=2.2,<3",

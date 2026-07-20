@@ -22,6 +22,12 @@ os.environ.update(
         "MAX_DATASETS_PER_OWNER": "2",
         "MAX_TOTAL_BYTES_PER_OWNER": "2048",
         "UPLOAD_RETENTION_DAYS": "14",
+        "VALIDATION_JOB_QUEUE": "arn:aws:batch:eu-central-1:111122223333:job-queue/unit",
+        "VALIDATION_JOB_DEFINITION": (
+            "arn:aws:batch:eu-central-1:111122223333:job-definition/unit:1"
+        ),
+        "VALIDATION_JOB_TIMEOUT_SECONDS": "900",
+        "VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER": "1",
         "AWS_REGION_NAME": "eu-central-1",
         "USER_POOL_ID": "eu-central-1_unit",
         "USER_POOL_CLIENT_ID": "unit-client",
@@ -235,10 +241,11 @@ class FakeDynamoClient:
         status = current.get(status_attr) if current else None
         expires_at = int(current.get("expires_at", 0)) if current else 0
         if condition.startswith("attribute_not_exists(pk)"):
+            expired_allowed = expires_at <= int(values[":now"])
+            if "#status = :pending AND expires_at <= :now" in condition:
+                expired_allowed = status == "pending" and expired_allowed
             allowed = (
-                current is None
-                or status in {"released", "free", "expired"}
-                or (status == "pending" and expires_at <= int(values[":now"]))
+                current is None or status in {"released", "free", "expired"} or expired_allowed
             )
         elif "owner_sub = :owner AND #status = :pending" in condition:
             allowed = bool(
@@ -251,6 +258,12 @@ class FakeDynamoClient:
                 current
                 and current.get("owner_sub") == values[":owner"]
                 and current.get("upload_id") == values[":upload"]
+            )
+        elif "owner_sub = :owner AND job_id = :job" in condition:
+            allowed = bool(
+                current
+                and current.get("owner_sub") == values[":owner"]
+                and current.get("job_id") == values[":job"]
             )
         else:
             raise AssertionError(f"unsupported condition {condition}")
@@ -308,6 +321,42 @@ class FakeTable:
             ]
         }
 
+    def update_item(self, **kwargs: Any) -> dict[str, Any]:
+        key = kwargs["Key"]
+        stored_key = (key["pk"], key["sk"])
+        current = self.items.get(stored_key)
+        if current is None:
+            raise AssertionError("update target missing")
+        values = kwargs["ExpressionAttributeValues"]
+        names = kwargs.get("ExpressionAttributeNames", {})
+        condition = kwargs.get("ConditionExpression", "")
+        status_attr = names.get("#status", "status")
+        if "owner_sub = :owner" in condition and current.get("owner_sub") != values[":owner"]:
+            raise AssertionError("owner condition failed")
+        if (
+            "#status = :submitting" in condition
+            and current.get(status_attr) != values[":submitting"]
+        ):
+            raise AssertionError("status condition failed")
+        assignments = kwargs["UpdateExpression"].removeprefix("SET ").split(",")
+        updated = dict(current)
+        for assignment in assignments:
+            attribute, reference = [part.strip() for part in assignment.split("=", 1)]
+            updated[names.get(attribute, attribute)] = values[reference]
+        self.items[stored_key] = updated
+        return {"Attributes": updated}
+
+
+class FakeBody:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    def read(self, amount: int = -1) -> bytes:
+        return self.content if amount < 0 else self.content[:amount]
+
+    def close(self) -> None:
+        return None
+
 
 class FakeS3:
     def __init__(self) -> None:
@@ -317,6 +366,8 @@ class FakeS3:
         self.copied: dict[str, Any] | None = None
         self.deleted_requests: list[dict[str, Any]] = []
         self.copy_version_id = "version-1"
+        self.result_payload: dict[str, Any] | None = None
+        self.result_version_id = "validation-result-version"
 
     def generate_presigned_post(self, **kwargs: Any) -> dict[str, Any]:
         self.presigned = kwargs
@@ -332,6 +383,40 @@ class FakeS3:
 
     def delete_object(self, **kwargs: Any) -> None:
         self.deleted_requests.append(kwargs)
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        if self.result_payload is None:
+            raise ClientError(
+                {
+                    "Error": {"Code": "NoSuchKey", "Message": "missing"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "GetObject",
+            )
+        return {
+            "Body": FakeBody(json.dumps(self.result_payload).encode("utf-8")),
+            "VersionId": self.result_version_id,
+        }
+
+
+class FakeBatch:
+    def __init__(self) -> None:
+        self.submissions: list[dict[str, Any]] = []
+        self.descriptions: list[dict[str, Any]] = []
+        self.terminated: list[dict[str, Any]] = []
+        self.job_id = "batch-job-001"
+
+    def submit_job(self, **kwargs: Any) -> dict[str, Any]:
+        self.submissions.append(kwargs)
+        return {"jobId": self.job_id, "jobName": kwargs["jobName"]}
+
+    def describe_jobs(self, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs == {"jobs": [self.job_id]}
+        return {"jobs": self.descriptions}
+
+    def terminate_job(self, **kwargs: Any) -> None:
+        self.terminated.append(kwargs)
 
 
 def test_upload_validation_rejects_paths_and_server_limit() -> None:
@@ -1041,3 +1126,320 @@ def test_complete_upload_updates_slot_and_remains_owner_isolated_and_idempotent(
     assert repeat["statusCode"] == 200
     assert json.loads(repeat["body"]) == json.loads(response["body"])
     assert len(fake_s3.deleted_requests) == 1
+
+
+def _uploaded_dataset(owner: str, dataset_id: str) -> dict[str, Any]:
+    return {
+        "pk": f"USER#{owner}",
+        "sk": f"DATASET#{dataset_id}",
+        "entity_type": "DATASET",
+        "owner_sub": owner,
+        "dataset_id": dataset_id,
+        "dataset_name": "Panel",
+        "filename": "panel.csv",
+        "media_type": "text/csv",
+        "actual_size": 38,
+        "status": "uploaded",
+        "object_key": f"datasets/users/{owner}/{dataset_id}/upload/panel.csv",
+        "object_version_id": "dataset-version",
+        "created_at": "2026-07-20T00:00:00+00:00",
+        "updated_at": "2026-07-20T00:00:00+00:00",
+    }
+
+
+def test_validation_submission_is_owner_scoped_and_idempotent(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    dataset_id = "94dfded7-9e04-4d0b-ab60-fe16340996b5"
+    request_token = "59dcd457-833e-48ea-b10a-581077204f77"
+    fake_table = FakeTable()
+    fake_batch = FakeBatch()
+    fake_s3 = FakeS3()
+    fake_table.items[(f"USER#{owner}", f"DATASET#{dataset_id}")] = _uploaded_dataset(
+        owner, dataset_id
+    )
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", fake_s3)
+    monkeypatch.setattr(handler, "_batch", fake_batch)
+
+    event = _event(
+        "POST",
+        f"/api/datasets/{dataset_id}/validations",
+        body={"requestToken": request_token},
+        owner=owner,
+    )
+    first = handler.lambda_handler(event, SimpleNamespace(aws_request_id="lambda-request"))
+    assert first["statusCode"] == 202
+    first_payload = json.loads(first["body"])
+    assert first_payload["status"] == "submitted"
+    assert first_payload["datasetId"] == dataset_id
+    assert len(fake_batch.submissions) == 1
+
+    request_document = json.loads(
+        fake_batch.submissions[0]["containerOverrides"]["environment"][0]["value"]
+    )
+    assert request_document["owner_id"] == owner
+    assert request_document["input"]["version_id"] == "dataset-version"
+    stored_job = fake_table.items[
+        (f"USER#{owner}", f"VALIDATION#{first_payload['validationJobId']}")
+    ]
+    assert json.loads(stored_job["request_json"]) == request_document
+    assert stored_job["input_version_id"] == "dataset-version"
+    assert request_document["output"]["key"].startswith(
+        f"validation-results/users/{owner}/datasets/{dataset_id}/"
+    )
+
+    repeated = handler.lambda_handler(event, SimpleNamespace(aws_request_id="lambda-request"))
+    assert repeated["statusCode"] == 200
+    assert json.loads(repeated["body"])["validationJobId"] == first_payload["validationJobId"]
+    assert len(fake_batch.submissions) == 1
+
+    changed = handler.lambda_handler(
+        _event(
+            "POST",
+            f"/api/datasets/{dataset_id}/validations",
+            body={"requestToken": request_token, "limits": {"max_rows": 100}},
+            owner=owner,
+        ),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+    assert changed["statusCode"] == 409
+    assert json.loads(changed["body"])["error"]["code"] == "validation_request_conflict"
+    assert len(fake_batch.submissions) == 1
+
+
+def test_validation_status_reconciles_result_and_releases_slot(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    dataset_id = "94dfded7-9e04-4d0b-ab60-fe16340996b5"
+    request_token = "59dcd457-833e-48ea-b10a-581077204f77"
+    fake_table = FakeTable()
+    fake_batch = FakeBatch()
+    fake_s3 = FakeS3()
+    fake_table.items[(f"USER#{owner}", f"DATASET#{dataset_id}")] = _uploaded_dataset(
+        owner, dataset_id
+    )
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", fake_s3)
+    monkeypatch.setattr(handler, "_batch", fake_batch)
+
+    submitted = handler.lambda_handler(
+        _event(
+            "POST",
+            f"/api/datasets/{dataset_id}/validations",
+            body={"requestToken": request_token},
+            owner=owner,
+        ),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+    job_id = json.loads(submitted["body"])["validationJobId"]
+    fake_batch.descriptions = [{"jobId": fake_batch.job_id, "status": "SUCCEEDED"}]
+    fake_s3.result_payload = {
+        "schema_version": "validation-result/v1",
+        "job_id": job_id,
+        "dataset_id": dataset_id,
+        "status": "succeeded",
+        "format": "csv",
+        "row_count": 2,
+        "column_count": 2,
+        "warnings": [],
+        "validation_errors": [],
+    }
+
+    status_response = handler.lambda_handler(
+        _event("GET", f"/api/validations/{job_id}", owner=owner),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+    assert status_response["statusCode"] == 200
+    status_payload = json.loads(status_response["body"])
+    assert status_payload["status"] == "succeeded"
+    assert status_payload["resultAvailable"] is True
+    assert status_payload["summary"]["rowCount"] == 2
+
+    result_response = handler.lambda_handler(
+        _event("GET", f"/api/validations/{job_id}/result", owner=owner),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+    assert result_response["statusCode"] == 200
+    assert json.loads(result_response["body"])["status"] == "succeeded"
+    assert fake_table.items[(f"USER#{owner}", "VALIDATION_SLOT#0000")]["status"] == "released"
+
+
+def test_validation_job_is_hidden_from_other_owner(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    other = "22345678-1234-1234-1234-123456789012"
+    job_id = "59dcd457-833e-48ea-b10a-581077204f77"
+    fake_table = FakeTable()
+    fake_table.items[(f"USER#{owner}", f"VALIDATION#{job_id}")] = {
+        "pk": f"USER#{owner}",
+        "sk": f"VALIDATION#{job_id}",
+        "owner_sub": owner,
+        "job_id": job_id,
+        "dataset_id": "94dfded7-9e04-4d0b-ab60-fe16340996b5",
+        "status": "submitted",
+        "created_at": "2026-07-20T00:00:00+00:00",
+        "updated_at": "2026-07-20T00:00:00+00:00",
+    }
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", FakeS3())
+    monkeypatch.setattr(handler, "_batch", FakeBatch())
+
+    response = handler.lambda_handler(
+        _event("GET", f"/api/validations/{job_id}", owner=other),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+    assert response["statusCode"] == 404
+    assert json.loads(response["body"])["error"]["code"] == "validation_not_found"
+
+
+def test_validation_submission_enforces_server_limits_before_aws_write(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    dataset_id = "94dfded7-9e04-4d0b-ab60-fe16340996b5"
+    fake_table = FakeTable()
+    fake_table.items[(f"USER#{owner}", f"DATASET#{dataset_id}")] = _uploaded_dataset(
+        owner, dataset_id
+    )
+    fake_batch = FakeBatch()
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", FakeS3())
+    monkeypatch.setattr(handler, "_batch", fake_batch)
+
+    response = handler.lambda_handler(
+        _event(
+            "POST",
+            f"/api/datasets/{dataset_id}/validations",
+            body={
+                "requestToken": "59dcd457-833e-48ea-b10a-581077204f77",
+                "limits": {"max_rows": handler.VALIDATION_LIMIT_POLICY["max_rows"] + 1},
+            },
+            owner=owner,
+        ),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+
+    assert response["statusCode"] == 422
+    assert json.loads(response["body"])["error"]["code"] == "validation_policy_exceeded"
+    assert fake_table.client.transactions == []
+    assert fake_batch.submissions == []
+
+
+def test_validation_submission_rejects_second_active_job(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    dataset_id = "94dfded7-9e04-4d0b-ab60-fe16340996b5"
+    fake_table = FakeTable()
+    fake_table.items[(f"USER#{owner}", f"DATASET#{dataset_id}")] = _uploaded_dataset(
+        owner, dataset_id
+    )
+    fake_table.items[(f"USER#{owner}", "VALIDATION_SLOT#0000")] = {
+        "pk": f"USER#{owner}",
+        "sk": "VALIDATION_SLOT#0000",
+        "owner_sub": owner,
+        "job_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "status": "active",
+        "expires_at": 4_102_444_800,
+    }
+    fake_batch = FakeBatch()
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", FakeS3())
+    monkeypatch.setattr(handler, "_batch", fake_batch)
+
+    response = handler.lambda_handler(
+        _event(
+            "POST",
+            f"/api/datasets/{dataset_id}/validations",
+            body={"requestToken": "59dcd457-833e-48ea-b10a-581077204f77"},
+            owner=owner,
+        ),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+
+    assert response["statusCode"] == 429
+    assert json.loads(response["body"])["error"]["code"] == "validation_capacity_exceeded"
+    assert fake_batch.submissions == []
+
+
+def test_stale_submitting_validation_is_failed_and_slot_released(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    job_id = "59dcd457-833e-48ea-b10a-581077204f77"
+    dataset_id = "94dfded7-9e04-4d0b-ab60-fe16340996b5"
+    fake_table = FakeTable()
+    fake_table.items[(f"USER#{owner}", f"VALIDATION#{job_id}")] = {
+        "pk": f"USER#{owner}",
+        "sk": f"VALIDATION#{job_id}",
+        "owner_sub": owner,
+        "job_id": job_id,
+        "dataset_id": dataset_id,
+        "status": "submitting",
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "updated_at": "2020-01-01T00:00:00+00:00",
+        "result_key": "validation-results/users/owner/result.json",
+    }
+    fake_table.items[(f"USER#{owner}", "VALIDATION_SLOT#0000")] = {
+        "pk": f"USER#{owner}",
+        "sk": "VALIDATION_SLOT#0000",
+        "owner_sub": owner,
+        "job_id": job_id,
+        "dataset_id": dataset_id,
+        "status": "active",
+        "expires_at": 4_102_444_800,
+    }
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", FakeS3())
+    monkeypatch.setattr(handler, "_batch", FakeBatch())
+
+    response = handler.lambda_handler(
+        _event("GET", f"/api/validations/{job_id}", owner=owner),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+
+    assert response["statusCode"] == 200
+    payload = json.loads(response["body"])
+    assert payload["status"] == "failed"
+    assert payload["failure"]["code"] == "validation_submission_interrupted"
+    assert fake_table.items[(f"USER#{owner}", "VALIDATION_SLOT#0000")]["status"] == "released"
+
+
+def test_recent_batch_submission_waits_for_describe_visibility(monkeypatch) -> None:
+    owner = "12345678-1234-1234-1234-123456789012"
+    job_id = "59dcd457-833e-48ea-b10a-581077204f77"
+    dataset_id = "94dfded7-9e04-4d0b-ab60-fe16340996b5"
+    fake_table = FakeTable()
+    fake_batch = FakeBatch()
+    fake_table.items[(f"USER#{owner}", f"VALIDATION#{job_id}")] = {
+        "pk": f"USER#{owner}",
+        "sk": f"VALIDATION#{job_id}",
+        "owner_sub": owner,
+        "job_id": job_id,
+        "dataset_id": dataset_id,
+        "batch_job_id": fake_batch.job_id,
+        "status": "submitted",
+        "created_at": "2999-01-01T00:00:00+00:00",
+        "updated_at": "2999-01-01T00:00:00+00:00",
+        "result_key": "validation-results/users/owner/result.json",
+    }
+    fake_table.items[(f"USER#{owner}", "VALIDATION_SLOT#0000")] = {
+        "pk": f"USER#{owner}",
+        "sk": "VALIDATION_SLOT#0000",
+        "owner_sub": owner,
+        "job_id": job_id,
+        "dataset_id": dataset_id,
+        "status": "active",
+        "expires_at": 4_102_444_800,
+    }
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", fake_table.client)
+    monkeypatch.setattr(handler, "_s3", FakeS3())
+    monkeypatch.setattr(handler, "_batch", fake_batch)
+
+    response = handler.lambda_handler(
+        _event("GET", f"/api/validations/{job_id}", owner=owner),
+        SimpleNamespace(aws_request_id="lambda-request"),
+    )
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["status"] == "submitted"
+    assert fake_table.items[(f"USER#{owner}", "VALIDATION_SLOT#0000")]["status"] == "active"

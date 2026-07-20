@@ -395,6 +395,14 @@ def test_control_plane_can_submit_and_reconcile_only_validation_jobs() -> None:
     assert "ValidationJobQueue" in submit_resources
     assert "ValidationJobDefinition" in submit_resources
 
+    pass_role = [statement for statement in statements if "iam:PassRole" in _actions(statement)]
+    assert len(pass_role) == 1
+    assert _actions(pass_role[0]) == {"iam:PassRole"}
+    pass_role_resources = _json_text(pass_role[0]["Resource"])
+    assert "ValidationExecutionRole" in pass_role_resources
+    assert "ValidationJobRole" in pass_role_resources
+    assert pass_role[0]["Resource"] != "*"
+
     reconciliation = [
         statement
         for statement in statements

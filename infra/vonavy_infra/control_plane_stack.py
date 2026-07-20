@@ -531,6 +531,15 @@ class ControlPlaneStack(Stack):
         )
         control_plane_function.add_to_role_policy(
             iam.PolicyStatement(
+                actions=["iam:PassRole"],
+                resources=[
+                    validation_execution_role.role_arn,
+                    validation_job_role.role_arn,
+                ],
+            )
+        )
+        control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
                 actions=["batch:DescribeJobs", "batch:TerminateJob"],
                 resources=["*"],
             )

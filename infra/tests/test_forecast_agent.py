@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -15,31 +14,31 @@ agent = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(agent)
 
 
-class MissingParameterSsm:
-    def get_parameter(self, **_: Any) -> dict[str, Any]:
-        raise ClientError(
-            {"Error": {"Code": "ParameterNotFound", "Message": "missing"}},
-            "GetParameter",
-        )
+class FakeBedrock:
+    def __init__(
+        self,
+        mapping: dict[str, Any] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.mapping = mapping
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
 
-
-class KeySsm:
-    def get_parameter(self, **_: Any) -> dict[str, Any]:
-        return {"Parameter": {"Value": "test-key"}}
-
-
-class FakeResponse:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self._body = BytesIO(json.dumps(payload).encode())
-
-    def __enter__(self) -> FakeResponse:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        return None
-
-    def read(self, amount: int = -1) -> bytes:
-        return self._body.read(amount)
+    def converse(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        assert self.mapping is not None
+        return {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": json.dumps(self.mapping)}],
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 300, "outputTokens": 180},
+        }
 
 
 def _validation_result() -> dict[str, Any]:
@@ -112,7 +111,7 @@ def _validation_result() -> dict[str, Any]:
     }
 
 
-def _openai_mapping() -> dict[str, Any]:
+def _bedrock_mapping() -> dict[str, Any]:
     return {
         "timestampColumn": "DateKey",
         "entityColumn": "ProductId",
@@ -133,94 +132,46 @@ def _openai_mapping() -> dict[str, Any]:
     }
 
 
-def _opener_for(mapping: dict[str, Any], captured: list[dict[str, Any]] | None = None):
-    def opener(request: Any, timeout: int) -> FakeResponse:
-        assert timeout == agent.OPENAI_TIMEOUT_SECONDS
-        body = json.loads(request.data)
-        if captured is not None:
-            captured.append(body)
-        return FakeResponse(
-            {
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": json.dumps(mapping)}],
-                    }
-                ],
-            }
-        )
-
-    return opener
-
-
-def _reset_key_cache() -> None:
-    agent._API_KEY = None
-    agent._SSM = None
-
-
-def test_provider_payload_never_contains_raw_string_values() -> None:
+def test_provider_request_never_contains_raw_string_values_or_tools() -> None:
     profiles = agent._column_profiles(_validation_result())
-    payload = agent._provider_payload(profiles, "forecast demand")
-    serialized = json.dumps(payload)
+    request = agent._provider_request(profiles, "forecast demand")
+    serialized = json.dumps(request)
     assert "SECRET_RAW_VALUE" not in serialized
     assert "top_values" not in serialized
-    assert payload["store"] is False
-    assert payload["text"]["format"]["type"] == "json_schema"
-    assert "tools" not in payload
+    assert request["modelId"] == "eu.anthropic.claude-opus-4-6-v1"
+    assert request["inferenceConfig"] == {"maxTokens": 1200, "temperature": 0.0}
+    assert "toolConfig" not in request
+    assert "outputConfig" not in request
+    assert request["requestMetadata"]["application"] == "vonavy-agent"
 
 
-def test_deterministic_fallback_produces_confirmable_xgboost_plan() -> None:
-    _reset_key_cache()
-    plan = agent.build_forecast_agent_plan(
-        dataset_id="00000000-0000-0000-0000-000000000001",
-        dataset_version_id="version-1",
-        validation_result=_validation_result(),
-        objective="Predict the next week.",
-        ssm_client=MissingParameterSsm(),
-    )
-    assert plan["agentMode"] == "deterministic-fallback"
-    assert plan["requiresConfirmation"] is True
-    assert plan["mapping"] == {
-        "timestampColumn": "DateKey",
-        "entityColumn": "ProductId",
-        "targetColumn": "Quantity",
-        "availabilityColumn": "ProductAvailable",
-        "knownFutureNumeric": ["Discount"],
-        "knownFutureCategorical": ["Campaign"],
-        "staticNumeric": [],
-        "staticCategorical": ["Category"],
-        "excluded": ["FuturePrediction"],
-    }
-    assert plan["trainingEnd"] == "2025-03-17"
-    assert plan["forecastStart"] == "2025-03-18"
-    assert plan["forecastEnd"] == "2025-03-24"
-    assert plan["execution"]["adapterId"] == "xgboost-direct-v1"
-    assert plan["privacy"]["rawRowsSentToProvider"] is False
-
-
-def test_openai_plan_is_structured_validated_and_version_bound() -> None:
-    _reset_key_cache()
-    captured: list[dict[str, Any]] = []
+def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
+    client = FakeBedrock(_bedrock_mapping())
     plan = agent.build_forecast_agent_plan(
         dataset_id="00000000-0000-0000-0000-000000000001",
         dataset_version_id="version-1",
         validation_result=_validation_result(),
         objective="Focus on promotion-aware demand.",
-        ssm_client=KeySsm(),
-        opener=_opener_for(_openai_mapping(), captured),
+        bedrock_client=client,
     )
-    assert plan["agentMode"] == "openai"
-    assert plan["model"] == "gpt-5-mini-2025-08-07"
+    assert plan["agentMode"] == "bedrock"
+    assert plan["provider"] == "amazon-bedrock"
+    assert plan["model"] == "eu.anthropic.claude-opus-4-6-v1"
+    assert plan["requiresConfirmation"] is True
     assert plan["mapping"]["knownFutureNumeric"] == ["Discount"]
     assert plan["mapping"]["excluded"] == ["FuturePrediction"]
+    assert plan["trainingEnd"] == "2025-03-17"
+    assert plan["forecastStart"] == "2025-03-18"
+    assert plan["forecastEnd"] == "2025-03-24"
+    assert plan["execution"]["adapterId"] == "xgboost-direct-v1"
+    assert plan["privacy"]["rawRowsSentToProvider"] is False
+    assert plan["privacy"]["awsIamAuthentication"] is True
     assert len(plan["planId"]) == 64
-    assert captured[0]["model"] == "gpt-5-mini-2025-08-07"
-    assert captured[0]["store"] is False
+    assert client.calls[0]["modelId"] == "eu.anthropic.claude-opus-4-6-v1"
 
 
 def test_provider_cannot_reference_unknown_or_leakage_column() -> None:
-    raw = _openai_mapping()
+    raw = _bedrock_mapping()
     raw["knownFutureNumeric"] = ["NotAColumn"]
     try:
         agent._validate_provider_mapping(raw, agent._column_profiles(_validation_result()))
@@ -230,7 +181,7 @@ def test_provider_cannot_reference_unknown_or_leakage_column() -> None:
     else:
         raise AssertionError("unknown provider column was accepted")
 
-    raw = _openai_mapping()
+    raw = _bedrock_mapping()
     raw["knownFutureNumeric"] = ["FuturePrediction"]
     raw["excluded"] = ["Discount"]
     try:
@@ -242,13 +193,12 @@ def test_provider_cannot_reference_unknown_or_leakage_column() -> None:
 
 
 def test_validation_result_is_bound_to_exact_dataset_version() -> None:
-    _reset_key_cache()
     try:
         agent.build_forecast_agent_plan(
             dataset_id="00000000-0000-0000-0000-000000000001",
             dataset_version_id="different-version",
             validation_result=_validation_result(),
-            ssm_client=MissingParameterSsm(),
+            bedrock_client=FakeBedrock(_bedrock_mapping()),
         )
     except agent.AgentPlanError as exc:
         assert exc.code == "validation_result_mismatch"
@@ -258,9 +208,48 @@ def test_validation_result_is_bound_to_exact_dataset_version() -> None:
 
 
 def test_plan_id_changes_with_objective_or_mapping() -> None:
-    mapping = _openai_mapping()
-    base = agent._plan_id("dataset", "version", mapping, "2025-03-17", "one", "openai")
-    assert base != agent._plan_id("dataset", "version", mapping, "2025-03-17", "two", "openai")
+    mapping = _bedrock_mapping()
+    base = agent._plan_id("dataset", "version", mapping, "2025-03-17", "one", "bedrock")
+    assert base != agent._plan_id("dataset", "version", mapping, "2025-03-17", "two", "bedrock")
     changed = dict(mapping)
     changed["targetColumn"] = "Other"
-    assert base != agent._plan_id("dataset", "version", changed, "2025-03-17", "one", "openai")
+    assert base != agent._plan_id("dataset", "version", changed, "2025-03-17", "one", "bedrock")
+
+
+def test_bedrock_access_denied_is_configuration_error() -> None:
+    error = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+        "Converse",
+    )
+    try:
+        agent.build_forecast_agent_plan(
+            dataset_id="00000000-0000-0000-0000-000000000001",
+            dataset_version_id="version-1",
+            validation_result=_validation_result(),
+            bedrock_client=FakeBedrock(error=error),
+        )
+    except agent.AgentPlanError as exc:
+        assert exc.code == "agent_configuration_error"
+        assert exc.status == 503
+        assert "Bedrock" in exc.message
+    else:
+        raise AssertionError("Bedrock access denial was accepted")
+
+
+def test_bedrock_throttling_is_retryable_unavailable_error() -> None:
+    error = ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
+        "Converse",
+    )
+    try:
+        agent.build_forecast_agent_plan(
+            dataset_id="00000000-0000-0000-0000-000000000001",
+            dataset_version_id="version-1",
+            validation_result=_validation_result(),
+            bedrock_client=FakeBedrock(error=error),
+        )
+    except agent.AgentPlanError as exc:
+        assert exc.code == "agent_provider_unavailable"
+        assert exc.status == 503
+    else:
+        raise AssertionError("Bedrock throttling was accepted")

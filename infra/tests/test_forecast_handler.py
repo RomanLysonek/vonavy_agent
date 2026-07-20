@@ -127,7 +127,7 @@ def test_agent_route_returns_confirmable_plan(monkeypatch: Any) -> None:
             "schemaVersion": "forecast-agent-plan/v1",
             "datasetId": dataset_id,
             "requiresConfirmation": True,
-            "agentMode": "openai",
+            "agentMode": "bedrock",
         },
     )
     response = handler.lambda_handler(
@@ -141,7 +141,7 @@ def test_agent_route_returns_confirmable_plan(monkeypatch: Any) -> None:
     assert response["statusCode"] == 200
     payload = json.loads(response["body"])
     assert payload["requiresConfirmation"] is True
-    assert payload["agentMode"] == "openai"
+    assert payload["agentMode"] == "bedrock"
 
 
 class QuotaTable:

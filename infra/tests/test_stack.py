@@ -71,7 +71,7 @@ def test_stack_adds_only_ephemeral_fargate_compute() -> None:
     template.resource_count_is("AWS::SageMaker::Endpoint", 0)
     template.resource_count_is("AWS::Batch::ComputeEnvironment", 1)
     template.resource_count_is("AWS::Batch::JobQueue", 1)
-    template.resource_count_is("AWS::Batch::JobDefinition", 1)
+    template.resource_count_is("AWS::Batch::JobDefinition", 2)
     template.resource_count_is("AWS::EC2::VPC", 1)
     template.resource_count_is("AWS::EC2::InternetGateway", 1)
     template.resource_count_is("AWS::DynamoDB::Table", 1)
@@ -193,7 +193,7 @@ def test_lambda_separates_staging_and_immutable_data_permissions() -> None:
     ]
 
     assert len(staging_statements) == 1
-    assert len(data_statements) == 2
+    assert len(data_statements) == 3
 
     staging_statement = staging_statements[0]
     dataset_read_statement = next(
@@ -294,7 +294,7 @@ def test_static_web_bucket_is_destroyed_with_auto_delete_helper() -> None:
 
 def test_every_api_route_requires_jwt_and_custom_scope() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 7
+    assert len(routes) == 10
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"
@@ -394,38 +394,50 @@ def test_validation_security_group_has_no_ingress() -> None:
 def test_control_plane_can_submit_and_reconcile_only_validation_jobs() -> None:
     statements = _policy_statements(_template())
     submit = [statement for statement in statements if "batch:SubmitJob" in _actions(statement)]
-    assert len(submit) == 1
-    submit_resources = _json_text(submit[0]["Resource"])
+    assert len(submit) == 2
+    validation_submit = next(
+        statement
+        for statement in submit
+        if "ValidationJobDefinition" in _json_text(statement["Resource"])
+    )
+    submit_resources = _json_text(validation_submit["Resource"])
     assert "ValidationJobQueue" in submit_resources
     assert "ValidationJobDefinition" in submit_resources
 
     pass_role = [statement for statement in statements if "iam:PassRole" in _actions(statement)]
-    assert len(pass_role) == 1
-    assert _actions(pass_role[0]) == {"iam:PassRole"}
-    pass_role_resources = _json_text(pass_role[0]["Resource"])
+    assert len(pass_role) == 2
+    validation_pass_role = next(
+        statement
+        for statement in pass_role
+        if "ValidationExecutionRole" in _json_text(statement["Resource"])
+    )
+    assert _actions(validation_pass_role) == {"iam:PassRole"}
+    pass_role_resources = _json_text(validation_pass_role["Resource"])
     assert "ValidationExecutionRole" in pass_role_resources
     assert "ValidationJobRole" in pass_role_resources
-    assert pass_role[0]["Resource"] != "*"
+    assert validation_pass_role["Resource"] != "*"
 
     reconciliation = [
         statement
         for statement in statements
         if {"batch:DescribeJobs", "batch:TerminateJob"} <= _actions(statement)
     ]
-    assert len(reconciliation) == 1
-    assert reconciliation[0]["Resource"] == "*"
+    assert len(reconciliation) == 2
+    assert all(statement["Resource"] == "*" for statement in reconciliation)
 
 
 def test_submit_job_permission_includes_only_validation_family() -> None:
     statements = _policy_statements(_template())
     submit = [statement for statement in statements if "batch:SubmitJob" in _actions(statement)]
-    assert len(submit) == 1
-
-    resources = submit[0]["Resource"]
+    validation_submit = next(
+        statement
+        for statement in submit
+        if "ValidationJobDefinition" in _json_text(statement["Resource"])
+    )
+    resources = validation_submit["Resource"]
     assert isinstance(resources, list)
     assert len(resources) == 3
     assert all(resource != "*" for resource in resources)
-
     serialized_resources = [_json_text(resource) for resource in resources]
     assert sum("ValidationJobQueue" in resource for resource in serialized_resources) == 1
     assert sum("ValidationJobDefinition" in resource for resource in serialized_resources) == 2
@@ -434,6 +446,82 @@ def test_submit_job_permission_includes_only_validation_family() -> None:
     ]
     assert len(family_resources) == 1
     assert "ValidationJobDefinition" in family_resources[0]
+
+
+def test_forecast_job_reuses_queue_and_is_bounded_fargate() -> None:
+    template = _template()
+    template.resource_count_is("AWS::Batch::ComputeEnvironment", 1)
+    template.resource_count_is("AWS::Batch::JobQueue", 1)
+    job_definition = _resource_by_logical_id_prefix(
+        template,
+        "AWS::Batch::JobDefinition",
+        "ForecastJobDefinition",
+    )
+    properties = job_definition["Properties"]
+    serialized = _json_text(properties)
+    assert properties["Type"] == "container"
+    assert properties["PlatformCapabilities"] == ["FARGATE"]
+    assert properties["Timeout"]["AttemptDurationSeconds"] == 3600
+    assert properties["RetryStrategy"]["Attempts"] == 1
+    assert "PropagateTags" not in properties
+    assert '"Type":"VCPU","Value":"1"' in serialized
+    assert '"Type":"MEMORY","Value":"4096"' in serialized
+    assert '"AssignPublicIp":"ENABLED"' in serialized
+    assert "VONAVY_DATA_BUCKET" in serialized
+
+
+def test_forecast_worker_and_control_plane_are_least_privilege() -> None:
+    template = _template()
+    statements = _policy_statements(template)
+    forecast_writes = [
+        statement
+        for statement in statements
+        if _resource_mentions(statement, "forecast-results/users/*")
+        and {"s3:PutObject", "s3:PutObjectTagging"} <= _actions(statement)
+    ]
+    assert len(forecast_writes) == 1
+    assert "s3:DeleteObject" not in _actions(forecast_writes[0])
+    assert "s3:ListBucket" not in _actions(forecast_writes[0])
+
+    submit = [statement for statement in statements if "batch:SubmitJob" in _actions(statement)]
+    forecast_submit = next(
+        statement
+        for statement in submit
+        if "ForecastJobDefinition" in _json_text(statement["Resource"])
+    )
+    resources = forecast_submit["Resource"]
+    assert isinstance(resources, list)
+    assert len(resources) == 3
+    serialized = [_json_text(resource) for resource in resources]
+    assert sum("ValidationJobQueue" in resource for resource in serialized) == 1
+    assert sum("ForecastJobDefinition" in resource for resource in serialized) == 2
+    assert all(resource != "*" for resource in resources)
+
+    pass_role = [statement for statement in statements if "iam:PassRole" in _actions(statement)]
+    forecast_pass_role = next(
+        statement
+        for statement in pass_role
+        if "ForecastExecutionRole" in _json_text(statement["Resource"])
+    )
+    role_resources = _json_text(forecast_pass_role["Resource"])
+    assert "ForecastExecutionRole" in role_resources
+    assert "ForecastJobRole" in role_resources
+    assert forecast_pass_role["Resource"] != "*"
+    assert not any("batch:TagResource" in _actions(statement) for statement in statements)
+
+
+def test_forecast_routes_are_jwt_protected() -> None:
+    routes = _template().find_resources("AWS::ApiGatewayV2::Route")
+    by_key = {route["Properties"]["RouteKey"]: route["Properties"] for route in routes.values()}
+    expected = {
+        "POST /api/datasets/{dataset_id}/forecasts",
+        "GET /api/forecasts/{run_id}",
+        "GET /api/forecasts/{run_id}/result",
+    }
+    assert expected <= set(by_key)
+    for key in expected:
+        assert by_key[key]["AuthorizationType"] == "JWT"
+        assert by_key[key]["AuthorizationScopes"] == ["vonavy-agent/api"]
 
 
 def test_validation_routes_are_agent_friendly_and_jwt_protected() -> None:

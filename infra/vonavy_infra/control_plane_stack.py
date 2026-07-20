@@ -315,6 +315,79 @@ class ControlPlaneStack(Stack):
             ],
         )
 
+        forecast_logs = logs.LogGroup(
+            self,
+            "ForecastWorkerLogs",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=durable_removal_policy,
+        )
+        forecast_execution_role = iam.Role(
+            self,
+            "ForecastExecutionRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AmazonECSTaskExecutionRolePolicy"
+                )
+            ],
+        )
+        forecast_job_role = iam.Role(
+            self,
+            "ForecastJobRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+        forecast_job_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[data_bucket.arn_for_objects("datasets/users/*")],
+            )
+        )
+        forecast_job_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject", "s3:PutObjectTagging"],
+                resources=[data_bucket.arn_for_objects("forecast-results/users/*")],
+            )
+        )
+        forecast_image = ecs.ContainerImage.from_asset(
+            str(Path(__file__).parents[2]),
+            file="Dockerfile.forecast-batch",
+            platform=ecr_assets.Platform.LINUX_AMD64,
+            build_args={"VCS_REF": config.source_revision},
+            exclude=[
+                "docs",
+                "infra",
+                "ops",
+                "tests",
+                "Dockerfile.validation-worker",
+                "Dockerfile.validation-batch",
+            ],
+        )
+        forecast_container = batch.EcsFargateContainerDefinition(
+            self,
+            "ForecastContainer",
+            image=forecast_image,
+            cpu=1,
+            memory=Size.mebibytes(4096),
+            assign_public_ip=True,
+            execution_role=forecast_execution_role,
+            job_role=forecast_job_role,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="forecast",
+                log_group=forecast_logs,
+            ),
+            environment={
+                "VONAVY_DATA_BUCKET": data_bucket.bucket_name,
+                "AWS_REGION_NAME": self.region,
+            },
+        )
+        forecast_job_definition = batch.EcsJobDefinition(
+            self,
+            "ForecastJobDefinition",
+            container=forecast_container,
+            retry_attempts=1,
+            timeout=Duration.seconds(3600),
+        )
+
         web_bucket = s3.Bucket(
             self,
             "WebBucket",
@@ -549,9 +622,81 @@ class ControlPlaneStack(Stack):
             )
         )
 
+        forecast_control_plane_logs = logs.LogGroup(
+            self,
+            "ForecastControlPlaneLogs",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=durable_removal_policy,
+        )
+        forecast_control_plane_function = lambda_.Function(
+            self,
+            "ForecastControlPlaneFunction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            architecture=lambda_.Architecture.ARM_64,
+            handler="handler.lambda_handler",
+            code=lambda_.Code.from_asset(
+                str(Path(__file__).parents[1] / "lambda/forecast_control_plane"),
+                exclude=["**/__pycache__/**", "**/*.pyc", "**/*.pyo"],
+            ),
+            timeout=Duration.seconds(15),
+            memory_size=256,
+            log_group=forecast_control_plane_logs,
+            environment={
+                "DATA_BUCKET": data_bucket.bucket_name,
+                "METADATA_TABLE": metadata_table.table_name,
+                "FORECAST_JOB_QUEUE": validation_job_queue.job_queue_arn,
+                "FORECAST_JOB_DEFINITION": forecast_job_definition.job_definition_arn,
+                "FORECAST_JOB_TIMEOUT_SECONDS": "3600",
+                "UPLOAD_RETENTION_DAYS": str(config.upload_retention_days),
+                "SOURCE_REVISION": config.source_revision,
+                "AWS_REGION_NAME": self.region,
+            },
+        )
+        metadata_table.grant_read_write_data(forecast_control_plane_function)
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[data_bucket.arn_for_objects("forecast-results/users/*")],
+            )
+        )
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["batch:SubmitJob"],
+                resources=[
+                    validation_job_queue.job_queue_arn,
+                    forecast_job_definition.job_definition_arn,
+                    self.format_arn(
+                        service="batch",
+                        resource="job-definition",
+                        resource_name=forecast_job_definition.job_definition_name,
+                    ),
+                ],
+            )
+        )
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["iam:PassRole"],
+                resources=[
+                    forecast_execution_role.role_arn,
+                    forecast_job_role.role_arn,
+                ],
+            )
+        )
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["batch:DescribeJobs", "batch:TerminateJob"],
+                resources=["*"],
+            )
+        )
+
         integration = integrations.HttpLambdaIntegration(
             "ControlPlaneIntegration",
             control_plane_function,
+            payload_format_version=apigwv2.PayloadFormatVersion.VERSION_2_0,
+        )
+        forecast_integration = integrations.HttpLambdaIntegration(
+            "ForecastControlPlaneIntegration",
+            forecast_control_plane_function,
             payload_format_version=apigwv2.PayloadFormatVersion.VERSION_2_0,
         )
         http_api = apigwv2.HttpApi(
@@ -587,6 +732,19 @@ class ControlPlaneStack(Stack):
                 path=path,
                 methods=[method],
                 integration=integration,
+                authorizer=jwt_authorizer,
+                authorization_scopes=["vonavy-agent/api"],
+            )
+
+        for path, method in (
+            ("/api/datasets/{dataset_id}/forecasts", apigwv2.HttpMethod.POST),
+            ("/api/forecasts/{run_id}", apigwv2.HttpMethod.GET),
+            ("/api/forecasts/{run_id}/result", apigwv2.HttpMethod.GET),
+        ):
+            http_api.add_routes(
+                path=path,
+                methods=[method],
+                integration=forecast_integration,
                 authorizer=jwt_authorizer,
                 authorization_scopes=["vonavy-agent/api"],
             )
@@ -643,6 +801,8 @@ class ControlPlaneStack(Stack):
                         "maximumDatasetsPerOwner": config.max_datasets_per_owner,
                         "maximumTotalBytesPerOwner": config.max_total_bytes_per_owner,
                         "validationJobTimeoutSeconds": config.validation_job_timeout_seconds,
+                        "forecastJobTimeoutSeconds": 3600,
+                        "forecastAdapterId": "xgboost-direct-v1",
                         "maximumActiveValidationJobsPerOwner": (
                             config.validation_max_active_jobs_per_owner
                         ),
@@ -668,4 +828,9 @@ class ControlPlaneStack(Stack):
             self,
             "ValidationJobDefinitionArn",
             value=validation_job_definition.job_definition_arn,
+        )
+        CfnOutput(
+            self,
+            "ForecastJobDefinitionArn",
+            value=forecast_job_definition.job_definition_arn,
         )

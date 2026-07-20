@@ -212,6 +212,96 @@ async function validateDataset(dataset, output, button) {
   }
 }
 
+function forecastMessage(run, result = null) {
+  if (run.status === "succeeded" && result) {
+    const wape = result.holdout?.wape;
+    const quality = typeof wape === "number" ? ` Holdout WAPE ${(wape * 100).toFixed(2)}%.` : "";
+    return `Forecast complete: ${result.profile.entities * 7} rows.${quality}`;
+  }
+  if (run.status === "invalid" && result) {
+    return result.failure?.message || "The forecast mapping or data is invalid.";
+  }
+  if (run.status === "failed") return run.failure?.message || "Forecast worker failed.";
+  return `Forecast status: ${run.status}.`;
+}
+function promptColumn(label, fallback, optional = false) {
+  const value = window.prompt(label, fallback);
+  if (value === null) throw new Error("Forecast setup cancelled.");
+  const clean = value.trim();
+  if (!clean && !optional) throw new Error(`${label} is required.`);
+  return clean || null;
+}
+function promptColumns(label) {
+  const value = window.prompt(`${label} (comma separated, optional)`, "");
+  if (value === null) throw new Error("Forecast setup cancelled.");
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+function showForecastResult(output, run, result) {
+  output.replaceChildren(document.createTextNode(forecastMessage(run, result)));
+  for (const [name, url] of Object.entries(result.downloads || {})) {
+    const link = document.createElement("a");
+    link.href = url;
+    link.textContent = `Download ${name}`;
+    link.rel = "noopener noreferrer";
+    link.className = "artifact-link";
+    output.append(document.createTextNode(" "), link);
+  }
+}
+async function waitForForecast(run, output, button) {
+  const terminal = new Set(["succeeded", "invalid", "failed"]);
+  let current = run;
+  const maxAttempts = Math.ceil((state.config.forecastJobTimeoutSeconds + 900) / 3);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    output.textContent = forecastMessage(current);
+    if (terminal.has(current.status)) {
+      if (current.resultAvailable) {
+        const result = await api(current.links.result);
+        showForecastResult(output, current, result);
+      }
+      button.disabled = false;
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    current = await api(current.links.status);
+  }
+  output.textContent = "Forecast is still running. Refresh to check it again.";
+  button.disabled = false;
+}
+async function forecastDataset(dataset, output, button) {
+  button.disabled = true;
+  try {
+    const timestampColumn = promptColumn("Timestamp column", "DateKey");
+    const entityColumn = promptColumn("Entity/product column (optional)", "ProductId", true);
+    const targetColumn = promptColumn("Target column", "Quantity");
+    const availabilityColumn = promptColumn(
+      "Availability column (optional)",
+      "ProductAvailable",
+      true,
+    );
+    const defaultEnd = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const trainingEnd = promptColumn("Last observed training date (YYYY-MM-DD)", defaultEnd);
+    const mapping = {
+      timestampColumn,
+      entityColumn,
+      targetColumn,
+      availabilityColumn,
+      knownFutureNumeric: promptColumns("Known-future numeric columns"),
+      knownFutureCategorical: promptColumns("Known-future categorical columns"),
+      staticNumeric: promptColumns("Static numeric columns"),
+      staticCategorical: promptColumns("Static categorical columns"),
+      excluded: [],
+    };
+    output.textContent = "Submitting a direct seven-day XGBoost retraining job…";
+    const run = await api(`/api/datasets/${dataset.datasetId}/forecasts`, {
+      method: "POST",
+      body: JSON.stringify({ requestToken: crypto.randomUUID(), trainingEnd, mapping }),
+    });
+    await waitForForecast(run, output, button);
+  } catch (error) {
+    output.textContent = error.message;
+    button.disabled = false;
+  }
+}
 async function listDatasets() {
   const payload = await api("/api/datasets");
   const root = $("datasets");
@@ -239,7 +329,15 @@ async function listDatasets() {
       validateButton.addEventListener("click", () => {
         validateDataset(dataset, validationStatus, validateButton);
       });
-      actions.append(validateButton, validationStatus);
+      actions.append(validateButton);
+      const forecastButton = document.createElement("button");
+      forecastButton.type = "button";
+      forecastButton.className = "secondary";
+      forecastButton.textContent = "Quick XGBoost";
+      forecastButton.addEventListener("click", () => {
+        forecastDataset(dataset, validationStatus, forecastButton);
+      });
+      actions.append(forecastButton, validationStatus);
     }
     item.append(title, meta, actions);
     root.append(item);

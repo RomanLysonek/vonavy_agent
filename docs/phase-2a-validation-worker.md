@@ -11,7 +11,7 @@ The v1 request supports two immutable artifact-reference shapes:
 - `storage=local`: a workspace-relative path plus optional expected size/checksum;
 - `storage=s3`: bucket, object key, mandatory object version ID, media type, and optional expected size/checksum.
 
-Phase 2A implements only `LocalFileArtifactReader` and `LocalFileArtifactWriter`. The validation core depends on the `ArtifactReader` protocol, so Phase 2B can materialize a versioned S3 object without changing the request or result schema. The local CLI returns `unsupported_storage` for S3 contracts and performs no cloud call.
+Phase 2A's local CLI implements only `LocalFileArtifactReader` and `LocalFileArtifactWriter`. The validation core depends on the `ArtifactReader` protocol; Phase 2B supplies separate S3 adapters and Batch orchestration without changing this request/result schema. The local CLI still returns `unsupported_storage` for S3 contracts and performs no cloud call.
 
 All local artifact paths are relative to a declared workspace. Absolute paths, `..`, symlinks, and non-regular input files are rejected. Inputs are opened with `O_NOFOLLOW` and exposed to parsers through a descriptor-backed path. The worker hashes the input before and after scanning and fails with `input_changed` if the bytes change during validation. The result is written atomically by creating and fsyncing a temporary file, renaming it in the destination directory, and fsyncing that directory.
 
@@ -121,7 +121,7 @@ Result serialization is strict JSON. `NaN`, positive infinity, and negative infi
 
 Given identical worker code, request, file bytes, and limits, schema, validation decisions, sampling, warnings, and column profiles are deterministic. Runtime timestamps, duration, CPU time, and peak RSS are explicitly runtime-specific.
 
-Default limits are conservative and independently configurable in the request. The worker checks the deadline while hashing and between streamed batches. A future Batch job will also enforce process-level CPU, memory, and wall-clock ceilings.
+Default limits are conservative and independently configurable in the request. The worker checks the deadline while hashing and between streamed batches. Phase 2B additionally enforces process-level CPU, memory, and wall-clock ceilings in AWS Batch.
 
 ## Container
 
@@ -161,4 +161,4 @@ The runtime image:
 
 ## Phase 2B extension
 
-Phase 2B will implement S3-backed `ArtifactReader`/`ArtifactWriter` adapters and ephemeral AWS Batch/Fargate orchestration around the same validation core. The core worker does not import boto3 and does not depend on AWS lifecycle, identity, or metadata APIs.
+Phase 2B implements S3-backed reader/writer adapters and ephemeral AWS Batch/Fargate orchestration around this validation core. The AWS adapter is isolated in `vonavy_agent.validation_worker.aws_artifacts` and is installed through the optional `aws` dependency group. The core worker and local container still do not import boto3 or depend on AWS lifecycle, identity, or metadata APIs. See `phase-2b-aws-validation.md`.

@@ -151,12 +151,63 @@ async function upload(event) {
       method: "POST",
       body: "{}",
     });
-    $("status").textContent = "Upload complete. Validation execution arrives in Phase 2.";
+    $("status").textContent = "Upload complete. The dataset is ready for validation.";
     $("upload-form").reset();
     await listDatasets();
   } catch (error) {
     $("status").textContent = error.message;
   } finally {
+    button.disabled = false;
+  }
+}
+
+function validationMessage(job, result = null) {
+  if (job.status === "succeeded" && result) {
+    return `Validated ${result.row_count.toLocaleString()} rows and ${result.column_count.toLocaleString()} columns.`;
+  }
+  if (job.status === "invalid" && result) {
+    const codes = result.validation_errors.map((issue) => issue.code).join(", ");
+    return `Dataset is invalid: ${codes || "validation rules failed"}.`;
+  }
+  if (job.status === "failed") {
+    return job.failure?.message || "Validation worker failed.";
+  }
+  return `Validation status: ${job.status}.`;
+}
+
+async function waitForValidation(job, output, button) {
+  const terminal = new Set(["succeeded", "invalid", "failed"]);
+  let current = job;
+  const maxAttempts = Math.ceil((state.config.validationJobTimeoutSeconds + 600) / 3);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    output.textContent = validationMessage(current);
+    if (terminal.has(current.status)) {
+      let result = null;
+      if (current.resultAvailable) {
+        result = await api(current.links.result);
+      }
+      output.textContent = validationMessage(current, result);
+      button.disabled = false;
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    current = await api(current.links.status);
+  }
+  output.textContent = "Validation is still running. Refresh to check it again.";
+  button.disabled = false;
+}
+
+async function validateDataset(dataset, output, button) {
+  button.disabled = true;
+  output.textContent = "Submitting an ephemeral CPU validation job…";
+  try {
+    const job = await api(`/api/datasets/${dataset.datasetId}/validations`, {
+      method: "POST",
+      body: JSON.stringify({ requestToken: crypto.randomUUID() }),
+    });
+    await waitForValidation(job, output, button);
+  } catch (error) {
+    output.textContent = error.message;
     button.disabled = false;
   }
 }
@@ -176,7 +227,21 @@ async function listDatasets() {
     title.textContent = dataset.name;
     const meta = document.createElement("span");
     meta.textContent = `${dataset.filename} · ${dataset.status} · ${dataset.sizeBytes.toLocaleString()} bytes`;
-    item.append(title, meta);
+    const actions = document.createElement("div");
+    actions.className = "dataset-actions";
+    const validationStatus = document.createElement("span");
+    validationStatus.className = "validation-status";
+    if (dataset.status === "uploaded") {
+      const validateButton = document.createElement("button");
+      validateButton.type = "button";
+      validateButton.className = "secondary";
+      validateButton.textContent = "Validate dataset";
+      validateButton.addEventListener("click", () => {
+        validateDataset(dataset, validationStatus, validateButton);
+      });
+      actions.append(validateButton, validationStatus);
+    }
+    item.append(title, meta, actions);
     root.append(item);
   }
 }

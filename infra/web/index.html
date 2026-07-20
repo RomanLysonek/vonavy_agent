@@ -13,7 +13,7 @@
     <header>
       <p class="eyebrow">NOTINO FORECASTING WORKBENCH</p>
       <h1>VOŇAVÝ AGENT</h1>
-      <p class="lead">Invite-only dataset intake for leakage-safe forecasting experiments.</p>
+      <p class="lead">Invite-only dataset intake and ephemeral validation for leakage-safe forecasting experiments.</p>
     </header>
 
     <section id="signed-out" class="card">
@@ -53,7 +53,7 @@
         <div class="section-heading">
           <div>
             <h2>Your datasets</h2>
-            <p>Only objects owned by the authenticated Cognito subject are returned.</p>
+            <p>Only owner-scoped datasets and validation jobs are returned. Validation runs on ephemeral CPU capacity.</p>
           </div>
           <button id="refresh" type="button" class="secondary">Refresh</button>
         </div>

@@ -11,6 +11,7 @@ from aws_cdk import (
     Duration,
     Environment,
     RemovalPolicy,
+    Size,
     Stack,
 )
 from aws_cdk import (
@@ -23,6 +24,9 @@ from aws_cdk import (
     aws_apigatewayv2_integrations as integrations,
 )
 from aws_cdk import (
+    aws_batch as batch,
+)
+from aws_cdk import (
     aws_cloudfront as cloudfront,
 )
 from aws_cdk import (
@@ -33,6 +37,15 @@ from aws_cdk import (
 )
 from aws_cdk import (
     aws_dynamodb as dynamodb,
+)
+from aws_cdk import (
+    aws_ec2 as ec2,
+)
+from aws_cdk import (
+    aws_ecr_assets as ecr_assets,
+)
+from aws_cdk import (
+    aws_ecs as ecs,
 )
 from aws_cdk import (
     aws_iam as iam,
@@ -61,6 +74,9 @@ class DeploymentConfig:
     upload_retention_days: int
     protect_data: bool
     local_callback_url: str
+    validation_job_timeout_seconds: int = 900
+    validation_max_active_jobs_per_owner: int = 1
+    source_revision: str = "unknown"
 
     def __post_init__(self) -> None:
         normalized = self.environment_name.replace("-", "")
@@ -84,6 +100,15 @@ class DeploymentConfig:
             )
         if not 1 <= self.upload_retention_days <= 365:
             raise ValueError("upload_retention_days must be between 1 and 365")
+        if not 120 <= self.validation_job_timeout_seconds <= 3_600:
+            raise ValueError("validation_job_timeout_seconds must be between 120 and 3600")
+        if self.validation_max_active_jobs_per_owner != 1:
+            raise ValueError("the first Phase 2B slice supports exactly one active job per owner")
+        if self.source_revision != "unknown" and (
+            len(self.source_revision) != 40
+            or any(character not in "0123456789abcdef" for character in self.source_revision)
+        ):
+            raise ValueError("source_revision must be 'unknown' or a lowercase 40-character SHA")
         callback = urlsplit(self.local_callback_url)
         if (
             callback.scheme != "http"
@@ -175,6 +200,120 @@ class ControlPlaneStack(Stack):
             time_to_live_attribute="expires_at",
             deletion_protection=config.protect_data,
             removal_policy=durable_removal_policy,
+        )
+
+        validation_vpc = ec2.Vpc(
+            self,
+            "ValidationVpc",
+            ip_addresses=ec2.IpAddresses.cidr("10.42.0.0/24"),
+            max_azs=2,
+            nat_gateways=0,
+            subnet_configuration=[
+                ec2.SubnetConfiguration(
+                    name="public",
+                    subnet_type=ec2.SubnetType.PUBLIC,
+                    cidr_mask=26,
+                )
+            ],
+        )
+        validation_security_group = ec2.SecurityGroup(
+            self,
+            "ValidationSecurityGroup",
+            vpc=validation_vpc,
+            allow_all_outbound=True,
+            description="No-ingress security group for ephemeral validation jobs",
+        )
+        validation_logs = logs.LogGroup(
+            self,
+            "ValidationWorkerLogs",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=durable_removal_policy,
+        )
+        validation_execution_role = iam.Role(
+            self,
+            "ValidationExecutionRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AmazonECSTaskExecutionRolePolicy"
+                )
+            ],
+        )
+        validation_job_role = iam.Role(
+            self,
+            "ValidationJobRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+        validation_job_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[data_bucket.arn_for_objects("datasets/users/*")],
+            )
+        )
+        validation_job_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject", "s3:PutObjectTagging"],
+                resources=[data_bucket.arn_for_objects("validation-results/users/*")],
+            )
+        )
+        validation_image = ecs.ContainerImage.from_asset(
+            str(Path(__file__).parents[2]),
+            file="Dockerfile.validation-batch",
+            platform=ecr_assets.Platform.LINUX_AMD64,
+            build_args={"VCS_REF": config.source_revision},
+            exclude=[
+                "docs",
+                "infra",
+                "ops",
+                "tests",
+                "Dockerfile.validation-worker",
+            ],
+        )
+        validation_container = batch.EcsFargateContainerDefinition(
+            self,
+            "ValidationContainer",
+            image=validation_image,
+            cpu=1,
+            memory=Size.mebibytes(2048),
+            assign_public_ip=True,
+            execution_role=validation_execution_role,
+            job_role=validation_job_role,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="validation",
+                log_group=validation_logs,
+            ),
+            environment={
+                "VONAVY_DATA_BUCKET": data_bucket.bucket_name,
+                "AWS_REGION_NAME": self.region,
+            },
+        )
+        validation_job_definition = batch.EcsJobDefinition(
+            self,
+            "ValidationJobDefinition",
+            container=validation_container,
+            retry_attempts=1,
+            timeout=Duration.seconds(config.validation_job_timeout_seconds),
+            propagate_tags=True,
+        )
+        validation_compute_environment = batch.FargateComputeEnvironment(
+            self,
+            "ValidationComputeEnvironment",
+            vpc=validation_vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
+            security_groups=[validation_security_group],
+            maxv_cpus=1,
+            spot=False,
+        )
+        validation_job_queue = batch.JobQueue(
+            self,
+            "ValidationJobQueue",
+            priority=1,
+            compute_environments=[
+                batch.OrderedComputeEnvironment(
+                    compute_environment=validation_compute_environment,
+                    order=1,
+                )
+            ],
         )
 
         web_bucket = s3.Bucket(
@@ -327,7 +466,10 @@ class ControlPlaneStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             architecture=lambda_.Architecture.ARM_64,
             handler="handler.lambda_handler",
-            code=lambda_.Code.from_asset(str(Path(__file__).parents[1] / "lambda/control_plane")),
+            code=lambda_.Code.from_asset(
+                str(Path(__file__).parents[1] / "lambda/control_plane"),
+                exclude=["**/__pycache__/**", "**/*.pyc", "**/*.pyo"],
+            ),
             timeout=Duration.seconds(15),
             memory_size=256,
             log_group=control_plane_log_group,
@@ -339,6 +481,12 @@ class ControlPlaneStack(Stack):
                 "MAX_DATASETS_PER_OWNER": str(config.max_datasets_per_owner),
                 "MAX_TOTAL_BYTES_PER_OWNER": str(config.max_total_bytes_per_owner),
                 "UPLOAD_RETENTION_DAYS": str(config.upload_retention_days),
+                "VALIDATION_JOB_QUEUE": validation_job_queue.job_queue_arn,
+                "VALIDATION_JOB_DEFINITION": validation_job_definition.job_definition_arn,
+                "VALIDATION_JOB_TIMEOUT_SECONDS": str(config.validation_job_timeout_seconds),
+                "VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER": str(
+                    config.validation_max_active_jobs_per_owner
+                ),
                 "AWS_REGION_NAME": self.region,
             },
         )
@@ -363,6 +511,28 @@ class ControlPlaneStack(Stack):
                     "s3:PutObjectTagging",
                 ],
                 resources=[data_bucket.arn_for_objects("datasets/users/*")],
+            )
+        )
+
+        control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[data_bucket.arn_for_objects("validation-results/users/*")],
+            )
+        )
+        control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["batch:SubmitJob"],
+                resources=[
+                    validation_job_queue.job_queue_arn,
+                    validation_job_definition.job_definition_arn,
+                ],
+            )
+        )
+        control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["batch:DescribeJobs", "batch:TerminateJob"],
+                resources=["*"],
             )
         )
 
@@ -396,6 +566,9 @@ class ControlPlaneStack(Stack):
             ("/api/upload-sessions", apigwv2.HttpMethod.POST),
             ("/api/upload-sessions/{upload_id}/complete", apigwv2.HttpMethod.POST),
             ("/api/datasets", apigwv2.HttpMethod.GET),
+            ("/api/datasets/{dataset_id}/validations", apigwv2.HttpMethod.POST),
+            ("/api/validations/{job_id}", apigwv2.HttpMethod.GET),
+            ("/api/validations/{job_id}/result", apigwv2.HttpMethod.GET),
         ):
             http_api.add_routes(
                 path=path,
@@ -456,6 +629,10 @@ class ControlPlaneStack(Stack):
                         "maximumUploadBytes": config.max_upload_bytes,
                         "maximumDatasetsPerOwner": config.max_datasets_per_owner,
                         "maximumTotalBytesPerOwner": config.max_total_bytes_per_owner,
+                        "validationJobTimeoutSeconds": config.validation_job_timeout_seconds,
+                        "maximumActiveValidationJobsPerOwner": (
+                            config.validation_max_active_jobs_per_owner
+                        ),
                     },
                 ),
             ],
@@ -473,3 +650,9 @@ class ControlPlaneStack(Stack):
         CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
         CfnOutput(self, "UserPoolClientId", value=user_pool_client.user_pool_client_id)
         CfnOutput(self, "CognitoDomain", value=user_pool_domain.base_url())
+        CfnOutput(self, "ValidationJobQueueArn", value=validation_job_queue.job_queue_arn)
+        CfnOutput(
+            self,
+            "ValidationJobDefinitionArn",
+            value=validation_job_definition.job_definition_arn,
+        )

@@ -15,6 +15,10 @@ class UnsafeArtifactPathError(OSError):
     pass
 
 
+class ArtifactTooLargeError(OSError):
+    pass
+
+
 class ArtifactReader(Protocol):
     def materialize(self, artifact: InputArtifact) -> AbstractContextManager[Path]: ...
 

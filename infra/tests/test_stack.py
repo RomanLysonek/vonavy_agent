@@ -63,13 +63,17 @@ def _resource_by_logical_id_prefix(
     return next(iter(matches.values()))
 
 
-def test_stack_is_serverless_and_has_no_network_compute() -> None:
+def test_stack_adds_only_ephemeral_fargate_compute() -> None:
     template = _template()
     template.resource_count_is("AWS::EC2::Instance", 0)
     template.resource_count_is("AWS::EC2::NatGateway", 0)
     template.resource_count_is("AWS::RDS::DBInstance", 0)
     template.resource_count_is("AWS::SageMaker::Endpoint", 0)
-    template.resource_count_is("AWS::Batch::ComputeEnvironment", 0)
+    template.resource_count_is("AWS::Batch::ComputeEnvironment", 1)
+    template.resource_count_is("AWS::Batch::JobQueue", 1)
+    template.resource_count_is("AWS::Batch::JobDefinition", 1)
+    template.resource_count_is("AWS::EC2::VPC", 1)
+    template.resource_count_is("AWS::EC2::InternetGateway", 1)
     template.resource_count_is("AWS::DynamoDB::Table", 1)
     template.resource_count_is("AWS::Cognito::UserPool", 1)
     template.resource_count_is("AWS::ApiGatewayV2::Api", 1)
@@ -189,10 +193,26 @@ def test_lambda_separates_staging_and_immutable_data_permissions() -> None:
     ]
 
     assert len(staging_statements) == 1
-    assert len(data_statements) == 1
+    assert len(data_statements) == 2
 
     staging_statement = staging_statements[0]
-    data_statement = data_statements[0]
+    dataset_read_statement = next(
+        statement
+        for statement in data_statements
+        if {"s3:GetObject", "s3:GetObjectVersion"} == _actions(statement)
+    )
+    data_lifecycle_statement = next(
+        statement
+        for statement in data_statements
+        if {
+            "s3:DeleteObjectVersion",
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+            "s3:PutObject",
+            "s3:PutObjectTagging",
+        }
+        <= _actions(statement)
+    )
 
     assert staging_statement["Effect"] == "Allow"
     assert {
@@ -201,14 +221,8 @@ def test_lambda_separates_staging_and_immutable_data_permissions() -> None:
         "s3:PutObject",
     } <= _actions(staging_statement)
 
-    assert data_statement["Effect"] == "Allow"
-    assert {
-        "s3:DeleteObjectVersion",
-        "s3:GetObject",
-        "s3:GetObjectVersion",
-        "s3:PutObject",
-        "s3:PutObjectTagging",
-    } <= _actions(data_statement)
+    assert dataset_read_statement["Effect"] == "Allow"
+    assert data_lifecycle_statement["Effect"] == "Allow"
 
 
 def test_lambda_uses_unreserved_concurrency_and_upload_policy() -> None:
@@ -253,6 +267,7 @@ def test_durable_resources_are_rollback_safe_and_retained_after_create() -> None
         ("AWS::Cognito::UserPool", "UserPool"),
         ("AWS::Logs::LogGroup", "ApiAccessLogs"),
         ("AWS::Logs::LogGroup", "ControlPlaneLogs"),
+        ("AWS::Logs::LogGroup", "ValidationWorkerLogs"),
     ]
 
     for resource_type, logical_id_prefix in resources:
@@ -279,7 +294,7 @@ def test_static_web_bucket_is_destroyed_with_auto_delete_helper() -> None:
 
 def test_every_api_route_requires_jwt_and_custom_scope() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 4
+    assert len(routes) == 7
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"
@@ -298,3 +313,100 @@ def test_staging_policy_does_not_grant_object_tagging() -> None:
     actions = _actions(staging_statements[0])
     assert "s3:GetObjectTagging" not in actions
     assert "s3:PutObjectTagging" not in actions
+
+
+def test_validation_compute_is_scale_to_zero_and_has_no_nat() -> None:
+    template = _template()
+    template.resource_count_is("AWS::EC2::NatGateway", 0)
+    compute = _resource_by_logical_id_prefix(
+        template,
+        "AWS::Batch::ComputeEnvironment",
+        "ValidationComputeEnvironment",
+    )
+    properties = compute["Properties"]
+    assert properties["Type"] == "managed"
+    resources = properties["ComputeResources"]
+    assert resources["Type"] == "FARGATE"
+    assert resources["MaxvCpus"] == 1
+    assert len(resources["Subnets"]) == 2
+    assert len(resources["SecurityGroupIds"]) == 1
+
+
+def test_validation_job_definition_is_bounded_fargate() -> None:
+    job_definition = _resource_by_logical_id_prefix(
+        _template(),
+        "AWS::Batch::JobDefinition",
+        "ValidationJobDefinition",
+    )
+    properties = job_definition["Properties"]
+    serialized = _json_text(properties)
+    assert properties["Type"] == "container"
+    assert properties["PlatformCapabilities"] == ["FARGATE"]
+    assert properties["Timeout"]["AttemptDurationSeconds"] == 900
+    assert properties["RetryStrategy"]["Attempts"] == 1
+    assert '"Type":"VCPU","Value":"1"' in serialized
+    assert '"Type":"MEMORY","Value":"2048"' in serialized
+    assert "VONAVY_DATA_BUCKET" in serialized
+    assert '"AssignPublicIp":"ENABLED"' in serialized
+    assert "validation" in serialized
+
+
+def test_validation_worker_permissions_are_prefix_scoped() -> None:
+    statements = _policy_statements(_template())
+    dataset_reads = [
+        statement
+        for statement in statements
+        if _resource_mentions(statement, "datasets/users/*")
+        and {"s3:GetObject", "s3:GetObjectVersion"} <= _actions(statement)
+    ]
+    result_writes = [
+        statement
+        for statement in statements
+        if _resource_mentions(statement, "validation-results/users/*")
+        and {"s3:PutObject", "s3:PutObjectTagging"} <= _actions(statement)
+    ]
+    assert dataset_reads
+    assert len(result_writes) == 1
+    assert "s3:DeleteObject" not in _actions(result_writes[0])
+    assert "s3:DeleteObjectVersion" not in _actions(result_writes[0])
+
+    job_role_policy = _resource_by_logical_id_prefix(
+        _template(),
+        "AWS::IAM::Policy",
+        "ValidationJobRoleDefaultPolicy",
+    )
+    job_role_text = _json_text(job_role_policy)
+    assert "dynamodb:" not in job_role_text.lower()
+    assert "batch:" not in job_role_text.lower()
+    assert "s3:ListBucket" not in job_role_text
+    assert "s3:DeleteObject" not in job_role_text
+
+
+def test_validation_security_group_has_no_ingress() -> None:
+    template = _template()
+    template.resource_count_is("AWS::EC2::SecurityGroupIngress", 0)
+
+
+def test_control_plane_can_submit_and_reconcile_only_validation_jobs() -> None:
+    statements = _policy_statements(_template())
+    submit = [statement for statement in statements if "batch:SubmitJob" in _actions(statement)]
+    assert len(submit) == 1
+    submit_resources = _json_text(submit[0]["Resource"])
+    assert "ValidationJobQueue" in submit_resources
+    assert "ValidationJobDefinition" in submit_resources
+
+    reconciliation = [
+        statement
+        for statement in statements
+        if {"batch:DescribeJobs", "batch:TerminateJob"} <= _actions(statement)
+    ]
+    assert len(reconciliation) == 1
+    assert reconciliation[0]["Resource"] == "*"
+
+
+def test_validation_routes_are_agent_friendly_and_jwt_protected() -> None:
+    routes = _template().find_resources("AWS::ApiGatewayV2::Route")
+    route_keys = {route["Properties"]["RouteKey"] for route in routes.values()}
+    assert "POST /api/datasets/{dataset_id}/validations" in route_keys
+    assert "GET /api/validations/{job_id}" in route_keys
+    assert "GET /api/validations/{job_id}/result" in route_keys

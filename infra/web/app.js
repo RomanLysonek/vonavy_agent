@@ -1,4 +1,4 @@
-const state = { config: null, tokens: null };
+const state = { config: null, tokens: null, validationResults: new Map() };
 const $ = (id) => document.getElementById(id);
 
 function base64Url(bytes) {
@@ -186,6 +186,12 @@ async function waitForValidation(job, output, button) {
       if (current.resultAvailable) {
         result = await api(current.links.result);
       }
+      if (current.status === "succeeded" && result) {
+        state.validationResults.set(current.datasetId, {
+          jobId: current.validationJobId,
+          result,
+        });
+      }
       output.textContent = validationMessage(current, result);
       button.disabled = false;
       return;
@@ -231,8 +237,11 @@ function promptColumn(label, fallback, optional = false) {
   if (!clean && !optional) throw new Error(`${label} is required.`);
   return clean || null;
 }
-function promptColumns(label) {
-  const value = window.prompt(`${label} (comma separated, optional)`, "");
+function promptColumns(label, fallback = []) {
+  const value = window.prompt(
+    `${label} (comma separated, optional)`,
+    fallback.join(", "),
+  );
   if (value === null) throw new Error("Forecast setup cancelled.");
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
@@ -270,31 +279,79 @@ async function waitForForecast(run, output, button) {
 async function forecastDataset(dataset, output, button) {
   button.disabled = true;
   try {
-    const timestampColumn = promptColumn("Timestamp column", "DateKey");
-    const entityColumn = promptColumn("Entity/product column (optional)", "ProductId", true);
-    const targetColumn = promptColumn("Target column", "Quantity");
-    const availabilityColumn = promptColumn(
-      "Availability column (optional)",
-      "ProductAvailable",
-      true,
+    const validation = state.validationResults.get(dataset.datasetId);
+    if (!validation?.jobId) {
+      throw new Error("Validate this dataset first so the AI can inspect its safe profile.");
+    }
+    const objective = window.prompt(
+      "What should the forecast prioritize? (optional)",
+      "Forecast the next seven days of demand using known future context.",
     );
-    const defaultEnd = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-    const trainingEnd = promptColumn("Last observed training date (YYYY-MM-DD)", defaultEnd);
+    if (objective === null) throw new Error("Forecast setup cancelled.");
+    output.textContent = "Asking the AI to prepare a leakage-safe forecast plan…";
+    const plan = await api(`/api/datasets/${dataset.datasetId}/forecast-agent`, {
+      method: "POST",
+      body: JSON.stringify({
+        validationJobId: validation.jobId,
+        objective: objective.trim(),
+      }),
+    });
+    const suggested = plan.mapping;
     const mapping = {
-      timestampColumn,
-      entityColumn,
-      targetColumn,
-      availabilityColumn,
-      knownFutureNumeric: promptColumns("Known-future numeric columns"),
-      knownFutureCategorical: promptColumns("Known-future categorical columns"),
-      staticNumeric: promptColumns("Static numeric columns"),
-      staticCategorical: promptColumns("Static categorical columns"),
-      excluded: [],
+      timestampColumn: promptColumn("Timestamp column", suggested.timestampColumn),
+      entityColumn: promptColumn(
+        "Entity/product column (optional)",
+        suggested.entityColumn || "",
+        true,
+      ),
+      targetColumn: promptColumn("Target column", suggested.targetColumn),
+      availabilityColumn: promptColumn(
+        "Availability column (optional)",
+        suggested.availabilityColumn || "",
+        true,
+      ),
+      knownFutureNumeric: promptColumns(
+        "Known-future numeric columns",
+        suggested.knownFutureNumeric,
+      ),
+      knownFutureCategorical: promptColumns(
+        "Known-future categorical columns",
+        suggested.knownFutureCategorical,
+      ),
+      staticNumeric: promptColumns("Static numeric columns", suggested.staticNumeric),
+      staticCategorical: promptColumns(
+        "Static categorical columns",
+        suggested.staticCategorical,
+      ),
+      excluded: suggested.excluded,
     };
-    output.textContent = "Submitting a direct seven-day XGBoost retraining job…";
+    const trainingEnd = promptColumn(
+      "Confirm the last observed training date (YYYY-MM-DD)",
+      plan.trainingEnd,
+    );
+    const warnings = plan.warnings.length
+      ? `\nWarnings:\n- ${plan.warnings.join("\n- ")}`
+      : "";
+    const approved = window.confirm(
+      `${plan.summary}\n\n` +
+        `Mode: ${plan.agentMode}${plan.model ? ` / ${plan.model}` : ""}\n` +
+        `Target: ${mapping.targetColumn}\n` +
+        `Timestamp: ${mapping.timestampColumn}\n` +
+        `Entity: ${mapping.entityColumn || "single series"}\n` +
+        `Training end: ${trainingEnd}\n` +
+        `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n` +
+        "Privacy: only validated profile metadata was sent; no raw rows or raw string values." +
+        `${warnings}\n\nStart the CPU XGBoost retraining job?`,
+    );
+    if (!approved) throw new Error("Forecast plan was not confirmed.");
+    output.textContent = "Submitting the confirmed XGBoost retraining plan…";
     const run = await api(`/api/datasets/${dataset.datasetId}/forecasts`, {
       method: "POST",
-      body: JSON.stringify({ requestToken: crypto.randomUUID(), trainingEnd, mapping }),
+      body: JSON.stringify({
+        requestToken: crypto.randomUUID(),
+        trainingEnd,
+        mapping,
+      }),
     });
     await waitForForecast(run, output, button);
   } catch (error) {
@@ -333,7 +390,7 @@ async function listDatasets() {
       const forecastButton = document.createElement("button");
       forecastButton.type = "button";
       forecastButton.className = "secondary";
-      forecastButton.textContent = "Quick XGBoost";
+      forecastButton.textContent = "AI → XGBoost";
       forecastButton.addEventListener("click", () => {
         forecastDataset(dataset, validationStatus, forecastButton);
       });

@@ -14,6 +14,7 @@ from pathlib import PurePath
 from typing import Any
 
 import boto3  # type: ignore[import-untyped]
+from agent import AgentPlanError, build_forecast_agent_plan
 from boto3.dynamodb.types import TypeSerializer  # type: ignore[import-untyped]
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -31,6 +32,8 @@ SOURCE_REVISION = os.environ.get("SOURCE_REVISION", "unknown")
 AWS_REGION_NAME = os.environ.get("AWS_REGION_NAME")
 
 MAX_BODY_BYTES = 32 * 1024
+MAX_VALIDATION_RESULT_BYTES = 4 * 1024 * 1024
+AGENT_DAILY_LIMIT = int(os.environ.get("AGENT_DAILY_LIMIT", "20"))
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 MAX_INPUT_BYTES = 500_000_000
 SLOT_LEASE_SECONDS = FORECAST_JOB_TIMEOUT_SECONDS + 900
@@ -104,14 +107,14 @@ def _identity(event: dict[str, Any]) -> str:
     return owner
 
 
-def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
+def _parse_json_body(event: dict[str, Any], maximum_bytes: int) -> dict[str, Any]:
     raw = event.get("body") or "{}"
     if event.get("isBase64Encoded"):
         try:
             raw = base64.b64decode(raw, validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError) as exc:
             raise ApiError("invalid_json", "Request body is not valid JSON", 400) from exc
-    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_BODY_BYTES:
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > maximum_bytes:
         raise ApiError("request_too_large", "Request body exceeds the server limit", 413)
     try:
         payload = json.loads(raw)
@@ -120,6 +123,10 @@ def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ApiError("invalid_request", "Request body must be a JSON object", 400)
     return payload
+
+
+def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
+    return _parse_json_body(event, MAX_BODY_BYTES)
 
 
 def _canonical_uuid(value: object, *, code: str, message: str, status: int) -> str:
@@ -781,12 +788,175 @@ def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
     return payload
 
 
+def _consume_agent_quota(table: Any, owner: str) -> None:
+    today = datetime.now(UTC).date()
+    now = datetime.now(UTC).isoformat()
+    expires = int(time.time()) + 2 * 86400
+    try:
+        table.update_item(
+            Key={"pk": f"USER#{owner}", "sk": f"AGENT_QUOTA#{today.isoformat()}"},
+            UpdateExpression=(
+                "SET entity_type=:entity, owner_sub=:owner, updated_at=:now, "
+                "expires_at=:expires ADD call_count :one"
+            ),
+            ConditionExpression="attribute_not_exists(call_count) OR call_count < :limit",
+            ExpressionAttributeValues={
+                ":entity": "AGENT_QUOTA",
+                ":owner": owner,
+                ":now": now,
+                ":expires": expires,
+                ":one": 1,
+                ":limit": AGENT_DAILY_LIMIT,
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(
+                "agent_rate_limit_exceeded",
+                "The daily AI planning limit has been reached",
+                429,
+            ) from exc
+        raise
+
+
+def _validation_result_for_agent(
+    s3: Any,
+    table: Any,
+    *,
+    owner: str,
+    dataset: dict[str, Any],
+    dataset_id: str,
+    validation_job_id: str,
+) -> dict[str, Any]:
+    response = table.get_item(
+        Key={"pk": f"USER#{owner}", "sk": f"VALIDATION#{validation_job_id}"},
+        ConsistentRead=True,
+    )
+    item = response.get("Item")
+    if (
+        not isinstance(item, dict)
+        or item.get("owner_sub") != owner
+        or item.get("dataset_id") != dataset_id
+    ):
+        raise ApiError("validation_not_found", "Validation job does not exist", 404)
+    if item.get("status") != "succeeded":
+        raise ApiError(
+            "validation_not_complete",
+            "A successful validation is required before AI planning",
+            409,
+            {"status": item.get("status")},
+        )
+    result_key = item.get("result_key")
+    result_version_id = item.get("result_version_id")
+    if not isinstance(result_key, str) or not isinstance(result_version_id, str):
+        raise ApiError(
+            "validation_result_unavailable",
+            "The immutable validation result is unavailable",
+            409,
+        )
+    try:
+        stored = s3.get_object(
+            Bucket=DATA_BUCKET,
+            Key=result_key,
+            VersionId=result_version_id,
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"NoSuchKey", "NoSuchVersion", "NotFound"}:
+            raise ApiError(
+                "validation_result_unavailable",
+                "The immutable validation result is unavailable",
+                409,
+            ) from exc
+        raise
+    body = stored["Body"]
+    try:
+        raw = body.read(MAX_VALIDATION_RESULT_BYTES + 1)
+    finally:
+        body.close()
+    if len(raw) > MAX_VALIDATION_RESULT_BYTES:
+        raise ApiError(
+            "validation_result_too_large",
+            "The validation result exceeds the planning limit",
+            500,
+        )
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ApiError(
+            "validation_result_invalid",
+            "The validation result is malformed",
+            500,
+        ) from exc
+    if (
+        not isinstance(result, dict)
+        or result.get("schema_version") != "validation-result/v1"
+        or result.get("status") != "succeeded"
+        or result.get("job_id") != validation_job_id
+        or result.get("dataset_id") != dataset_id
+    ):
+        raise ApiError(
+            "validation_result_invalid",
+            "The validation result identity is invalid",
+            500,
+        )
+    identity = result.get("input_identity")
+    if not isinstance(identity, dict) or identity.get("version_id") != dataset.get(
+        "object_version_id"
+    ):
+        raise ApiError(
+            "validation_result_mismatch",
+            "The validation result does not match the immutable dataset version",
+            409,
+        )
+    return result
+
+
+def _agent_plan(event: dict[str, Any], dataset_id: str) -> dict[str, Any]:
+    owner = _identity(event)
+    dataset_id = _canonical_uuid(
+        dataset_id,
+        code="dataset_not_found",
+        message="Dataset does not exist",
+        status=404,
+    )
+    body = _parse_body(event)
+    validation_job_id = _canonical_uuid(
+        body.get("validationJobId"),
+        code="validation_not_found",
+        message="Validation job does not exist",
+        status=404,
+    )
+    s3, table, _, _ = _clients()
+    dataset = _dataset(table, owner, dataset_id)
+    validation_result = _validation_result_for_agent(
+        s3,
+        table,
+        owner=owner,
+        dataset=dataset,
+        dataset_id=dataset_id,
+        validation_job_id=validation_job_id,
+    )
+    _consume_agent_quota(table, owner)
+    try:
+        return build_forecast_agent_plan(
+            dataset_id=dataset_id,
+            dataset_version_id=str(dataset["object_version_id"]),
+            validation_result=validation_result,
+            objective=body.get("objective"),
+        )
+    except AgentPlanError as exc:
+        raise ApiError(exc.code, exc.message, exc.status, exc.detail) from exc
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     request_id = getattr(context, "aws_request_id", None)
     try:
         route = event.get("routeKey")
         path = event.get("rawPath", "")
         parts = path.split("/")
+        if route == "POST /api/datasets/{dataset_id}/forecast-agent" and len(parts) == 5:
+            return _response(200, _agent_plan(event, parts[3]))
         if route == "POST /api/datasets/{dataset_id}/forecasts" and len(parts) == 5:
             status, payload = _create(event, parts[3])
             return _response(status, payload)

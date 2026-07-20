@@ -638,7 +638,7 @@ class ControlPlaneStack(Stack):
                 str(Path(__file__).parents[1] / "lambda/forecast_control_plane"),
                 exclude=["**/__pycache__/**", "**/*.pyc", "**/*.pyo"],
             ),
-            timeout=Duration.seconds(15),
+            timeout=Duration.seconds(45),
             memory_size=256,
             log_group=forecast_control_plane_logs,
             environment={
@@ -647,6 +647,11 @@ class ControlPlaneStack(Stack):
                 "FORECAST_JOB_QUEUE": validation_job_queue.job_queue_arn,
                 "FORECAST_JOB_DEFINITION": forecast_job_definition.job_definition_arn,
                 "FORECAST_JOB_TIMEOUT_SECONDS": "3600",
+                "OPENAI_API_KEY_PARAMETER": "/vonavy-agent/dev/openai-api-key",
+                "OPENAI_MODEL": "gpt-5-mini-2025-08-07",
+                "OPENAI_TIMEOUT_SECONDS": "25",
+                "OPENAI_MAX_OUTPUT_TOKENS": "1600",
+                "AGENT_DAILY_LIMIT": "20",
                 "UPLOAD_RETENTION_DAYS": str(config.upload_retention_days),
                 "SOURCE_REVISION": config.source_revision,
                 "AWS_REGION_NAME": self.region,
@@ -655,8 +660,20 @@ class ControlPlaneStack(Stack):
         metadata_table.grant_read_write_data(forecast_control_plane_function)
         forecast_control_plane_function.add_to_role_policy(
             iam.PolicyStatement(
+                actions=["ssm:GetParameter"],
+                resources=[
+                    f"arn:{Aws.PARTITION}:ssm:{self.region}:{self.account}:"
+                    "parameter/vonavy-agent/dev/openai-api-key"
+                ],
+            )
+        )
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
                 actions=["s3:GetObject", "s3:GetObjectVersion"],
-                resources=[data_bucket.arn_for_objects("forecast-results/users/*")],
+                resources=[
+                    data_bucket.arn_for_objects("forecast-results/users/*"),
+                    data_bucket.arn_for_objects("validation-results/users/*"),
+                ],
             )
         )
         forecast_control_plane_function.add_to_role_policy(
@@ -737,6 +754,7 @@ class ControlPlaneStack(Stack):
             )
 
         for path, method in (
+            ("/api/datasets/{dataset_id}/forecast-agent", apigwv2.HttpMethod.POST),
             ("/api/datasets/{dataset_id}/forecasts", apigwv2.HttpMethod.POST),
             ("/api/forecasts/{run_id}", apigwv2.HttpMethod.GET),
             ("/api/forecasts/{run_id}/result", apigwv2.HttpMethod.GET),
@@ -803,6 +821,8 @@ class ControlPlaneStack(Stack):
                         "validationJobTimeoutSeconds": config.validation_job_timeout_seconds,
                         "forecastJobTimeoutSeconds": 3600,
                         "forecastAdapterId": "xgboost-direct-v1",
+                        "forecastAgentEnabled": True,
+                        "forecastAgentModel": "gpt-5-mini-2025-08-07",
                         "maximumActiveValidationJobsPerOwner": (
                             config.validation_max_active_jobs_per_owner
                         ),

@@ -1,0 +1,39 @@
+FROM python:3.12.3-slim-bookworm AS build
+
+ARG UV_VERSION=0.10.0
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+RUN python -m pip install "uv==${UV_VERSION}"
+WORKDIR /build
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+RUN uv sync --frozen --no-dev --no-editable --extra aws --extra modeling --python /usr/local/bin/python
+
+FROM python:3.12.3-slim-bookworm AS runtime
+
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="Vonavy Agent XGBoost forecast worker" \
+      org.opencontainers.image.description="AWS Batch adapter for direct seven-day XGBoost retraining" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="https://github.com/RomanLysonek/vonavy_agent"
+
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/worker \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
+
+RUN groupadd --gid 10001 worker \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin worker
+
+COPY --from=build --chown=10001:10001 /opt/venv /opt/venv
+WORKDIR /home/worker
+USER 10001:10001
+ENTRYPOINT ["python", "-m", "vonavy_agent.forecasting.aws_batch"]

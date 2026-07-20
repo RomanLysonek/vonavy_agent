@@ -1174,10 +1174,11 @@ def test_validation_submission_is_owner_scoped_and_idempotent(monkeypatch) -> No
     assert first_payload["status"] == "submitted"
     assert first_payload["datasetId"] == dataset_id
     assert len(fake_batch.submissions) == 1
+    submission = fake_batch.submissions[0]
+    assert "tags" not in submission
+    assert "propagateTags" not in submission
 
-    request_document = json.loads(
-        fake_batch.submissions[0]["containerOverrides"]["environment"][0]["value"]
-    )
+    request_document = json.loads(submission["containerOverrides"]["environment"][0]["value"])
     assert request_document["owner_id"] == owner
     assert request_document["input"]["version_id"] == "dataset-version"
     stored_job = fake_table.items[

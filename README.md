@@ -1,6 +1,6 @@
 # Experiment Agent
 
-> Current development line: Phase 1 serverless control plane. Local evaluation remains fully supported; the AWS slice is implemented for synthesis and review but must not be deployed before its CDK/IAM diff is approved.
+> Current development line: Phase 2A dataset validation worker. The Phase 1 serverless control plane is deployed and end-to-end certified; local evaluation remains fully supported.
 
 Local, deterministic forecasting experiment workbench for the NOTINO interview
 portfolio. It copies permitted CSV/Parquet data into immutable content-addressed
@@ -106,6 +106,25 @@ uv run mypy src
 uv run pytest
 ```
 
+## Dataset validation worker
+
+Phase 2A includes a cloud-neutral CPU worker that validates and profiles immutable
+CSV/Parquet artifacts through strict `validation-request/v1` and
+`validation-result/v1` contracts. It supports bounded deterministic sampling,
+exact row/null counts, stable error codes, safe workspace-relative paths, and
+atomic result publication.
+
+```bash
+uv run vonavy-agent validate-dataset \
+  --workspace ./validation-workspace \
+  --request ./validation-workspace/request.json \
+  --result output/result.json
+```
+
+Exit code `0` means success, `2` means a readable but invalid dataset, and `1`
+means a worker/I/O/parser failure. See `docs/phase-2a-validation-worker.md` and
+`Dockerfile.validation-worker` for the full contracts and container workflow.
+
 ## Managed artifacts
 
 Each run publishes canonical spec, gate, profile, predictions, metrics,
@@ -145,10 +164,9 @@ The `infra/` CDK application implements the first scale-to-zero AWS slice:
 - short-lived direct browser-to-S3 uploads with exact-size POST policy, hard
   server-owned slot limits, immutable final copies, and lifecycle expiry.
 
-This phase creates no EC2, NAT Gateway, RDS, SageMaker, AWS Batch, training, or
-GPU resources. It is not yet deployed. The executor must generate and commit
-`infra/uv.lock` and `infra/package-lock.json`, pass all root and infrastructure
-quality gates, synthesize the stack, and return the complete IAM diff before
-`cdk bootstrap` or `cdk deploy` is considered. See
-`docs/phase-1-serverless-control-plane.md` and
+The Phase 1 stack is deployed and certified across Cognito OAuth/PKCE,
+authenticated API access, presigned S3 upload, owner isolation, DynamoDB state,
+versioned final storage, CloudFront UI display, idempotent completion, and exact
+cleanup. It still creates no EC2, NAT Gateway, RDS, SageMaker, AWS Batch,
+training, or GPU resources. See `docs/phase-1-serverless-control-plane.md` and
 `ops/phase-1-synth-and-review.md`.

@@ -1222,6 +1222,8 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "xgboost", version = "3.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "xgboost", version = "3.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 modeling = [
     { name = "xgboost", version = "3.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1250,6 +1252,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.6,<2" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
+    { name = "xgboost", marker = "extra == 'dev'", specifier = ">=3.1,<4" },
     { name = "xgboost", marker = "extra == 'modeling'", specifier = ">=3.1,<4" },
 ]
 provides-extras = ["aws", "modeling", "dev"]

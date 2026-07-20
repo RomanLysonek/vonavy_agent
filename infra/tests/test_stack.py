@@ -510,7 +510,7 @@ def test_forecast_worker_and_control_plane_are_least_privilege() -> None:
     assert not any("batch:TagResource" in _actions(statement) for statement in statements)
 
 
-def test_forecast_agent_is_pinned_and_reads_only_exact_secret_parameter() -> None:
+def test_forecast_agent_is_pinned_to_exact_bedrock_profile() -> None:
     template = _template()
     function = _resource_by_logical_id_prefix(
         template,
@@ -520,19 +520,35 @@ def test_forecast_agent_is_pinned_and_reads_only_exact_secret_parameter() -> Non
     properties = function["Properties"]
     assert properties["Timeout"] == 45
     environment = properties["Environment"]["Variables"]
-    assert environment["OPENAI_API_KEY_PARAMETER"] == "/vonavy-agent/dev/openai-api-key"
-    assert environment["OPENAI_MODEL"] == "gpt-5-mini-2025-08-07"
-    assert environment["OPENAI_TIMEOUT_SECONDS"] == "25"
+    assert environment["BEDROCK_MODEL_ID"] == "eu.anthropic.claude-opus-4-6-v1"
+    assert environment["BEDROCK_TIMEOUT_SECONDS"] == "25"
+    assert environment["BEDROCK_MAX_OUTPUT_TOKENS"] == "1200"
     assert environment["AGENT_DAILY_LIMIT"] == "20"
+    assert not any(key.startswith("OPENAI_") for key in environment)
 
     statements = _policy_statements(template)
-    parameter_reads = [
-        statement for statement in statements if "ssm:GetParameter" in _actions(statement)
+    bedrock = [
+        statement for statement in statements if "bedrock:InvokeModel" in _actions(statement)
     ]
-    assert len(parameter_reads) == 1
-    assert _actions(parameter_reads[0]) == {"ssm:GetParameter"}
-    assert parameter_reads[0]["Resource"] != "*"
-    assert "parameter/vonavy-agent/dev/openai-api-key" in _json_text(parameter_reads[0]["Resource"])
+    assert len(bedrock) == 2
+    assert all(_actions(statement) == {"bedrock:InvokeModel"} for statement in bedrock)
+    serialized = _json_text(bedrock)
+    assert "inference-profile/eu.anthropic.claude-opus-4-6-v1" in serialized
+    assert "foundation-model/anthropic.claude-opus-4-6-v1" in serialized
+    for region in (
+        "eu-central-1",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-3",
+    ):
+        assert region in serialized
+    assert "bedrock:InferenceProfileArn" in serialized
+    assert '"Resource":"*"' not in serialized
+    assert "bedrock:InvokeModelWithResponseStream" not in _json_text(statements)
+    assert "ssm:GetParameter" not in _json_text(statements)
+    assert "/vonavy-agent/dev/openai-api-key" not in _json_text(template.to_json())
 
     validation_reads = [
         statement

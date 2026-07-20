@@ -647,10 +647,9 @@ class ControlPlaneStack(Stack):
                 "FORECAST_JOB_QUEUE": validation_job_queue.job_queue_arn,
                 "FORECAST_JOB_DEFINITION": forecast_job_definition.job_definition_arn,
                 "FORECAST_JOB_TIMEOUT_SECONDS": "3600",
-                "OPENAI_API_KEY_PARAMETER": "/vonavy-agent/dev/openai-api-key",
-                "OPENAI_MODEL": "gpt-5-mini-2025-08-07",
-                "OPENAI_TIMEOUT_SECONDS": "25",
-                "OPENAI_MAX_OUTPUT_TOKENS": "1600",
+                "BEDROCK_MODEL_ID": "eu.anthropic.claude-opus-4-6-v1",
+                "BEDROCK_TIMEOUT_SECONDS": "25",
+                "BEDROCK_MAX_OUTPUT_TOKENS": "1200",
                 "AGENT_DAILY_LIMIT": "20",
                 "UPLOAD_RETENTION_DAYS": str(config.upload_retention_days),
                 "SOURCE_REVISION": config.source_revision,
@@ -658,13 +657,34 @@ class ControlPlaneStack(Stack):
             },
         )
         metadata_table.grant_read_write_data(forecast_control_plane_function)
+        bedrock_inference_profile_arn = (
+            f"arn:{Aws.PARTITION}:bedrock:{self.region}:{self.account}:"
+            "inference-profile/eu.anthropic.claude-opus-4-6-v1"
+        )
         forecast_control_plane_function.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["ssm:GetParameter"],
+                actions=["bedrock:InvokeModel"],
+                resources=[bedrock_inference_profile_arn],
+            )
+        )
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:InvokeModel"],
                 resources=[
-                    f"arn:{Aws.PARTITION}:ssm:{self.region}:{self.account}:"
-                    "parameter/vonavy-agent/dev/openai-api-key"
+                    f"arn:{Aws.PARTITION}:bedrock:{region}::foundation-model/"
+                    "anthropic.claude-opus-4-6-v1"
+                    for region in (
+                        "eu-central-1",
+                        "eu-north-1",
+                        "eu-south-1",
+                        "eu-south-2",
+                        "eu-west-1",
+                        "eu-west-3",
+                    )
                 ],
+                conditions={
+                    "StringEquals": {"bedrock:InferenceProfileArn": bedrock_inference_profile_arn}
+                },
             )
         )
         forecast_control_plane_function.add_to_role_policy(
@@ -822,7 +842,7 @@ class ControlPlaneStack(Stack):
                         "forecastJobTimeoutSeconds": 3600,
                         "forecastAdapterId": "xgboost-direct-v1",
                         "forecastAgentEnabled": True,
-                        "forecastAgentModel": "gpt-5-mini-2025-08-07",
+                        "forecastAgentModel": "eu.anthropic.claude-opus-4-6-v1",
                         "maximumActiveValidationJobsPerOwner": (
                             config.validation_max_active_jobs_per_owner
                         ),

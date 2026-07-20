@@ -13,6 +13,7 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
 UPLOAD_BUCKET = os.environ["UPLOAD_BUCKET"]
@@ -42,6 +43,8 @@ ALLOWED_MEDIA_TYPES = {
 
 _s3: Any | None = None
 _table: Any | None = None
+_SERIALIZER = TypeSerializer()
+_ATTRIBUTE_VALUE_TYPES = {"S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"}
 
 
 class ApiError(Exception):
@@ -60,6 +63,36 @@ def _clients() -> tuple[Any, Any]:
     if _table is None:
         _table = boto3.resource("dynamodb", region_name=AWS_REGION_NAME).Table(METADATA_TABLE)
     return _s3, _table
+
+
+def _av(value: Any) -> dict[str, Any]:
+    """Serialize one native Python value into one DynamoDB AttributeValue."""
+    if isinstance(value, dict) and set(value).issubset(_ATTRIBUTE_VALUE_TYPES):
+        raise TypeError("DynamoDB AttributeValues must be built from native values exactly once")
+    serialized = _SERIALIZER.serialize(value)
+    if "M" in serialized and isinstance(value, dict):
+        raise TypeError("ExpressionAttributeValues must serialize placeholders individually")
+    return serialized
+
+
+def _key(pk: str, sk: str) -> dict[str, dict[str, Any]]:
+    return {"pk": _av(pk), "sk": _av(sk)}
+
+
+def _item(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {name: _av(value) for name, value in values.items() if value is not None}
+
+
+def _expression_values(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {name: _av(value) for name, value in values.items()}
+
+
+def _attribute_value_type_map(values: dict[str, dict[str, Any]]) -> dict[str, str]:
+    return {name: next(iter(value), "Unknown") for name, value in values.items()}
+
+
+def _sanitize_aws_error_message(message: str) -> str:
+    return re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", "<redacted-email>", message)[:500]
 
 
 def _json_response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +255,10 @@ def _is_transaction_canceled(exc: ClientError) -> bool:
     return exc.response.get("Error", {}).get("Code") == "TransactionCanceledException"
 
 
+def _is_validation_exception(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") == "ValidationException"
+
+
 def _handle_create_upload_transaction_cancel(
     exc: ClientError,
     *,
@@ -265,7 +302,40 @@ def _handle_create_upload_transaction_cancel(
     ) from exc
 
 
-def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
+def _log_create_upload_validation_exception(
+    exc: ClientError,
+    *,
+    lambda_request_id: str | None,
+    upload_id: str,
+    dataset_id: str,
+    transaction_items: list[dict[str, Any]],
+) -> None:
+    first_update = transaction_items[0]["Update"]
+    placeholder_type_map = _attribute_value_type_map(
+        first_update.get("ExpressionAttributeValues", {})
+    )
+    error = exc.response.get("Error", {})
+    LOGGER.warning(
+        "Create-upload DynamoDB transaction request was invalid",
+        extra={
+            "route": "POST /api/upload-sessions",
+            "lambda_request_id": lambda_request_id,
+            "aws_request_id": exc.response.get("ResponseMetadata", {}).get("RequestId"),
+            "aws_error_code": error.get("Code"),
+            "sanitized_aws_error_message": _sanitize_aws_error_message(
+                str(error.get("Message", ""))
+            ),
+            "action_order": ["slot", "dataset", "upload"],
+            "expression_placeholder_type_map": placeholder_type_map,
+            "dataset_id": dataset_id,
+            "upload_id": upload_id,
+        },
+    )
+
+
+def _create_upload_session(
+    event: dict[str, Any], lambda_request_id: str | None = None
+) -> dict[str, Any]:
     owner, email = _identity(event)
     dataset_name, filename, media_type, size_bytes = _validate_upload(_parse_body(event))
     s3, table = _clients()
@@ -281,101 +351,115 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
         staging_object_key = f"pending/users/{owner}/datasets/{dataset_id}/{upload_id}/{filename}"
         object_key = f"datasets/users/{owner}/{dataset_id}/{upload_id}/{filename}"
         slot_key = f"SLOT#{slot_number:04d}"
+        slot_values = _expression_values(
+            {
+                ":entity": "UPLOAD_SLOT",
+                ":owner": owner,
+                ":slot": slot_number,
+                ":dataset": dataset_id,
+                ":upload": upload_id,
+                ":size": size_bytes,
+                ":pending": "pending",
+                ":released": "released",
+                ":free": "free",
+                ":expired": "expired",
+                ":created": created_at,
+                ":updated": created_at,
+                ":expires": pending_expires_at,
+                ":now": now,
+            }
+        )
+        transaction_items = [
+            {
+                "Update": {
+                    "TableName": METADATA_TABLE,
+                    "Key": _key(owner_pk, slot_key),
+                    "UpdateExpression": (
+                        "SET entity_type = :entity, owner_sub = :owner, "
+                        "slot_number = :slot, dataset_id = :dataset, upload_id = :upload, "
+                        "expected_size = :size, #status = :pending, "
+                        "created_at = if_not_exists(created_at, :created), "
+                        "updated_at = :updated, expires_at = :expires"
+                    ),
+                    "ConditionExpression": (
+                        "attribute_not_exists(pk) "
+                        "OR #status IN (:released, :free, :expired) "
+                        "OR (#status = :pending AND expires_at <= :now)"
+                    ),
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": slot_values,
+                }
+            },
+            {
+                "Put": {
+                    "TableName": METADATA_TABLE,
+                    "Item": _item(
+                        {
+                            "pk": owner_pk,
+                            "sk": f"DATASET#{dataset_id}",
+                            "entity_type": "DATASET",
+                            "owner_sub": owner,
+                            "dataset_id": dataset_id,
+                            "dataset_name": dataset_name,
+                            "filename": filename,
+                            "media_type": media_type,
+                            "expected_size": size_bytes,
+                            "staging_object_key": staging_object_key,
+                            "object_key": object_key,
+                            "upload_id": upload_id,
+                            "slot_key": slot_key,
+                            "status": "upload_pending",
+                            "created_at": created_at,
+                            "updated_at": created_at,
+                            "expires_at": pending_expires_at,
+                            "owner_email": email,
+                        }
+                    ),
+                    "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                }
+            },
+            {
+                "Put": {
+                    "TableName": METADATA_TABLE,
+                    "Item": _item(
+                        {
+                            "pk": owner_pk,
+                            "sk": f"UPLOAD#{upload_id}",
+                            "entity_type": "UPLOAD",
+                            "owner_sub": owner,
+                            "dataset_id": dataset_id,
+                            "upload_id": upload_id,
+                            "slot_key": slot_key,
+                            "staging_object_key": staging_object_key,
+                            "object_key": object_key,
+                            "media_type": media_type,
+                            "expected_size": size_bytes,
+                            "status": "pending",
+                            "created_at": created_at,
+                            "updated_at": created_at,
+                            "expires_at": pending_expires_at,
+                        }
+                    ),
+                    "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                }
+            },
+        ]
         try:
-            table.meta.client.transact_write_items(
-                TransactItems=[
-                    {
-                        "Update": {
-                            "TableName": METADATA_TABLE,
-                            "Key": {"pk": {"S": owner_pk}, "sk": {"S": slot_key}},
-                            "UpdateExpression": (
-                                "SET entity_type = :entity, owner_sub = :owner, "
-                                "slot_number = :slot, dataset_id = :dataset, upload_id = :upload, "
-                                "expected_size = :size, #status = :pending, "
-                                "created_at = if_not_exists(created_at, :created), "
-                                "updated_at = :updated, expires_at = :expires"
-                            ),
-                            "ConditionExpression": (
-                                "attribute_not_exists(pk) "
-                                "OR #status IN (:released, :free, :expired) "
-                                "OR (#status = :pending AND expires_at <= :now)"
-                            ),
-                            "ExpressionAttributeNames": {"#status": "status"},
-                            "ExpressionAttributeValues": {
-                                ":entity": {"S": "UPLOAD_SLOT"},
-                                ":owner": {"S": owner},
-                                ":slot": {"N": str(slot_number)},
-                                ":dataset": {"S": dataset_id},
-                                ":upload": {"S": upload_id},
-                                ":size": {"N": str(size_bytes)},
-                                ":pending": {"S": "pending"},
-                                ":released": {"S": "released"},
-                                ":free": {"S": "free"},
-                                ":expired": {"S": "expired"},
-                                ":created": {"S": created_at},
-                                ":updated": {"S": created_at},
-                                ":expires": {"N": str(pending_expires_at)},
-                                ":now": {"N": str(now)},
-                            },
-                        }
-                    },
-                    {
-                        "Put": {
-                            "TableName": METADATA_TABLE,
-                            "Item": {
-                                "pk": {"S": owner_pk},
-                                "sk": {"S": f"DATASET#{dataset_id}"},
-                                "entity_type": {"S": "DATASET"},
-                                "owner_sub": {"S": owner},
-                                "dataset_id": {"S": dataset_id},
-                                "dataset_name": {"S": dataset_name},
-                                "filename": {"S": filename},
-                                "media_type": {"S": media_type},
-                                "expected_size": {"N": str(size_bytes)},
-                                "staging_object_key": {"S": staging_object_key},
-                                "object_key": {"S": object_key},
-                                "upload_id": {"S": upload_id},
-                                "slot_key": {"S": slot_key},
-                                "status": {"S": "upload_pending"},
-                                "created_at": {"S": created_at},
-                                "updated_at": {"S": created_at},
-                                "expires_at": {"N": str(pending_expires_at)},
-                                **({"owner_email": {"S": email}} if email else {}),
-                            },
-                            "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
-                        }
-                    },
-                    {
-                        "Put": {
-                            "TableName": METADATA_TABLE,
-                            "Item": {
-                                "pk": {"S": owner_pk},
-                                "sk": {"S": f"UPLOAD#{upload_id}"},
-                                "entity_type": {"S": "UPLOAD"},
-                                "owner_sub": {"S": owner},
-                                "dataset_id": {"S": dataset_id},
-                                "upload_id": {"S": upload_id},
-                                "slot_key": {"S": slot_key},
-                                "staging_object_key": {"S": staging_object_key},
-                                "object_key": {"S": object_key},
-                                "media_type": {"S": media_type},
-                                "expected_size": {"N": str(size_bytes)},
-                                "status": {"S": "pending"},
-                                "created_at": {"S": created_at},
-                                "updated_at": {"S": created_at},
-                                "expires_at": {"N": str(pending_expires_at)},
-                            },
-                            "ConditionExpression": "attribute_not_exists(pk) AND attribute_not_exists(sk)",
-                        }
-                    },
-                ]
-            )
+            table.meta.client.transact_write_items(TransactItems=transaction_items)
         except ClientError as exc:
             if _is_transaction_canceled(exc):
                 _handle_create_upload_transaction_cancel(
                     exc,
                     upload_id=upload_id,
                     dataset_id=dataset_id,
+                )
+            if _is_validation_exception(exc):
+                _log_create_upload_validation_exception(
+                    exc,
+                    lambda_request_id=lambda_request_id,
+                    upload_id=upload_id,
+                    dataset_id=dataset_id,
+                    transaction_items=transaction_items,
                 )
             raise
         break
@@ -477,28 +561,27 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
                 {
                     "Update": {
                         "TableName": METADATA_TABLE,
-                        "Key": {"pk": {"S": owner_pk}, "sk": {"S": f"UPLOAD#{upload_id}"}},
+                        "Key": _key(owner_pk, f"UPLOAD#{upload_id}"),
                         "UpdateExpression": (
                             "SET #status = :completed, updated_at = :updated, expires_at = :expires"
                         ),
                         "ConditionExpression": "owner_sub = :owner AND #status = :pending",
                         "ExpressionAttributeNames": {"#status": "status"},
-                        "ExpressionAttributeValues": {
-                            ":completed": {"S": "completed"},
-                            ":pending": {"S": "pending"},
-                            ":owner": {"S": owner},
-                            ":updated": {"S": updated_at},
-                            ":expires": {"N": str(completed_expires_at)},
-                        },
+                        "ExpressionAttributeValues": _expression_values(
+                            {
+                                ":completed": "completed",
+                                ":pending": "pending",
+                                ":owner": owner,
+                                ":updated": updated_at,
+                                ":expires": completed_expires_at,
+                            }
+                        ),
                     }
                 },
                 {
                     "Update": {
                         "TableName": METADATA_TABLE,
-                        "Key": {
-                            "pk": {"S": owner_pk},
-                            "sk": {"S": f"DATASET#{upload['dataset_id']}"},
-                        },
+                        "Key": _key(owner_pk, f"DATASET#{upload['dataset_id']}"),
                         "UpdateExpression": (
                             "SET #status = :uploaded, updated_at = :updated, "
                             "actual_size = :size, object_key = :object_key, "
@@ -506,34 +589,38 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
                         ),
                         "ConditionExpression": "owner_sub = :owner AND upload_id = :upload",
                         "ExpressionAttributeNames": {"#status": "status"},
-                        "ExpressionAttributeValues": {
-                            ":uploaded": {"S": "uploaded"},
-                            ":owner": {"S": owner},
-                            ":upload": {"S": upload_id},
-                            ":updated": {"S": updated_at},
-                            ":size": {"N": str(actual_size)},
-                            ":object_key": {"S": object_key},
-                            ":version": {"S": object_version_id},
-                            ":expires": {"N": str(completed_expires_at)},
-                        },
+                        "ExpressionAttributeValues": _expression_values(
+                            {
+                                ":uploaded": "uploaded",
+                                ":owner": owner,
+                                ":upload": upload_id,
+                                ":updated": updated_at,
+                                ":size": actual_size,
+                                ":object_key": object_key,
+                                ":version": object_version_id,
+                                ":expires": completed_expires_at,
+                            }
+                        ),
                     }
                 },
                 {
                     "Update": {
                         "TableName": METADATA_TABLE,
-                        "Key": {"pk": {"S": owner_pk}, "sk": {"S": upload["slot_key"]}},
+                        "Key": _key(owner_pk, upload["slot_key"]),
                         "UpdateExpression": (
-                            "SET #status = :completed, updated_at = :updated, expires_at = :expires"
+                            "SET #status = :released, updated_at = :updated, expires_at = :expires"
                         ),
                         "ConditionExpression": "owner_sub = :owner AND upload_id = :upload",
                         "ExpressionAttributeNames": {"#status": "status"},
-                        "ExpressionAttributeValues": {
-                            ":completed": {"S": "completed"},
-                            ":owner": {"S": owner},
-                            ":upload": {"S": upload_id},
-                            ":updated": {"S": updated_at},
-                            ":expires": {"N": str(completed_expires_at)},
-                        },
+                        "ExpressionAttributeValues": _expression_values(
+                            {
+                                ":released": "released",
+                                ":owner": owner,
+                                ":upload": upload_id,
+                                ":updated": updated_at,
+                                ":expires": completed_expires_at,
+                            }
+                        ),
                     }
                 },
             ]
@@ -584,13 +671,13 @@ def _list_datasets(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    del context
+    lambda_request_id = getattr(context, "aws_request_id", None)
     try:
         method, path = _route(event)
         if method == "GET" and path == "/api/health":
             return _json_response(200, {"status": "ok", "service": "vonavy-agent-control-plane"})
         if method == "POST" and path == "/api/upload-sessions":
-            return _json_response(201, _create_upload_session(event))
+            return _json_response(201, _create_upload_session(event, lambda_request_id))
         if (
             method == "POST"
             and path.startswith("/api/upload-sessions/")

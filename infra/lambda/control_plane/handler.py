@@ -42,7 +42,9 @@ ALLOWED_MEDIA_TYPES = {
 }
 
 _s3: Any | None = None
+_ddb_resource: Any | None = None
 _table: Any | None = None
+_ddb_client: Any | None = None
 _SERIALIZER = TypeSerializer()
 _ATTRIBUTE_VALUE_TYPES = {"S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"}
 
@@ -56,13 +58,17 @@ class ApiError(Exception):
         self.detail = detail
 
 
-def _clients() -> tuple[Any, Any]:
-    global _s3, _table
+def _clients() -> tuple[Any, Any, Any]:
+    global _s3, _ddb_resource, _table, _ddb_client
     if _s3 is None:
         _s3 = boto3.client("s3", region_name=AWS_REGION_NAME)
+    if _ddb_resource is None:
+        _ddb_resource = boto3.resource("dynamodb", region_name=AWS_REGION_NAME)
     if _table is None:
-        _table = boto3.resource("dynamodb", region_name=AWS_REGION_NAME).Table(METADATA_TABLE)
-    return _s3, _table
+        _table = _ddb_resource.Table(METADATA_TABLE)
+    if _ddb_client is None:
+        _ddb_client = boto3.client("dynamodb", region_name=AWS_REGION_NAME)
+    return _s3, _table, _ddb_client
 
 
 def _av(value: Any) -> dict[str, Any]:
@@ -338,7 +344,7 @@ def _create_upload_session(
 ) -> dict[str, Any]:
     owner, email = _identity(event)
     dataset_name, filename, media_type, size_bytes = _validate_upload(_parse_body(event))
-    s3, table = _clients()
+    s3, table, ddb_client = _clients()
     created_at = datetime.now(UTC).isoformat()
     owner_pk = f"USER#{owner}"
 
@@ -445,7 +451,7 @@ def _create_upload_session(
             },
         ]
         try:
-            table.meta.client.transact_write_items(TransactItems=transaction_items)
+            ddb_client.transact_write_items(TransactItems=transaction_items)
         except ClientError as exc:
             if _is_transaction_canceled(exc):
                 _handle_create_upload_transaction_cancel(
@@ -488,7 +494,7 @@ def _create_upload_session(
 
 def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
     owner, _ = _identity(event)
-    s3, table = _clients()
+    s3, table, ddb_client = _clients()
     owner_pk = f"USER#{owner}"
     response = table.get_item(
         Key={"pk": owner_pk, "sk": f"UPLOAD#{upload_id}"},
@@ -556,7 +562,7 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
     updated_at = datetime.now(UTC).isoformat()
     completed_expires_at = int(time.time()) + UPLOAD_RETENTION_DAYS * 86400
     try:
-        table.meta.client.transact_write_items(
+        ddb_client.transact_write_items(
             TransactItems=[
                 {
                     "Update": {
@@ -646,7 +652,7 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
 
 def _list_datasets(event: dict[str, Any]) -> dict[str, Any]:
     owner, _ = _identity(event)
-    _, table = _clients()
+    _, table, _ = _clients()
     response = table.query(
         KeyConditionExpression=Key("pk").eq(f"USER#{owner}") & Key("sk").begins_with("DATASET#"),
         ConsistentRead=True,

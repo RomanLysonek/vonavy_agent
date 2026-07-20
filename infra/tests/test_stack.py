@@ -294,7 +294,7 @@ def test_static_web_bucket_is_destroyed_with_auto_delete_helper() -> None:
 
 def test_every_api_route_requires_jwt_and_custom_scope() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 10
+    assert len(routes) == 11
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"
@@ -510,10 +510,44 @@ def test_forecast_worker_and_control_plane_are_least_privilege() -> None:
     assert not any("batch:TagResource" in _actions(statement) for statement in statements)
 
 
+def test_forecast_agent_is_pinned_and_reads_only_exact_secret_parameter() -> None:
+    template = _template()
+    function = _resource_by_logical_id_prefix(
+        template,
+        "AWS::Lambda::Function",
+        "ForecastControlPlaneFunction",
+    )
+    properties = function["Properties"]
+    assert properties["Timeout"] == 45
+    environment = properties["Environment"]["Variables"]
+    assert environment["OPENAI_API_KEY_PARAMETER"] == "/vonavy-agent/dev/openai-api-key"
+    assert environment["OPENAI_MODEL"] == "gpt-5-mini-2025-08-07"
+    assert environment["OPENAI_TIMEOUT_SECONDS"] == "25"
+    assert environment["AGENT_DAILY_LIMIT"] == "20"
+
+    statements = _policy_statements(template)
+    parameter_reads = [
+        statement for statement in statements if "ssm:GetParameter" in _actions(statement)
+    ]
+    assert len(parameter_reads) == 1
+    assert _actions(parameter_reads[0]) == {"ssm:GetParameter"}
+    assert parameter_reads[0]["Resource"] != "*"
+    assert "parameter/vonavy-agent/dev/openai-api-key" in _json_text(parameter_reads[0]["Resource"])
+
+    validation_reads = [
+        statement
+        for statement in statements
+        if _resource_mentions(statement, "validation-results/users/*")
+        and {"s3:GetObject", "s3:GetObjectVersion"} <= _actions(statement)
+    ]
+    assert len(validation_reads) >= 2
+
+
 def test_forecast_routes_are_jwt_protected() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
     by_key = {route["Properties"]["RouteKey"]: route["Properties"] for route in routes.values()}
     expected = {
+        "POST /api/datasets/{dataset_id}/forecast-agent",
         "POST /api/datasets/{dataset_id}/forecasts",
         "GET /api/forecasts/{run_id}",
         "GET /api/forecasts/{run_id}/result",

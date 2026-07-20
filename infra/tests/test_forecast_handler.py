@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ os.environ.setdefault("FORECAST_JOB_DEFINITION", "job-definition-arn:1")
 os.environ.setdefault("SOURCE_REVISION", "unknown")
 
 HANDLER_PATH = Path(__file__).parents[1] / "lambda/forecast_control_plane/handler.py"
+sys.path.insert(0, str(HANDLER_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("forecast_control_plane_handler", HANDLER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 handler = importlib.util.module_from_spec(SPEC)
@@ -115,3 +117,171 @@ def test_lambda_returns_404_for_unknown_route() -> None:
     assert response["statusCode"] == 404
     payload = json.loads(response["body"])
     assert payload["error"]["code"] == "not_found"
+
+
+def test_agent_route_returns_confirmable_plan(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        handler,
+        "_agent_plan",
+        lambda event, dataset_id: {
+            "schemaVersion": "forecast-agent-plan/v1",
+            "datasetId": dataset_id,
+            "requiresConfirmation": True,
+            "agentMode": "openai",
+        },
+    )
+    response = handler.lambda_handler(
+        {
+            "routeKey": "POST /api/datasets/{dataset_id}/forecast-agent",
+            "rawPath": "/api/datasets/00000000-0000-0000-0000-000000000001/forecast-agent",
+            "requestContext": {"authorizer": {"jwt": {"claims": {"sub": "owner"}}}},
+        },
+        type("Context", (), {"aws_request_id": "request-1"})(),
+    )
+    assert response["statusCode"] == 200
+    payload = json.loads(response["body"])
+    assert payload["requiresConfirmation"] is True
+    assert payload["agentMode"] == "openai"
+
+
+class QuotaTable:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    def update_item(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+
+
+def test_agent_quota_is_owner_scoped_and_bounded() -> None:
+    table = QuotaTable()
+    handler._consume_agent_quota(table, "owner")
+    request = table.calls[0]
+    assert request["Key"]["pk"] == "USER#owner"
+    assert request["Key"]["sk"].startswith("AGENT_QUOTA#")
+    assert request["ExpressionAttributeValues"][":limit"] == 20
+    assert "call_count < :limit" in request["ConditionExpression"]
+
+
+def test_agent_quota_limit_returns_429() -> None:
+    error = handler.ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "limit"}},
+        "UpdateItem",
+    )
+    try:
+        handler._consume_agent_quota(QuotaTable(error), "owner")
+    except handler.ApiError as exc:
+        assert exc.code == "agent_rate_limit_exceeded"
+        assert exc.status == 429
+    else:
+        raise AssertionError("exhausted AI quota was accepted")
+
+
+class StoredBody:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.content = json.dumps(payload).encode("utf-8")
+        self.closed = False
+
+    def read(self, amount: int = -1) -> bytes:
+        return self.content if amount < 0 else self.content[:amount]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ValidationTable:
+    def __init__(self, item: dict[str, Any]) -> None:
+        self.item = item
+        self.requests: list[dict[str, Any]] = []
+
+    def get_item(self, **kwargs: Any) -> dict[str, Any]:
+        self.requests.append(kwargs)
+        return {"Item": self.item}
+
+
+class ValidationS3:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.requests: list[dict[str, Any]] = []
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.requests.append(kwargs)
+        return {"Body": StoredBody(self.payload), "VersionId": "result-version"}
+
+
+def test_agent_reads_exact_server_owned_validation_result() -> None:
+    owner = "owner"
+    dataset_id = "00000000-0000-0000-0000-000000000001"
+    validation_job_id = "00000000-0000-0000-0000-000000000002"
+    dataset = {"object_version_id": "dataset-version"}
+    payload = {
+        "schema_version": "validation-result/v1",
+        "status": "succeeded",
+        "job_id": validation_job_id,
+        "dataset_id": dataset_id,
+        "input_identity": {"version_id": "dataset-version"},
+        "columns": [{"name": "DateKey", "logical_type": "date"}],
+    }
+    table = ValidationTable(
+        {
+            "owner_sub": owner,
+            "dataset_id": dataset_id,
+            "status": "succeeded",
+            "result_key": "validation-results/users/owner/result.json",
+            "result_version_id": "result-version",
+        }
+    )
+    s3 = ValidationS3(payload)
+
+    result = handler._validation_result_for_agent(
+        s3,
+        table,
+        owner=owner,
+        dataset=dataset,
+        dataset_id=dataset_id,
+        validation_job_id=validation_job_id,
+    )
+
+    assert result == payload
+    assert table.requests == [
+        {
+            "Key": {
+                "pk": "USER#owner",
+                "sk": f"VALIDATION#{validation_job_id}",
+            },
+            "ConsistentRead": True,
+        }
+    ]
+    assert s3.requests == [
+        {
+            "Bucket": "data-bucket",
+            "Key": "validation-results/users/owner/result.json",
+            "VersionId": "result-version",
+        }
+    ]
+
+
+def test_agent_hides_other_owner_validation_result() -> None:
+    table = ValidationTable(
+        {
+            "owner_sub": "other-owner",
+            "dataset_id": "00000000-0000-0000-0000-000000000001",
+            "status": "succeeded",
+        }
+    )
+    try:
+        handler._validation_result_for_agent(
+            ValidationS3({}),
+            table,
+            owner="owner",
+            dataset={"object_version_id": "dataset-version"},
+            dataset_id="00000000-0000-0000-0000-000000000001",
+            validation_job_id="00000000-0000-0000-0000-000000000002",
+        )
+    except handler.ApiError as exc:
+        assert exc.code == "validation_not_found"
+        assert exc.status == 404
+    else:
+        raise AssertionError("cross-owner validation result was exposed")

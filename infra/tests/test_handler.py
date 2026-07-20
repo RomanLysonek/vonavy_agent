@@ -78,6 +78,22 @@ def _client_error(codes: list[str], *, request_id: str = "unit-request") -> Clie
     )
 
 
+def _validation_error(*, request_id: str = "unit-validation-request") -> ClientError:
+    return ClientError(
+        {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": (
+                    "Invalid ConditionExpression: Incorrect operand type for operator or "
+                    "function; operator or function: <=, operand type: M"
+                ),
+            },
+            "ResponseMetadata": {"RequestId": request_id},
+        },
+        "TransactWriteItems",
+    )
+
+
 def _ddb_value(value: dict[str, str]) -> str | int:
     if "S" in value:
         return value["S"]
@@ -90,14 +106,50 @@ def _ddb_item(item: dict[str, dict[str, str]]) -> dict[str, Any]:
     return {key: _ddb_value(value) for key, value in item.items()}
 
 
+def _assert_no_nested_attribute_values(value: Any) -> None:
+    attribute_value_types = {"S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"}
+    if isinstance(value, dict):
+        keys = set(value)
+        if keys & attribute_value_types:
+            assert len(keys) == 1, value
+            inner = next(iter(value.values()))
+            assert not (isinstance(inner, dict) and set(inner) & attribute_value_types), value
+            if "M" in value:
+                for nested in value["M"].values():
+                    _assert_no_nested_attribute_values(nested)
+            if "L" in value:
+                for nested in value["L"]:
+                    _assert_no_nested_attribute_values(nested)
+            return
+        for nested in value.values():
+            _assert_no_nested_attribute_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _assert_no_nested_attribute_values(nested)
+
+
+def _assert_expression_value_types(
+    values: dict[str, dict[str, str]], expected: dict[str, str]
+) -> None:
+    assert set(values) >= set(expected)
+    for placeholder, attribute_type in expected.items():
+        assert values[placeholder] == {attribute_type: values[placeholder][attribute_type]}
+        assert set(values[placeholder]) == {attribute_type}
+        assert "M" not in values[placeholder]
+        _assert_no_nested_attribute_values(values[placeholder])
+
+
 class FakeDynamoClient:
     def __init__(self, table: FakeTable) -> None:
         self.table = table
         self.transactions: list[dict[str, Any]] = []
         self.forced_cancellation_codes: list[str] | None = None
+        self.force_validation_error = False
 
     def transact_write_items(self, **kwargs: Any) -> None:
         self.transactions.append(kwargs)
+        if self.force_validation_error:
+            raise _validation_error()
         if self.forced_cancellation_codes is not None:
             raise _client_error(self.forced_cancellation_codes)
         snapshot = dict(self.table.items)
@@ -350,12 +402,48 @@ def test_create_upload_session_scopes_storage_to_authenticated_owner(monkeypatch
     assert fake_s3.presigned["Conditions"][-1] == ["content-length-range", 512, 512]
     transaction = fake_table.client.transactions[0]["TransactItems"]
     slot_update = transaction[0]["Update"]
-    dataset_item = transaction[1]["Put"]["Item"]
-    upload_item = transaction[2]["Put"]["Item"]
+    dataset_put = transaction[1]["Put"]
+    upload_put = transaction[2]["Put"]
+    dataset_item = dataset_put["Item"]
+    upload_item = upload_put["Item"]
+    slot_values = slot_update["ExpressionAttributeValues"]
     slot_item = fake_table.items[("USER#12345678-1234-1234-1234-123456789012", "SLOT#0000")]
-    assert slot_update["Key"]["sk"] == {"S": "SLOT#0000"}
+    assert [next(iter(action)) for action in transaction] == ["Update", "Put", "Put"]
+    assert slot_update["Key"] == {
+        "pk": {"S": "USER#12345678-1234-1234-1234-123456789012"},
+        "sk": {"S": "SLOT#0000"},
+    }
+    assert dataset_put["Item"]["pk"] == {"S": "USER#12345678-1234-1234-1234-123456789012"}
+    assert dataset_put["Item"]["sk"] == {"S": f"DATASET#{payload['datasetId']}"}
+    assert upload_put["Item"]["pk"] == {"S": "USER#12345678-1234-1234-1234-123456789012"}
+    assert upload_put["Item"]["sk"] == {"S": f"UPLOAD#{payload['uploadId']}"}
     assert "attribute_not_exists(pk)" in slot_update["ConditionExpression"]
+    assert "expires_at <= :now" in slot_update["ConditionExpression"]
     assert "if_not_exists(created_at" in slot_update["UpdateExpression"]
+    _assert_expression_value_types(
+        slot_values,
+        {
+            ":now": "N",
+            ":expires": "N",
+            ":size": "N",
+            ":slot": "N",
+            ":entity": "S",
+            ":owner": "S",
+            ":dataset": "S",
+            ":upload": "S",
+            ":pending": "S",
+            ":released": "S",
+            ":free": "S",
+            ":expired": "S",
+            ":created": "S",
+            ":updated": "S",
+        },
+    )
+    assert slot_values[":now"] == {"N": slot_values[":now"]["N"]}
+    assert dataset_item["expected_size"] == {"N": "512"}
+    assert dataset_item["expires_at"] == slot_values[":expires"]
+    assert upload_item["expected_size"] == {"N": "512"}
+    assert upload_item["expires_at"] == slot_values[":expires"]
     assert slot_item["status"] == "pending"
     assert slot_item["upload_id"] == payload["uploadId"]
     assert dataset_item["owner_sub"]["S"] == "12345678-1234-1234-1234-123456789012"
@@ -541,6 +629,37 @@ def test_brand_new_owner_first_upload_creates_slot_and_metadata(monkeypatch) -> 
     assert payload["upload"]["url"] == "https://s3.example.test"
 
 
+def test_create_upload_expression_operands_use_compatible_scalar_wire_types(
+    monkeypatch,
+) -> None:
+    fake_s3 = FakeS3()
+    fake_table = FakeTable()
+    monkeypatch.setattr(handler, "_s3", fake_s3)
+    monkeypatch.setattr(handler, "_table", fake_table)
+
+    response = handler.lambda_handler(
+        _event("POST", "/api/upload-sessions", body=_upload_body(), owner="shape-owner"),
+        None,
+    )
+
+    assert response["statusCode"] == 201
+    slot_update = fake_table.client.transactions[0]["TransactItems"][0]["Update"]
+    slot_values = slot_update["ExpressionAttributeValues"]
+    dataset_item = fake_table.client.transactions[0]["TransactItems"][1]["Put"]["Item"]
+    upload_item = fake_table.client.transactions[0]["TransactItems"][2]["Put"]["Item"]
+    assert dataset_item["expires_at"] == slot_values[":expires"]
+    assert upload_item["expires_at"] == slot_values[":expires"]
+    assert set(dataset_item["expires_at"]) == {"N"}
+    assert set(upload_item["expires_at"]) == {"N"}
+    assert set(slot_values[":now"]) == {"N"}
+    assert "expires_at <= :now" in slot_update["ConditionExpression"]
+    for placeholder in (":now", ":expires"):
+        assert set(slot_values[placeholder]).isdisjoint(
+            {"M", "L", "BOOL", "NULL", "SS", "NS", "BS"}
+        )
+        _assert_no_nested_attribute_values(slot_values[placeholder])
+
+
 def test_existing_released_slot_is_reserved_for_new_upload(monkeypatch) -> None:
     fake_s3 = FakeS3()
     fake_table = FakeTable()
@@ -672,6 +791,40 @@ def test_transaction_conflict_is_retryable_not_slot_busy(monkeypatch) -> None:
     assert json.loads(response["body"])["error"]["code"] == "upload_transaction_conflict"
 
 
+def test_validation_exception_logs_sanitized_placeholder_types(monkeypatch, caplog) -> None:
+    fake_s3 = FakeS3()
+    fake_table = FakeTable()
+    fake_table.client.force_validation_error = True
+    monkeypatch.setattr(handler, "_s3", fake_s3)
+    monkeypatch.setattr(handler, "_table", fake_table)
+    caplog.set_level("WARNING")
+    context = SimpleNamespace(aws_request_id="lambda-request-id")
+
+    response = handler.lambda_handler(
+        _event("POST", "/api/upload-sessions", body=_upload_body()), context
+    )
+
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"])["error"]["code"] == "aws_service_error"
+    records = [
+        record
+        for record in caplog.records
+        if record.message == "Create-upload DynamoDB transaction request was invalid"
+    ]
+    assert records
+    record = records[0]
+    assert record.route == "POST /api/upload-sessions"
+    assert record.lambda_request_id == "lambda-request-id"
+    assert record.aws_request_id == "unit-validation-request"
+    assert record.aws_error_code == "ValidationException"
+    assert record.action_order == ["slot", "dataset", "upload"]
+    assert record.expression_placeholder_type_map[":now"] == "N"
+    assert record.expression_placeholder_type_map[":pending"] == "S"
+    assert record.dataset_id
+    assert record.upload_id
+    assert "reviewer@example.com" not in record.sanitized_aws_error_message
+
+
 def test_complete_upload_updates_slot_and_remains_owner_isolated_and_idempotent(
     monkeypatch,
 ) -> None:
@@ -729,7 +882,7 @@ def test_complete_upload_updates_slot_and_remains_owner_isolated_and_idempotent(
     assert response["statusCode"] == 200
     assert fake_table.items[(owner_pk, f"UPLOAD#{upload_id}")]["status"] == "completed"
     assert fake_table.items[(owner_pk, f"DATASET#{dataset_id}")]["status"] == "uploaded"
-    assert fake_table.items[(owner_pk, "SLOT#0000")]["status"] == "completed"
+    assert fake_table.items[(owner_pk, "SLOT#0000")]["status"] == "released"
     assert fake_s3.deleted_requests == [{"Bucket": "unit-upload-bucket", "Key": staging_key}]
 
     repeat = handler.lambda_handler(

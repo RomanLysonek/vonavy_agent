@@ -412,6 +412,26 @@ def test_control_plane_can_submit_and_reconcile_only_validation_jobs() -> None:
     assert reconciliation[0]["Resource"] == "*"
 
 
+def test_submit_job_permission_includes_only_validation_family() -> None:
+    statements = _policy_statements(_template())
+    submit = [statement for statement in statements if "batch:SubmitJob" in _actions(statement)]
+    assert len(submit) == 1
+
+    resources = submit[0]["Resource"]
+    assert isinstance(resources, list)
+    assert len(resources) == 3
+    assert all(resource != "*" for resource in resources)
+
+    serialized_resources = [_json_text(resource) for resource in resources]
+    assert sum("ValidationJobQueue" in resource for resource in serialized_resources) == 1
+    assert sum("ValidationJobDefinition" in resource for resource in serialized_resources) == 2
+    family_resources = [
+        resource for resource in serialized_resources if "job-definition/" in resource
+    ]
+    assert len(family_resources) == 1
+    assert "ValidationJobDefinition" in family_resources[0]
+
+
 def test_validation_routes_are_agent_friendly_and_jwt_protected() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
     route_keys = {route["Properties"]["RouteKey"] for route in routes.values()}

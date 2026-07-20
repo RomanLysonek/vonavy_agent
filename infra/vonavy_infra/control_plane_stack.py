@@ -526,6 +526,11 @@ class ControlPlaneStack(Stack):
                 resources=[
                     validation_job_queue.job_queue_arn,
                     validation_job_definition.job_definition_arn,
+                    self.format_arn(
+                        service="batch",
+                        resource="job-definition",
+                        resource_name=validation_job_definition.job_definition_name,
+                    ),
                 ],
             )
         )

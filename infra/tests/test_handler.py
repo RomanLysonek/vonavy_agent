@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 
@@ -139,6 +140,35 @@ def _assert_expression_value_types(
         _assert_no_nested_attribute_values(values[placeholder])
 
 
+class _StopBeforeNetwork(Exception):
+    def __init__(self, body: bytes) -> None:
+        super().__init__("captured outgoing DynamoDB body")
+        self.body = body
+
+
+def _real_dynamodb_client() -> Any:
+    return boto3.client(
+        "dynamodb",
+        region_name="eu-central-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        aws_session_token="test",
+    )
+
+
+def _capture_transact_write_body(client: Any, call) -> dict[str, Any]:
+    def before_send(request: Any, **_: Any) -> None:
+        raise _StopBeforeNetwork(request.body)
+
+    client.meta.events.register("before-send.dynamodb.TransactWriteItems", before_send)
+    try:
+        with pytest.raises(_StopBeforeNetwork) as captured:
+            call()
+    finally:
+        client.meta.events.unregister("before-send.dynamodb.TransactWriteItems", before_send)
+    return json.loads(captured.value.body.decode("utf-8"))
+
+
 class FakeDynamoClient:
     def __init__(self, table: FakeTable) -> None:
         self.table = table
@@ -258,8 +288,9 @@ class FakeDynamoClient:
 class FakeTable:
     def __init__(self) -> None:
         self.client = FakeDynamoClient(self)
-        self.meta = SimpleNamespace(client=self.client)
+        handler._ddb_client = self.client  # type: ignore[attr-defined]
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
+
         self.query_items: list[dict[str, Any]] | None = None
 
     def get_item(self, **kwargs: Any) -> dict[str, Any]:
@@ -658,6 +689,125 @@ def test_create_upload_expression_operands_use_compatible_scalar_wire_types(
             {"M", "L", "BOOL", "NULL", "SS", "NS", "BS"}
         )
         _assert_no_nested_attribute_values(slot_values[placeholder])
+
+
+def test_resource_derived_dynamodb_client_double_serializes_attribute_values() -> None:
+    resource = boto3.resource(
+        "dynamodb",
+        region_name="eu-central-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        aws_session_token="test",
+    )
+    resource_client = resource.meta.client  # type: ignore[union-attr]
+    tx = {
+        "TransactItems": [
+            {
+                "Update": {
+                    "TableName": "unit-metadata-table",
+                    "Key": {"pk": {"S": "USER#owner"}, "sk": {"S": "SLOT#0000"}},
+                    "UpdateExpression": "SET #status = :pending",
+                    "ConditionExpression": "expires_at <= :now",
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": {
+                        ":now": {"N": "123"},
+                        ":pending": {"S": "pending"},
+                    },
+                }
+            }
+        ]
+    }
+
+    wire = _capture_transact_write_body(
+        resource_client, lambda: resource_client.transact_write_items(**tx)
+    )
+
+    values = wire["TransactItems"][0]["Update"]["ExpressionAttributeValues"]
+    assert values[":now"] == {"M": {"N": {"S": "123"}}}
+    assert values[":pending"] == {"M": {"S": {"S": "pending"}}}
+
+
+def test_create_upload_uses_true_low_level_client_without_double_serialization(
+    monkeypatch,
+) -> None:
+    fake_s3 = FakeS3()
+    fake_table = FakeTable()
+    real_client = _real_dynamodb_client()
+    monkeypatch.setattr(handler, "_s3", fake_s3)
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", real_client)
+
+    wire = _capture_transact_write_body(
+        real_client,
+        lambda: handler._create_upload_session(
+            _event("POST", "/api/upload-sessions", body=_upload_body())
+        ),
+    )
+
+    transaction = wire["TransactItems"]
+    assert [next(iter(action)) for action in transaction] == ["Update", "Put", "Put"]
+    slot_values = transaction[0]["Update"]["ExpressionAttributeValues"]
+    dataset_item = transaction[1]["Put"]["Item"]
+    upload_item = transaction[2]["Put"]["Item"]
+    assert slot_values[":now"] == {"N": slot_values[":now"]["N"]}
+    assert slot_values[":expires"] == {"N": slot_values[":expires"]["N"]}
+    assert slot_values[":size"] == {"N": "512"}
+    assert "M" not in slot_values[":now"]
+    assert slot_values[":now"] != {"M": {"N": {"S": slot_values[":now"]["N"]}}}
+    assert dataset_item["expires_at"] == slot_values[":expires"]
+    assert upload_item["expires_at"] == slot_values[":expires"]
+
+
+def test_complete_upload_uses_true_low_level_client_without_double_serialization(
+    monkeypatch,
+) -> None:
+    fake_s3 = FakeS3()
+    fake_table = FakeTable()
+    real_client = _real_dynamodb_client()
+    owner = "complete-owner"
+    dataset_id = "dataset-1"
+    upload_id = "upload-1"
+    staging_key = f"pending/users/{owner}/datasets/{dataset_id}/{upload_id}/panel.csv"
+    object_key = f"datasets/users/{owner}/{dataset_id}/{upload_id}/panel.csv"
+    owner_pk = f"USER#{owner}"
+    fake_s3.head = {"ContentLength": 512}
+    fake_table.items[(owner_pk, f"UPLOAD#{upload_id}")] = {
+        "pk": owner_pk,
+        "sk": f"UPLOAD#{upload_id}",
+        "owner_sub": owner,
+        "dataset_id": dataset_id,
+        "upload_id": upload_id,
+        "slot_key": "SLOT#0000",
+        "status": "pending",
+        "media_type": "text/csv",
+        "expected_size": 512,
+        "staging_object_key": staging_key,
+        "object_key": object_key,
+    }
+    monkeypatch.setattr(handler, "_s3", fake_s3)
+    monkeypatch.setattr(handler, "_table", fake_table)
+    monkeypatch.setattr(handler, "_ddb_client", real_client)
+
+    wire = _capture_transact_write_body(
+        real_client,
+        lambda: handler._complete_upload(
+            _event("POST", f"/api/upload-sessions/{upload_id}/complete", owner=owner), upload_id
+        ),
+    )
+
+    transaction = wire["TransactItems"]
+    assert [next(iter(action)) for action in transaction] == ["Update", "Update", "Update"]
+    for action in transaction:
+        update = action["Update"]
+        _assert_no_nested_attribute_values(update["Key"])
+        _assert_no_nested_attribute_values(update["ExpressionAttributeValues"])
+        for value in update["ExpressionAttributeValues"].values():
+            assert "M" not in value
+    assert transaction[0]["Update"]["Key"] == {
+        "pk": {"S": owner_pk},
+        "sk": {"S": f"UPLOAD#{upload_id}"},
+    }
+    assert transaction[2]["Update"]["ExpressionAttributeValues"][":released"] == {"S": "released"}
 
 
 def test_existing_released_slot_is_reserved_for_new_upload(monkeypatch) -> None:

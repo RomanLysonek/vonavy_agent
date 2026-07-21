@@ -127,16 +127,22 @@ def _new_response_id() -> str:
     return str(uuid.UUID(bytes=os.urandom(16), version=4))
 
 
+def _response_log_message(response_id: str, status_code: int) -> str:
+    return json.dumps(
+        {
+            "event": "api_response",
+            "requestId": response_id,
+            "sourceRevision": SOURCE_REVISION,
+            "statusCode": status_code,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _json_response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
     response_id = _new_response_id()
-    LOGGER.info(
-        "control-plane response",
-        extra={
-            "response_id": response_id,
-            "status_code": status_code,
-            "source_revision": SOURCE_REVISION,
-        },
-    )
+    LOGGER.info(_response_log_message(response_id, status_code))
     return {
         "statusCode": status_code,
         "headers": {

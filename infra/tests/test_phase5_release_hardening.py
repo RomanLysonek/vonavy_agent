@@ -1,9 +1,37 @@
 from __future__ import annotations
 
+import ast
+import json
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 ROOT = Path(__file__).parents[1]
 PROJECT = ROOT.parent
+
+
+def _load_response_log_helper(source: str) -> Callable[[str, int], str]:
+    module = ast.parse(source)
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_response_log_message"
+    )
+    namespace: dict[str, object] = {
+        "json": json,
+        "SOURCE_REVISION": "0123456789abcdef0123456789abcdef01234567",
+    }
+    exec(
+        compile(
+            ast.Module(body=[function], type_ignores=[]),
+            "<response-log-helper>",
+            "exec",
+        ),
+        namespace,
+    )
+    helper = namespace["_response_log_message"]
+    assert callable(helper)
+    return cast(Callable[[str, int], str], helper)
 
 
 def test_api_responses_publish_bounded_provenance() -> None:
@@ -17,10 +45,42 @@ def test_api_responses_publish_bounded_provenance() -> None:
         assert "return str(uuid.UUID(bytes=os.urandom(16), version=4))" in source
         assert "response_id = _new_response_id()" in source
         assert "response_id = str(uuid.uuid4())" not in source
-        assert '"source_revision": SOURCE_REVISION' in source
-        assert '"status_code":' in source
+        assert "def _response_log_message(" in source
+        assert '"event": "api_response"' in source
+        assert '"requestId": response_id' in source
+        assert '"sourceRevision": SOURCE_REVISION' in source
+        assert '"statusCode": status_code' in source
+        assert "LOGGER.info(_response_log_message(" in source
 
     assert 'SOURCE_REVISION = os.environ.get("SOURCE_REVISION", "unknown")' in control
+
+
+def test_response_log_message_is_correlatable_and_bounded() -> None:
+    request_id = "00000000-0000-4000-8000-000000000123"
+    revision = "0123456789abcdef0123456789abcdef01234567"
+
+    for path in (
+        ROOT / "lambda/control_plane/handler.py",
+        ROOT / "lambda/forecast_control_plane/handler.py",
+    ):
+        helper = _load_response_log_helper(path.read_text(encoding="utf-8"))
+        encoded = helper(request_id, 503)
+        event = json.loads(encoded)
+
+        assert encoded == (
+            '{"event":"api_response","requestId":"'
+            + request_id
+            + '","sourceRevision":"'
+            + revision
+            + '","statusCode":503}'
+        )
+        assert event == {
+            "event": "api_response",
+            "requestId": request_id,
+            "sourceRevision": revision,
+            "statusCode": 503,
+        }
+        assert set(event) == {"event", "requestId", "sourceRevision", "statusCode"}
 
 
 def test_cdk_exposes_diagnostics_without_new_authority() -> None:
@@ -53,4 +113,5 @@ def test_release_hardening_contract_is_checked_in() -> None:
     assert "`POST` requests are attempted exactly once" in document
     assert "x-vonavy-request-id" in document
     assert "x-vonavy-source-revision" in document
+    assert "compact JSON `api_response` log" in document
     assert "adds no" in document

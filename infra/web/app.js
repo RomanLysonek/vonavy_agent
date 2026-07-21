@@ -297,6 +297,21 @@ async function forecastDataset(dataset, output, button) {
       }),
     });
     const suggested = plan.mapping;
+    const modelChoice = window.prompt(
+      "Choose model: xgboost or neuralnet",
+      "neuralnet",
+    );
+    if (modelChoice === null) throw new Error("Forecast setup cancelled.");
+    const normalisedModel = modelChoice.trim().toLowerCase();
+    const adapterId = normalisedModel === "neuralnet"
+      ? "neuralnet-direct-v1"
+      : normalisedModel === "xgboost"
+        ? "xgboost-direct-v1"
+        : null;
+    if (!adapterId) throw new Error("Model must be xgboost or neuralnet.");
+    const modelLabel = adapterId === "neuralnet-direct-v1"
+      ? "Best NeuralNet"
+      : "Quick XGBoost";
     const mapping = {
       timestampColumn: promptColumn("Timestamp column", suggested.timestampColumn),
       entityColumn: promptColumn(
@@ -341,14 +356,15 @@ async function forecastDataset(dataset, output, button) {
         `Training end: ${trainingEnd}\n` +
         `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n` +
         "Privacy: only validated profile metadata was sent; no raw rows or raw string values." +
-        `${warnings}\n\nStart the CPU XGBoost retraining job?`,
+        `${warnings}\n\nStart ${modelLabel} on the CPU scale-to-zero worker?`,
     );
     if (!approved) throw new Error("Forecast plan was not confirmed.");
-    output.textContent = "Submitting the confirmed XGBoost retraining plan…";
+    output.textContent = `Submitting the confirmed ${modelLabel} retraining plan…`;
     const run = await api(`/api/datasets/${dataset.datasetId}/forecasts`, {
       method: "POST",
       body: JSON.stringify({
         requestToken: crypto.randomUUID(),
+        adapterId,
         trainingEnd,
         mapping,
       }),
@@ -390,7 +406,7 @@ async function listDatasets() {
       const forecastButton = document.createElement("button");
       forecastButton.type = "button";
       forecastButton.className = "secondary";
-      forecastButton.textContent = "AI → XGBoost";
+      forecastButton.textContent = "AI → Forecast";
       forecastButton.addEventListener("click", () => {
         forecastDataset(dataset, validationStatus, forecastButton);
       });

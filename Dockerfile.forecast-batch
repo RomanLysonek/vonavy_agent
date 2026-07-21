@@ -16,8 +16,8 @@ RUN uv sync --frozen --no-dev --no-editable --extra aws --extra modeling --pytho
 FROM python:3.12.3-slim-bookworm AS runtime
 
 ARG VCS_REF=unknown
-LABEL org.opencontainers.image.title="Vonavy Agent XGBoost forecast worker" \
-      org.opencontainers.image.description="AWS Batch adapter for direct seven-day XGBoost retraining" \
+LABEL org.opencontainers.image.title="Vonavy Agent forecast worker" \
+      org.opencontainers.image.description="AWS Batch adapter for direct seven-day XGBoost and NeuralNet retraining" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.source="https://github.com/RomanLysonek/vonavy_agent"
 

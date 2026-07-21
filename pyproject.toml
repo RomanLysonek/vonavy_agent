@@ -28,6 +28,7 @@ aws = [
   "boto3>=1.40,<2",
 ]
 modeling = [
+  "torch>=2.10,<3",
   "xgboost>=3.1,<4",
 ]
 dev = [
@@ -38,8 +39,17 @@ dev = [
   "pytest>=8.3,<9",
   "pytest-cov>=6,<8",
   "ruff>=0.9,<1",
+  "torch>=2.10,<3",
   "xgboost>=3.1,<4",
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [project.scripts]
 vonavy-agent = "vonavy_agent.cli:main"

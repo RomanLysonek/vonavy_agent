@@ -12,6 +12,9 @@ import pandas as pd
 from pydantic import ValidationError
 
 from vonavy_agent.forecasting.contracts import (
+    ADAPTER_ID,
+    AdapterId,
+    AdapterIdentity,
     ForecastIssue,
     ForecastProfile,
     ForecastResult,
@@ -22,6 +25,7 @@ from vonavy_agent.forecasting.contracts import (
     LocalForecastRequest,
 )
 from vonavy_agent.forecasting.model import run_xgboost_forecast
+from vonavy_agent.forecasting.neural_net import run_neuralnet_forecast
 
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 
@@ -70,8 +74,10 @@ def run_local(request_path: Path, result_relative: str, workspace: Path | None =
     request_path = _safe_path(workspace, str(request_path.relative_to(workspace)), must_exist=True)
     result_path = _safe_path(workspace, result_relative, must_exist=False)
     started = datetime.now(UTC)
+    adapter_id: AdapterId = ADAPTER_ID
     try:
         request = LocalForecastRequest.model_validate_json(request_path.read_text(encoding="utf-8"))
+        adapter_id = request.adapter_id
         input_path = _safe_path(workspace, request.input_path, must_exist=True)
         if input_path.stat().st_size > request.limits.max_bytes:
             raise ValueError("input exceeds max_bytes")
@@ -80,7 +86,12 @@ def run_local(request_path: Path, result_relative: str, workspace: Path | None =
         output_directory = _safe_path(workspace, request.output_directory, must_exist=False)
         output_directory.mkdir(parents=True, exist_ok=True)
         raw = _load(input_path, request.media_type)
-        output = run_xgboost_forecast(
+        runner = (
+            run_neuralnet_forecast
+            if request.adapter_id == "neuralnet-direct-v1"
+            else run_xgboost_forecast
+        )
+        output = runner(
             raw=raw,
             mapping=request.mapping,
             training_end=pd.Timestamp(request.training_end),
@@ -100,6 +111,7 @@ def run_local(request_path: Path, result_relative: str, workspace: Path | None =
     except (ValueError, ValidationError) as exc:
         failure = ForecastResult(
             status=ForecastStatus.INVALID,
+            adapter=AdapterIdentity(id=adapter_id),
             owner_id="unknown",
             dataset_id="00000000-0000-0000-0000-000000000000",
             run_id="00000000-0000-0000-0000-000000000000",

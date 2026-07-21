@@ -164,6 +164,10 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
     assert plan["forecastStart"] == "2025-03-18"
     assert plan["forecastEnd"] == "2025-03-24"
     assert plan["execution"]["adapterId"] == "xgboost-direct-v1"
+    assert plan["execution"]["availableAdapterIds"] == [
+        "xgboost-direct-v1",
+        "neuralnet-direct-v1",
+    ]
     assert plan["privacy"]["rawRowsSentToProvider"] is False
     assert plan["privacy"]["awsIamAuthentication"] is True
     assert len(plan["planId"]) == 64

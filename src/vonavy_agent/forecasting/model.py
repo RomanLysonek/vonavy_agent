@@ -25,6 +25,7 @@ from vonavy_agent.forecasting.contracts import (
     InputIdentity,
     ModelArtifactManifest,
 )
+from vonavy_agent.forecasting.evaluation import build_forecast_evaluation
 from vonavy_agent.forecasting.panel import (
     PanelFrames,
     PreparedPanel,
@@ -173,6 +174,10 @@ def run_xgboost_forecast(
     holdout_started = time.monotonic()
     holdout_origin = prepared.training_end - pd.Timedelta(days=7)
     holdout: HoldoutMetrics
+    holdout_actual = np.asarray([], dtype=float)
+    holdout_prediction_evidence = np.asarray([], dtype=float)
+    holdout_baseline = np.asarray([], dtype=float)
+    holdout_entities = np.asarray([], dtype=object)
     if holdout_origin - prepared.frame["timestamp"].min() < pd.Timedelta(days=35):
         holdout = HoldoutMetrics(
             supported=False,
@@ -194,6 +199,10 @@ def run_xgboost_forecast(
                 ],
                 dtype=float,
             )
+            holdout_actual = actual
+            holdout_prediction_evidence = holdout_prediction
+            holdout_baseline = holdout_frames.predict["target_baseline"].to_numpy(dtype=float)
+            holdout_entities = holdout_frames.predict["entity"].to_numpy(dtype=object)
             holdout = _metrics(
                 actual, holdout_prediction, len(holdout_frames.predict), holdout_origin
             )
@@ -216,6 +225,17 @@ def run_xgboost_forecast(
 
     forecast_started = time.monotonic()
     prediction, fallback = _predict(estimator, final_frames)
+    evaluation = build_forecast_evaluation(
+        holdout_origin=holdout.origin,
+        actual=holdout_actual,
+        prediction=holdout_prediction_evidence,
+        baseline=holdout_baseline,
+        entities=holdout_entities,
+        train_features=final_frames.train,
+        fresh_features=final_frames.predict,
+        feature_columns=final_frames.feature_columns,
+        categorical_columns=final_frames.categorical_columns,
+    )
     forecast = final_frames.predict[["entity", "target_date", "horizon"]].copy()
     forecast = forecast.rename(columns={"target_date": "timestamp"})
     forecast["prediction"] = prediction
@@ -279,6 +299,7 @@ def run_xgboost_forecast(
             fallback_rows=int(fallback.sum()),
         ),
         holdout=holdout,
+        evaluation=evaluation,
         artifacts=ForecastArtifacts(
             forecast=ArtifactReference(
                 key="forecast.parquet",

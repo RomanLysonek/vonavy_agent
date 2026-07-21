@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 FORECAST_REQUEST_SCHEMA: Literal["forecast-request/v1"] = "forecast-request/v1"
 FORECAST_RESULT_SCHEMA: Literal["forecast-result/v1"] = "forecast-result/v1"
 MODEL_MANIFEST_SCHEMA: Literal["model-artifact-manifest/v1"] = "model-artifact-manifest/v1"
+FORECAST_EVALUATION_SCHEMA: Literal["forecast-evaluation/v1"] = "forecast-evaluation/v1"
 AdapterId: TypeAlias = Literal[
     "xgboost-direct-v1",
     "neuralnet-direct-v1",
@@ -247,6 +248,66 @@ class InputIdentity(StrictModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class BaselineSkillEvidence(StrictModel):
+    supported: bool
+    metric: Literal["wape"] = "wape"
+    common_rows: int = Field(ge=0)
+    model_value: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    baseline_value: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    relative_improvement: float | None = Field(default=None, allow_inf_nan=False)
+    verdict: Literal["better", "tied", "worse", "unavailable"]
+    reason: str | None = Field(default=None, max_length=300)
+
+
+class EntityErrorEvidence(StrictModel):
+    entity_key: str = Field(pattern=r"^entity-[0-9a-f]{16}$")
+    rows: int = Field(ge=1)
+    model_wape: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    baseline_wape: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    relative_improvement: float | None = Field(default=None, allow_inf_nan=False)
+    model_mae: float = Field(ge=0, allow_inf_nan=False)
+    bias: float = Field(allow_inf_nan=False)
+
+
+class FeatureShiftEvidence(StrictModel):
+    feature: str = Field(min_length=1, max_length=128)
+    kind: Literal["numeric", "categorical"]
+    statistic: Literal["standardized_mean_shift", "unseen_rate"]
+    value: float = Field(ge=0, allow_inf_nan=False)
+    reference_count: int = Field(ge=1)
+    fresh_count: int = Field(ge=1)
+    extrapolated_count: int = Field(ge=0)
+    severity: Literal["info", "notice", "warning"]
+
+
+class EvaluationSafetyEvidence(StrictModel):
+    deterministic: Literal[True] = True
+    worker_computed: Literal[True] = True
+    raw_rows_exported: Literal[False] = False
+    raw_entity_values_exported: Literal[False] = False
+    automatic_experiment_execution: Literal[False] = False
+
+
+class ForecastEvaluationEvidence(StrictModel):
+    schema_version: Literal["forecast-evaluation/v1"] = FORECAST_EVALUATION_SCHEMA
+    evidence_basis: Literal["worker-holdout-and-aggregate-features"] = (
+        "worker-holdout-and-aggregate-features"
+    )
+    holdout_origin: date | None = None
+    baseline_skill: BaselineSkillEvidence
+    worst_entities: tuple[EntityErrorEvidence, ...] = Field(max_length=10)
+    evaluated_entity_count: int = Field(ge=0)
+    cold_start_entity_count: int = Field(ge=0)
+    cold_start_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
+    evaluated_feature_count: int = Field(ge=0)
+    extrapolated_value_count: int = Field(ge=0)
+    evaluated_value_count: int = Field(ge=0)
+    feature_extrapolation_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
+    feature_shifts: tuple[FeatureShiftEvidence, ...] = Field(max_length=10)
+    unavailable: tuple[str, ...] = Field(max_length=12)
+    safety: EvaluationSafetyEvidence = Field(default_factory=EvaluationSafetyEvidence)
+
+
 class ForecastResult(StrictModel):
     schema_version: Literal["forecast-result/v1"] = FORECAST_RESULT_SCHEMA
     status: ForecastStatus
@@ -257,6 +318,7 @@ class ForecastResult(StrictModel):
     input: InputIdentity
     profile: ForecastProfile
     holdout: HoldoutMetrics
+    evaluation: ForecastEvaluationEvidence | None = None
     artifacts: ForecastArtifacts | None
     warnings: tuple[ForecastIssue, ...] = ()
     failure: ForecastIssue | None = None

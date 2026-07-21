@@ -245,8 +245,69 @@ function promptColumns(label, fallback = []) {
   if (value === null) throw new Error("Forecast setup cancelled.");
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
+
+function percentage(value) {
+  return typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "unavailable";
+}
+
+function appendResultReview(output, result) {
+  const review = result.review;
+  if (!review) return;
+  const details = document.createElement("details");
+  details.className = "forecast-review";
+  details.open = review.status === "needs_attention";
+  const summary = document.createElement("summary");
+  summary.textContent = `Result review: ${review.status.replaceAll("_", " ")}`;
+  details.append(summary);
+
+  const headline = document.createElement("p");
+  headline.textContent = review.headline;
+  details.append(headline);
+
+  const evaluation = result.evaluation;
+  if (evaluation) {
+    const skill = evaluation.baseline_skill || {};
+    const evidence = document.createElement("p");
+    evidence.textContent =
+      `Model WAPE ${percentage(skill.model_value)} vs seasonal baseline ` +
+      `${percentage(skill.baseline_value)}; relative skill ` +
+      `${percentage(skill.relative_improvement)}. Cold start ` +
+      `${evaluation.cold_start_entity_count}/${evaluation.evaluated_entity_count}; ` +
+      `feature extrapolation ${percentage(evaluation.feature_extrapolation_rate)}.`;
+    details.append(evidence);
+  }
+
+  if (review.findings?.length) {
+    const title = document.createElement("strong");
+    title.textContent = "Findings";
+    details.append(title);
+    const list = document.createElement("ul");
+    for (const finding of review.findings) {
+      const item = document.createElement("li");
+      item.textContent = `[${finding.severity}] ${finding.message}`;
+      list.append(item);
+    }
+    details.append(list);
+  }
+
+  if (review.recommendations?.length) {
+    const title = document.createElement("strong");
+    title.textContent = "Measured next experiments";
+    details.append(title);
+    const list = document.createElement("ol");
+    for (const recommendation of review.recommendations) {
+      const item = document.createElement("li");
+      item.textContent = recommendation.action;
+      list.append(item);
+    }
+    details.append(list);
+  }
+  output.append(document.createTextNode(" "), details);
+}
+
 function showForecastResult(output, run, result) {
   output.replaceChildren(document.createTextNode(forecastMessage(run, result)));
+  appendResultReview(output, result);
   for (const [name, url] of Object.entries(result.downloads || {})) {
     const link = document.createElement("a");
     link.href = url;
@@ -256,6 +317,7 @@ function showForecastResult(output, run, result) {
     output.append(document.createTextNode(" "), link);
   }
 }
+
 async function waitForForecast(run, output, button) {
   const terminal = new Set(["succeeded", "invalid", "failed"]);
   let current = run;

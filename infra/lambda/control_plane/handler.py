@@ -33,6 +33,7 @@ VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER = int(
     os.environ.get("VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER", "1")
 )
 AWS_REGION_NAME = os.environ.get("AWS_REGION_NAME", os.environ.get("AWS_REGION", "eu-central-1"))
+SOURCE_REVISION = os.environ.get("SOURCE_REVISION", "unknown")
 
 if MAX_UPLOAD_BYTES < 1 or MAX_DATASETS_PER_OWNER < 1:
     raise RuntimeError("Upload policy limits must be positive")
@@ -122,13 +123,28 @@ def _sanitize_aws_error_message(message: str) -> str:
     return re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", "<redacted-email>", message)[:500]
 
 
+def _new_response_id() -> str:
+    return str(uuid.UUID(bytes=os.urandom(16), version=4))
+
+
 def _json_response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
+    response_id = _new_response_id()
+    LOGGER.info(
+        "control-plane response",
+        extra={
+            "response_id": response_id,
+            "status_code": status_code,
+            "source_revision": SOURCE_REVISION,
+        },
+    )
     return {
         "statusCode": status_code,
         "headers": {
             "content-type": "application/json; charset=utf-8",
             "cache-control": "no-store",
             "x-content-type-options": "nosniff",
+            "x-vonavy-request-id": response_id,
+            "x-vonavy-source-revision": SOURCE_REVISION,
         },
         "body": json.dumps(payload, separators=(",", ":"), default=str),
     }

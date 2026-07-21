@@ -91,13 +91,28 @@ def _json_default(value: object) -> object:
     raise TypeError(f"unsupported JSON value: {type(value).__name__}")
 
 
+def _new_response_id() -> str:
+    return str(uuid.UUID(bytes=os.urandom(16), version=4))
+
+
 def _response(status: int, payload: dict[str, Any]) -> dict[str, Any]:
+    response_id = _new_response_id()
+    LOGGER.info(
+        "forecast-control-plane response",
+        extra={
+            "response_id": response_id,
+            "status_code": status,
+            "source_revision": SOURCE_REVISION,
+        },
+    )
     return {
         "statusCode": status,
         "headers": {
             "content-type": "application/json; charset=utf-8",
             "cache-control": "no-store",
             "x-content-type-options": "nosniff",
+            "x-vonavy-request-id": response_id,
+            "x-vonavy-source-revision": SOURCE_REVISION,
         },
         "body": json.dumps(
             payload,

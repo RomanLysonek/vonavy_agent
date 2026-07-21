@@ -1,4 +1,13 @@
-const state = { config: null, tokens: null, validationResults: new Map() };
+const API_REQUEST_TIMEOUT_MS = 15_000;
+const API_RETRY_DELAYS_MS = [250, 750];
+const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504]);
+
+const state = {
+  config: null,
+  tokens: null,
+  validationResults: new Map(),
+  sourceRevision: null,
+};
 const $ = (id) => document.getElementById(id);
 
 function base64Url(bytes) {
@@ -46,14 +55,86 @@ function loadTokens() {
   }
 }
 
+class ApiRequestError extends Error {
+  constructor(message, { status = null, requestId = null, sourceRevision = null } = {}) {
+    const references = [];
+    if (requestId) references.push(`reference ${requestId}`);
+    if (sourceRevision && sourceRevision !== "unknown") {
+      references.push(`deployment ${sourceRevision.slice(0, 12)}`);
+    }
+    super(references.length ? `${message} (${references.join(", ")})` : message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.requestId = requestId;
+    this.sourceRevision = sourceRevision;
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (state.tokens) headers.set("authorization", `Bearer ${state.tokens.access_token}`);
   if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
-  const response = await fetch(`${state.config.apiBaseUrl}${path}`, { ...options, headers });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error?.message || `Request failed (${response.status})`);
-  return payload;
+
+  const method = String(options.method || "GET").toUpperCase();
+  const attempts = method === "GET" ? 3 : 1;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${state.config.apiBaseUrl}${path}`, {
+        ...options,
+        method,
+        headers,
+        signal: controller.signal,
+      });
+      const requestId = response.headers.get("x-vonavy-request-id");
+      const sourceRevision = response.headers.get("x-vonavy-source-revision");
+      if (sourceRevision) state.sourceRevision = sourceRevision;
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok) return payload;
+
+      const error = new ApiRequestError(
+        payload.error?.message || `Request failed (${response.status})`,
+        { status: response.status, requestId, sourceRevision },
+      );
+      if (
+        method === "GET" &&
+        RETRYABLE_API_STATUSES.has(response.status) &&
+        attempt < attempts - 1
+      ) {
+        lastError = error;
+        clearTimeout(timeout);
+        await sleep(API_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw error;
+    } catch (error) {
+      if (error instanceof ApiRequestError) throw error;
+      const wrapped = new ApiRequestError(
+        error?.name === "AbortError"
+          ? "The request timed out."
+          : "The service could not be reached.",
+        { sourceRevision: state.sourceRevision },
+      );
+      if (method === "GET" && attempt < attempts - 1) {
+        lastError = wrapped;
+        clearTimeout(timeout);
+        await sleep(API_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw wrapped;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new ApiRequestError("The request could not be completed.");
 }
 
 async function login() {

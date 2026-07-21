@@ -559,6 +559,7 @@ class ControlPlaneStack(Stack):
                 "VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER": str(
                     config.validation_max_active_jobs_per_owner
                 ),
+                "SOURCE_REVISION": config.source_revision,
                 "AWS_REGION_NAME": self.region,
             },
         )
@@ -743,6 +744,10 @@ class ControlPlaneStack(Stack):
             cors_preflight=apigwv2.CorsPreflightOptions(
                 allow_origins=[web_url.rstrip("/"), config.local_callback_url.rstrip("/")],
                 allow_headers=["authorization", "content-type"],
+                expose_headers=[
+                    "x-vonavy-request-id",
+                    "x-vonavy-source-revision",
+                ],
                 allow_methods=[
                     apigwv2.CorsHttpMethod.GET,
                     apigwv2.CorsHttpMethod.POST,

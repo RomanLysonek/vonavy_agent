@@ -15,6 +15,7 @@ from botocore.config import Config  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from vonavy_agent.forecasting.contracts import (
+    AdapterIdentity,
     ForecastIssue,
     ForecastProfile,
     ForecastRequest,
@@ -25,6 +26,7 @@ from vonavy_agent.forecasting.contracts import (
     InputIdentity,
 )
 from vonavy_agent.forecasting.model import run_xgboost_forecast, sha256_file
+from vonavy_agent.forecasting.neural_net import run_neuralnet_forecast
 
 RESULT_MAX_BYTES = 2 * 1024 * 1024
 S3_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"})
@@ -114,6 +116,7 @@ def _invalid_result(
     training_end = request.training_end
     return ForecastResult(
         status=ForecastStatus.INVALID,
+        adapter=AdapterIdentity(id=request.adapter_id),
         owner_id=request.owner_id,
         dataset_id=request.dataset_id,
         run_id=request.run_id,
@@ -190,7 +193,12 @@ def main() -> None:
         try:
             actual_sha256 = _download(s3, request, input_path)
             raw = _load(input_path, request.input.media_type)
-            output = run_xgboost_forecast(
+            runner = (
+                run_neuralnet_forecast
+                if request.adapter_id == "neuralnet-direct-v1"
+                else run_xgboost_forecast
+            )
+            output = runner(
                 raw=raw,
                 mapping=request.mapping,
                 training_end=pd.Timestamp(request.training_end),
@@ -219,7 +227,7 @@ def main() -> None:
                     "forecast.parquet",
                     "application/vnd.apache.parquet",
                 ),
-                ("model", output.model_path, "model.ubj", "application/octet-stream"),
+                ("model", output.model_path, output.model_path.name, "application/octet-stream"),
                 ("manifest", output.manifest_path, "model-manifest.json", "application/json"),
             )
             for name, path, filename, content_type in uploads:

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 FORECAST_REQUEST_SCHEMA: Literal["forecast-request/v1"] = "forecast-request/v1"
 FORECAST_RESULT_SCHEMA: Literal["forecast-result/v1"] = "forecast-result/v1"
 MODEL_MANIFEST_SCHEMA: Literal["model-artifact-manifest/v1"] = "model-artifact-manifest/v1"
+AdapterId: TypeAlias = Literal["xgboost-direct-v1", "neuralnet-direct-v1"]
 ADAPTER_ID: Literal["xgboost-direct-v1"] = "xgboost-direct-v1"
+NEURALNET_ADAPTER_ID: Literal["neuralnet-direct-v1"] = "neuralnet-direct-v1"
 MODEL_SOURCE_REPOSITORY = "RomanLysonek/vonava_predikce"
 MODEL_SOURCE_REVISION = "8fb0b4634a9e67554b548af47afc18f68f9b0dd7"
 
@@ -116,7 +118,7 @@ class ForecastRequest(StrictModel):
     mapping: ForecastMapping
     training_end: date
     horizon_days: Literal[7] = 7
-    adapter_id: Literal["xgboost-direct-v1"] = ADAPTER_ID
+    adapter_id: AdapterId = ADAPTER_ID
     seed: Literal[42] = 42
     limits: ForecastLimits
     source_revision: str = Field(pattern=r"^(unknown|[0-9a-f]{40})$")
@@ -135,7 +137,7 @@ class LocalForecastRequest(StrictModel):
     mapping: ForecastMapping
     training_end: date
     horizon_days: Literal[7] = 7
-    adapter_id: Literal["xgboost-direct-v1"] = ADAPTER_ID
+    adapter_id: AdapterId = ADAPTER_ID
     seed: Literal[42] = 42
     limits: ForecastLimits
     source_revision: str = Field(pattern=r"^(unknown|[0-9a-f]{40})$")
@@ -195,7 +197,7 @@ class ForecastArtifacts(StrictModel):
 
 
 class AdapterIdentity(StrictModel):
-    id: Literal["xgboost-direct-v1"] = "xgboost-direct-v1"
+    id: AdapterId = ADAPTER_ID
     source_repository: Literal["RomanLysonek/vonava_predikce"] = "RomanLysonek/vonava_predikce"
     source_revision: Literal["8fb0b4634a9e67554b548af47afc18f68f9b0dd7"] = (
         "8fb0b4634a9e67554b548af47afc18f68f9b0dd7"

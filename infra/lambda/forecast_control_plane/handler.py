@@ -38,6 +38,7 @@ MAX_RESULT_BYTES = 2 * 1024 * 1024
 MAX_INPUT_BYTES = 500_000_000
 SLOT_LEASE_SECONDS = FORECAST_JOB_TIMEOUT_SECONDS + 900
 ACTIVE_BATCH = {"SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"}
+SUPPORTED_ADAPTERS = {"xgboost-direct-v1", "neuralnet-direct-v1"}
 TERMINAL = {"succeeded", "invalid", "failed"}
 OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 COLUMN_PATTERN = re.compile(r"^.{1,128}$", re.DOTALL)
@@ -218,6 +219,17 @@ def _training_end(payload: dict[str, Any]) -> str:
     return parsed.isoformat()
 
 
+def _adapter_id(payload: dict[str, Any]) -> str:
+    value = payload.get("adapterId", "xgboost-direct-v1")
+    if value not in SUPPORTED_ADAPTERS:
+        raise ApiError(
+            "unsupported_forecast_adapter",
+            "adapterId must be xgboost-direct-v1 or neuralnet-direct-v1",
+            422,
+        )
+    return str(value)
+
+
 def _media_type(filename: str) -> str:
     suffix = PurePath(filename).suffix.lower()
     if suffix == ".csv":
@@ -258,9 +270,16 @@ def _item(table: Any, owner: str, run_id: str) -> dict[str, Any] | None:
     return item
 
 
-def _fingerprint(dataset_id: str, mapping: dict[str, Any], training_end: str) -> str:
+def _fingerprint(
+    dataset_id: str, mapping: dict[str, Any], training_end: str, adapter_id: str
+) -> str:
     encoded = json.dumps(
-        {"dataset_id": dataset_id, "mapping": mapping, "training_end": training_end},
+        {
+            "dataset_id": dataset_id,
+            "mapping": mapping,
+            "training_end": training_end,
+            "adapter_id": adapter_id,
+        },
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -295,6 +314,7 @@ def _payload(item: dict[str, Any]) -> dict[str, Any]:
         "forecastRunId": item["run_id"],
         "datasetId": item["dataset_id"],
         "status": item["status"],
+        "adapterId": item.get("adapter_id", "xgboost-direct-v1"),
         "createdAt": item["created_at"],
         "updatedAt": item["updated_at"],
         "resultAvailable": bool(item.get("result_version_id")),
@@ -326,6 +346,7 @@ def _request_document(
     mapping: dict[str, Any],
     training_end: str,
     requested_at: str,
+    adapter_id: str,
 ) -> dict[str, Any]:
     prefix = f"forecast-results/users/{owner}/datasets/{dataset_id}/runs/{run_id}/"
     return {
@@ -345,7 +366,7 @@ def _request_document(
         "mapping": mapping,
         "training_end": training_end,
         "horizon_days": 7,
-        "adapter_id": "xgboost-direct-v1",
+        "adapter_id": adapter_id,
         "seed": 42,
         "limits": {
             "max_bytes": MAX_INPUT_BYTES,
@@ -429,10 +450,11 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
     )
     mapping = _mapping(body)
     training_end = _training_end(body)
+    adapter_id = _adapter_id(body)
     _, table, ddb, batch = _clients()
     dataset = _dataset(table, owner, dataset_id)
     run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"vonavy-forecast:{owner}:{token}"))
-    fingerprint = _fingerprint(dataset_id, mapping, training_end)
+    fingerprint = _fingerprint(dataset_id, mapping, training_end, adapter_id)
     existing = _item(table, owner, run_id)
     if existing is not None:
         if (
@@ -452,6 +474,7 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
         mapping=mapping,
         training_end=training_end,
         requested_at=created,
+        adapter_id=adapter_id,
     )
     owner_pk = f"USER#{owner}"
     try:
@@ -497,6 +520,7 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
                                 "dataset_id": dataset_id,
                                 "request_token": token,
                                 "request_fingerprint": fingerprint,
+                                "adapter_id": adapter_id,
                                 "status": "submitting",
                                 "created_at": created,
                                 "updated_at": created,
@@ -579,12 +603,14 @@ def _terminalize(
     if status not in TERMINAL:
         raise ApiError("forecast_result_invalid", "Forecast result has invalid status", 502)
     identity = result.get("input") if isinstance(result.get("input"), dict) else {}
+    adapter = result.get("adapter") if isinstance(result.get("adapter"), dict) else {}
     if (
         result.get("schema_version") != "forecast-result/v1"
         or result.get("owner_id") != owner
         or result.get("run_id") != item["run_id"]
         or result.get("dataset_id") != item["dataset_id"]
         or identity.get("version_id") != item["input_version_id"]
+        or adapter.get("id") != item.get("adapter_id", "xgboost-direct-v1")
     ):
         raise ApiError(
             "forecast_result_invalid", "Forecast result identity does not match the run", 502
@@ -754,11 +780,13 @@ def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ApiError("forecast_result_invalid", "Forecast result must be a JSON object", 502)
     identity = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    adapter = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else {}
     if (
         payload.get("owner_id") != owner
         or payload.get("run_id") != run_id
         or payload.get("dataset_id") != item["dataset_id"]
         or identity.get("version_id") != item["input_version_id"]
+        or adapter.get("id") != item.get("adapter_id", "xgboost-direct-v1")
     ):
         raise ApiError(
             "forecast_result_invalid", "Forecast result identity does not match the run", 502

@@ -53,6 +53,7 @@ def test_request_document_contains_no_batch_tags() -> None:
         },
         training_end="2025-01-01",
         requested_at="2025-01-01T00:00:00+00:00",
+        adapter_id="xgboost-direct-v1",
     )
     serialized = json.dumps(request)
     assert "tags" not in request
@@ -79,12 +80,30 @@ def test_mapping_rejects_duplicate_roles() -> None:
         raise AssertionError("duplicate mapping role was accepted")
 
 
+def test_adapter_selection_is_validated_and_bound_to_fingerprint() -> None:
+    assert handler._adapter_id({}) == "xgboost-direct-v1"
+    assert handler._adapter_id({"adapterId": "neuralnet-direct-v1"}) == "neuralnet-direct-v1"
+    try:
+        handler._adapter_id({"adapterId": "unknown"})
+    except handler.ApiError as exc:
+        assert exc.code == "unsupported_forecast_adapter"
+        assert exc.status == 422
+    else:
+        raise AssertionError("unsupported adapter was accepted")
+
+    mapping = {"timestamp_column": "DateKey", "target_column": "Quantity"}
+    xgb = handler._fingerprint("dataset", mapping, "2025-01-01", "xgboost-direct-v1")
+    neural = handler._fingerprint("dataset", mapping, "2025-01-01", "neuralnet-direct-v1")
+    assert xgb != neural
+
+
 def test_terminal_transaction_uses_only_expression_values_needed_by_each_update() -> None:
     ddb = FakeDdb()
     item = {
         "run_id": "00000000-0000-0000-0000-000000000002",
         "dataset_id": "00000000-0000-0000-0000-000000000001",
         "input_version_id": "version-1",
+        "adapter_id": "neuralnet-direct-v1",
     }
     result = {
         "schema_version": "forecast-result/v1",
@@ -93,6 +112,7 @@ def test_terminal_transaction_uses_only_expression_values_needed_by_each_update(
         "dataset_id": item["dataset_id"],
         "run_id": item["run_id"],
         "input": {"version_id": "version-1"},
+        "adapter": {"id": "neuralnet-direct-v1"},
         "profile": {"entities": 2, "fallback_rows": 0},
         "holdout": {"wape": 0.2},
     }

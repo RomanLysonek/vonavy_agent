@@ -9,11 +9,24 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 FORECAST_REQUEST_SCHEMA: Literal["forecast-request/v1"] = "forecast-request/v1"
 FORECAST_RESULT_SCHEMA: Literal["forecast-result/v1"] = "forecast-result/v1"
 MODEL_MANIFEST_SCHEMA: Literal["model-artifact-manifest/v1"] = "model-artifact-manifest/v1"
-AdapterId: TypeAlias = Literal["xgboost-direct-v1", "neuralnet-direct-v1"]
+AdapterId: TypeAlias = Literal[
+    "xgboost-direct-v1",
+    "neuralnet-direct-v1",
+    "chronos2-zero-shot-v1",
+]
 ADAPTER_ID: Literal["xgboost-direct-v1"] = "xgboost-direct-v1"
 NEURALNET_ADAPTER_ID: Literal["neuralnet-direct-v1"] = "neuralnet-direct-v1"
+CHRONOS2_ADAPTER_ID: Literal["chronos2-zero-shot-v1"] = "chronos2-zero-shot-v1"
 MODEL_SOURCE_REPOSITORY = "RomanLysonek/vonava_predikce"
 MODEL_SOURCE_REVISION = "8fb0b4634a9e67554b548af47afc18f68f9b0dd7"
+CHRONOS2_SOURCE_REPOSITORY = "RomanLysonek/vonavy_chronos"
+CHRONOS2_SOURCE_REVISION = "ecda712f64883b348fe612446475264da1a66ce9"
+
+_ADAPTER_SOURCES: dict[str, tuple[str, str]] = {
+    ADAPTER_ID: (MODEL_SOURCE_REPOSITORY, MODEL_SOURCE_REVISION),
+    NEURALNET_ADAPTER_ID: (MODEL_SOURCE_REPOSITORY, MODEL_SOURCE_REVISION),
+    CHRONOS2_ADAPTER_ID: (CHRONOS2_SOURCE_REPOSITORY, CHRONOS2_SOURCE_REVISION),
+}
 
 
 class StrictModel(BaseModel):
@@ -198,10 +211,33 @@ class ForecastArtifacts(StrictModel):
 
 class AdapterIdentity(StrictModel):
     id: AdapterId = ADAPTER_ID
-    source_repository: Literal["RomanLysonek/vonava_predikce"] = "RomanLysonek/vonava_predikce"
-    source_revision: Literal["8fb0b4634a9e67554b548af47afc18f68f9b0dd7"] = (
-        "8fb0b4634a9e67554b548af47afc18f68f9b0dd7"
-    )
+    source_repository: str = MODEL_SOURCE_REPOSITORY
+    source_revision: str = MODEL_SOURCE_REVISION
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bind_source(cls, data: object) -> object:
+        if data is None:
+            return data
+        if isinstance(data, cls):
+            return data
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        adapter_id = str(values.get("id", ADAPTER_ID))
+        expected = _ADAPTER_SOURCES.get(adapter_id)
+        if expected is None:
+            return values
+        repository, revision = expected
+        supplied_repository = values.get("source_repository")
+        supplied_revision = values.get("source_revision")
+        if supplied_repository not in (None, repository):
+            raise ValueError("adapter source_repository does not match adapter id")
+        if supplied_revision not in (None, revision):
+            raise ValueError("adapter source_revision does not match adapter id")
+        values["source_repository"] = repository
+        values["source_revision"] = revision
+        return values
 
 
 class InputIdentity(StrictModel):

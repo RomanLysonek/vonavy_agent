@@ -38,7 +38,11 @@ MAX_RESULT_BYTES = 2 * 1024 * 1024
 MAX_INPUT_BYTES = 500_000_000
 SLOT_LEASE_SECONDS = FORECAST_JOB_TIMEOUT_SECONDS + 900
 ACTIVE_BATCH = {"SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"}
-SUPPORTED_ADAPTERS = {"xgboost-direct-v1", "neuralnet-direct-v1"}
+SUPPORTED_ADAPTERS = {
+    "xgboost-direct-v1",
+    "neuralnet-direct-v1",
+    "chronos2-zero-shot-v1",
+}
 TERMINAL = {"succeeded", "invalid", "failed"}
 OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 COLUMN_PATTERN = re.compile(r"^.{1,128}$", re.DOTALL)
@@ -224,7 +228,7 @@ def _adapter_id(payload: dict[str, Any]) -> str:
     if value not in SUPPORTED_ADAPTERS:
         raise ApiError(
             "unsupported_forecast_adapter",
-            "adapterId must be xgboost-direct-v1 or neuralnet-direct-v1",
+            "adapterId must be xgboost-direct-v1, neuralnet-direct-v1, or chronos2-zero-shot-v1",
             422,
         )
     return str(value)

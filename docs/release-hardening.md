@@ -25,9 +25,11 @@ server-side idempotency and explicit-confirmation boundaries for mutations.
 Both API Lambdas add these response headers to every JSON response:
 
 - `x-vonavy-request-id`: a version-4 UUID generated from an independent
-  operating-system random source and written to the corresponding structured
-  CloudWatch log entry; response correlation never consumes the domain UUID
-  generator used for dataset, upload, validation, session, or forecast identities;
+  operating-system random source and written into a compact JSON `api_response` log
+  message containing only the response ID, status code, and source revision;
+  response correlation does not depend on Lambda advanced JSON logging and never
+  consumes the domain UUID generator used for dataset, upload, validation, session,
+  or forecast identities;
 - `x-vonavy-source-revision`: the exact deployed source revision supplied by CDK.
 
 API Gateway CORS exposes both headers to the browser. User-visible API errors include

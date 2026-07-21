@@ -290,6 +290,7 @@ function appendAgentMessage(role, text) {
 function renderAgentPlan(plan) {
   const root = $("agent-plan-summary");
   root.replaceChildren();
+  const preprocessing = plan.preprocessingPlan;
   const lines = [
     plan.summary,
     `Model: ${plan.adapter.label}`,
@@ -304,6 +305,54 @@ function renderAgentPlan(plan) {
     const paragraph = document.createElement("p");
     paragraph.textContent = line;
     root.append(paragraph);
+  }
+  if (preprocessing) {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    const operations = Array.isArray(preprocessing.operations)
+      ? preprocessing.operations
+      : [];
+    summary.textContent = `Preprocessing: ${operations.length} fixed operations`;
+    details.append(summary);
+
+    const metadata = document.createElement("p");
+    const digest = preprocessing.digest?.value || "unavailable";
+    metadata.textContent =
+      `Catalogue: ${preprocessing.catalogVersion} · plan digest: ${digest.slice(0, 12)}…`;
+    details.append(metadata);
+
+    const review = preprocessing.review || {};
+    const findings = Array.isArray(preprocessing.findings)
+      ? preprocessing.findings
+      : [];
+    const reviewLine = document.createElement("p");
+    reviewLine.textContent =
+      `Preprocessing review: ${review.status || "unavailable"} · ` +
+      `max severity: ${review.maxSeverity || "unavailable"} · ` +
+      `${findings.length} findings`;
+    details.append(reviewLine);
+
+    const attentionFindings = findings.filter(
+      (finding) => finding.severity === "warning",
+    );
+    if (attentionFindings.length) {
+      const findingsList = document.createElement("ul");
+      for (const finding of attentionFindings) {
+        const item = document.createElement("li");
+        item.textContent = `${finding.severity}: ${finding.message}`;
+        findingsList.append(item);
+      }
+      details.append(findingsList);
+    }
+
+    const list = document.createElement("ol");
+    for (const operation of operations) {
+      const item = document.createElement("li");
+      item.textContent = `${operation.action} (${operation.status})`;
+      list.append(item);
+    }
+    details.append(list);
+    root.append(details);
   }
   $("agent-plan").classList.remove("hidden");
 }
@@ -324,7 +373,7 @@ async function agenticForecastDataset(dataset, output, button) {
   $("agent-input").value = "";
   appendAgentMessage(
     "assistant",
-    "Tell me the forecasting objective. I can inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, then prepare a plan for your confirmation.",
+    "Tell me the forecasting objective. I can inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, compile a fixed safe preprocessing plan, then prepare everything for your confirmation.",
   );
   $("agent-dialog").showModal();
   $("agent-input").focus();
@@ -376,11 +425,23 @@ async function sendAgentMessage(event) {
 async function confirmAgentPlan() {
   if (!agentContext?.plan || agentContext.running) return;
   const plan = agentContext.plan;
+  const preprocessing = plan.preprocessingPlan;
+  const operationCount = Array.isArray(preprocessing?.operations)
+    ? preprocessing.operations.length
+    : 0;
+  const preprocessingDigest = preprocessing?.digest?.value || "unavailable";
+  const preprocessingReview = preprocessing?.review?.status || "unavailable";
+  const attentionCount = Array.isArray(preprocessing?.review?.attentionFindingIds)
+    ? preprocessing.review.attentionFindingIds.length
+    : 0;
   const approved = window.confirm(
     `${plan.summary}\n\nModel: ${plan.adapter.label}\n` +
-    `Target: ${plan.mapping.targetColumn}\nTraining end: ${plan.trainingEnd}\n` +
-    `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n\n` +
-    "Only validated metadata was sent to Bedrock. Confirm this immutable plan and start the scale-to-zero workflow?",
+      `Target: ${plan.mapping.targetColumn}\nTraining end: ${plan.trainingEnd}\n` +
+      `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n` +
+      `Preprocessing: ${operationCount} fixed operations\n` +
+      `Review: ${preprocessingReview} (${attentionCount} attention findings)\n` +
+      `Plan digest: ${preprocessingDigest.slice(0, 12)}…\n\n` +
+      "Only validated metadata was sent to Bedrock. Confirm this immutable plan and start the scale-to-zero workflow?",
   );
   if (!approved) return;
   agentContext.running = true;

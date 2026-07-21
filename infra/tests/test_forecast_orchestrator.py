@@ -109,6 +109,22 @@ def test_agent_uses_bounded_tools_and_returns_confirmable_plan() -> None:
                     "message": {
                         "content": [
                             _tool_use(
+                                "compile_preprocessing_plan",
+                                {
+                                    "adapterId": "neuralnet-direct-v1",
+                                    "mapping": mapping,
+                                },
+                                "3",
+                            )
+                        ]
+                    }
+                }
+            },
+            {
+                "output": {
+                    "message": {
+                        "content": [
+                            _tool_use(
                                 "draft_forecast_plan",
                                 {
                                     "adapterId": "neuralnet-direct-v1",
@@ -116,7 +132,7 @@ def test_agent_uses_bounded_tools_and_returns_confirmable_plan() -> None:
                                     "summary": "Use the shared panel neural network.",
                                     "warnings": [],
                                 },
-                                "3",
+                                "4",
                             )
                         ]
                     }
@@ -143,13 +159,17 @@ def test_agent_uses_bounded_tools_and_returns_confirmable_plan() -> None:
     assert turn.draft_plan["requiresConfirmation"] is True
     assert turn.draft_plan["executesAutomatically"] is False
     assert turn.draft_plan["mapping"]["excluded"] == ["FuturePrediction"]
+    assert turn.draft_plan["preprocessingPlan"]["catalogVersion"] == (
+        "forecast-preprocessing-catalog/v1"
+    )
     assert [item["name"] for item in turn.tool_audit] == [
         "inspect_dataset",
         "compare_models",
+        "compile_preprocessing_plan",
         "draft_forecast_plan",
     ]
     assert all(request["inferenceConfig"]["temperature"] == 0.0 for request in client.requests)
-    assert all(len(request["toolConfig"]["tools"]) == 3 for request in client.requests)
+    assert all(len(request["toolConfig"]["tools"]) == 4 for request in client.requests)
 
 
 def test_unknown_column_in_plan_is_rejected() -> None:

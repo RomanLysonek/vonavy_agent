@@ -38,6 +38,7 @@ AGENT_DAILY_LIMIT = int(os.environ.get("AGENT_DAILY_LIMIT", "20"))
 AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "8"))
 AGENT_SESSION_TTL_DAYS = int(os.environ.get("AGENT_SESSION_TTL_DAYS", "7"))
 MAX_RESULT_BYTES = 2 * 1024 * 1024
+RESULT_REVIEW_POLICY_VERSION = "forecast-result-review/v1"
 MAX_INPUT_BYTES = 500_000_000
 SLOT_LEASE_SECONDS = FORECAST_JOB_TIMEOUT_SECONDS + 900
 ACTIVE_BATCH = {"SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"}
@@ -622,6 +623,8 @@ def _terminalize(
         raise ApiError(
             "forecast_result_invalid", "Forecast result identity does not match the run", 502
         )
+    if status == "succeeded":
+        _validated_result_evaluation(result)
     now = datetime.now(UTC).isoformat()
     expires = int(time.time()) + UPLOAD_RETENTION_DAYS * 86400
     profile = result.get("profile") if isinstance(result.get("profile"), dict) else {}
@@ -756,6 +759,434 @@ def _status(event: dict[str, Any], run_id: str) -> dict[str, Any]:
     return _payload(_refresh(owner, item))
 
 
+def _evaluation_error(message: str) -> ApiError:
+    return ApiError("forecast_result_invalid", message, 502)
+
+
+def _evaluation_int(value: object, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise _evaluation_error("Forecast evaluation integer evidence is invalid")
+    return value
+
+
+def _evaluation_number(
+    value: object,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    optional: bool = False,
+) -> float | None:
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _evaluation_error("Forecast evaluation numeric evidence is invalid")
+    number = float(value)
+    if number != number or number in {float("inf"), float("-inf")}:
+        raise _evaluation_error("Forecast evaluation numeric evidence is non-finite")
+    if minimum is not None and number < minimum:
+        raise _evaluation_error("Forecast evaluation numeric evidence is below its bound")
+    if maximum is not None and number > maximum:
+        raise _evaluation_error("Forecast evaluation numeric evidence exceeds its bound")
+    return number
+
+
+def _validated_result_evaluation(
+    result: dict[str, Any], *, required: bool = False
+) -> dict[str, Any] | None:
+    value = result.get("evaluation")
+    if value is None:
+        if required:
+            raise _evaluation_error("Successful forecast result is missing evaluation evidence")
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != "forecast-evaluation/v1"
+        or value.get("evidence_basis") != "worker-holdout-and-aggregate-features"
+    ):
+        raise _evaluation_error("Forecast evaluation evidence is invalid")
+    holdout_origin = value.get("holdout_origin")
+    if holdout_origin is not None and (
+        not isinstance(holdout_origin, str)
+        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", holdout_origin)
+    ):
+        raise _evaluation_error("Forecast evaluation holdout origin is invalid")
+    safety = value.get("safety")
+    if not isinstance(safety, dict) or safety != {
+        "deterministic": True,
+        "worker_computed": True,
+        "raw_rows_exported": False,
+        "raw_entity_values_exported": False,
+        "automatic_experiment_execution": False,
+    }:
+        raise _evaluation_error("Forecast evaluation safety evidence is invalid")
+
+    skill = value.get("baseline_skill")
+    if not isinstance(skill, dict):
+        raise _evaluation_error("Forecast baseline evidence is invalid")
+    if not isinstance(skill.get("supported"), bool) or skill.get("metric") != "wape":
+        raise _evaluation_error("Forecast baseline evidence is invalid")
+    _evaluation_int(skill.get("common_rows"))
+    model_value = _evaluation_number(skill.get("model_value"), minimum=0, optional=True)
+    baseline_value = _evaluation_number(skill.get("baseline_value"), minimum=0, optional=True)
+    improvement = _evaluation_number(skill.get("relative_improvement"), optional=True)
+    verdict = skill.get("verdict")
+    if verdict not in {"better", "tied", "worse", "unavailable"}:
+        raise _evaluation_error("Forecast baseline verdict is invalid")
+    if skill["supported"]:
+        if None in {model_value, baseline_value, improvement} or verdict == "unavailable":
+            raise _evaluation_error("Supported forecast baseline evidence is incomplete")
+    elif verdict != "unavailable":
+        raise _evaluation_error("Unsupported forecast baseline evidence has a verdict")
+    reason = skill.get("reason")
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 300):
+        raise _evaluation_error("Forecast baseline reason is invalid")
+
+    worst = value.get("worst_entities")
+    shifts = value.get("feature_shifts")
+    unavailable = value.get("unavailable")
+    if (
+        not isinstance(worst, list)
+        or len(worst) > 10
+        or not isinstance(shifts, list)
+        or len(shifts) > 10
+        or not isinstance(unavailable, list)
+        or len(unavailable) > 12
+        or any(not isinstance(item, str) or len(item) > 256 for item in unavailable)
+    ):
+        raise _evaluation_error("Forecast evaluation evidence exceeds bounds")
+
+    evaluated_entities = _evaluation_int(value.get("evaluated_entity_count"))
+    cold_entities = _evaluation_int(value.get("cold_start_entity_count"))
+    cold_rate = _evaluation_number(value.get("cold_start_rate"), minimum=0, maximum=1)
+    if cold_entities > evaluated_entities:
+        raise _evaluation_error("Forecast cold-start evidence is inconsistent")
+    expected_cold_rate = cold_entities / evaluated_entities if evaluated_entities else 0.0
+    if cold_rate is None or abs(cold_rate - expected_cold_rate) > 1e-9:
+        raise _evaluation_error("Forecast cold-start rate is inconsistent")
+
+    _evaluation_int(value.get("evaluated_feature_count"))
+    extrapolated = _evaluation_int(value.get("extrapolated_value_count"))
+    evaluated_values = _evaluation_int(value.get("evaluated_value_count"))
+    extrapolation_rate = _evaluation_number(
+        value.get("feature_extrapolation_rate"), minimum=0, maximum=1
+    )
+    if extrapolated > evaluated_values:
+        raise _evaluation_error("Forecast extrapolation evidence is inconsistent")
+    expected_extrapolation_rate = extrapolated / evaluated_values if evaluated_values else 0.0
+    if extrapolation_rate is None or abs(extrapolation_rate - expected_extrapolation_rate) > 1e-9:
+        raise _evaluation_error("Forecast extrapolation rate is inconsistent")
+
+    for item in worst:
+        if not isinstance(item, dict):
+            raise _evaluation_error("Forecast entity evidence is invalid")
+        entity_key = item.get("entity_key")
+        if not isinstance(entity_key, str) or not re.fullmatch(r"entity-[0-9a-f]{16}", entity_key):
+            raise _evaluation_error("Forecast entity evidence is invalid")
+        _evaluation_int(item.get("rows"), minimum=1)
+        _evaluation_number(item.get("model_wape"), minimum=0, optional=True)
+        _evaluation_number(item.get("baseline_wape"), minimum=0, optional=True)
+        _evaluation_number(item.get("relative_improvement"), optional=True)
+        _evaluation_number(item.get("model_mae"), minimum=0)
+        _evaluation_number(item.get("bias"))
+
+    for item in shifts:
+        if not isinstance(item, dict):
+            raise _evaluation_error("Forecast feature evidence is invalid")
+        feature = item.get("feature")
+        kind = item.get("kind")
+        statistic = item.get("statistic")
+        if not isinstance(feature, str) or not 1 <= len(feature) <= 128:
+            raise _evaluation_error("Forecast feature evidence is invalid")
+        if kind not in {"numeric", "categorical"}:
+            raise _evaluation_error("Forecast feature kind is invalid")
+        expected_statistic = "unseen_rate" if kind == "categorical" else "standardized_mean_shift"
+        if statistic != expected_statistic or item.get("severity") not in {
+            "info",
+            "notice",
+            "warning",
+        }:
+            raise _evaluation_error("Forecast feature evidence is invalid")
+        _evaluation_number(item.get("value"), minimum=0)
+        _evaluation_int(item.get("reference_count"), minimum=1)
+        fresh_count = _evaluation_int(item.get("fresh_count"), minimum=1)
+        feature_extrapolated = _evaluation_int(item.get("extrapolated_count"))
+        if feature_extrapolated > fresh_count:
+            raise _evaluation_error("Forecast feature extrapolation evidence is inconsistent")
+    return value
+
+
+def _finding(
+    finding_id: str,
+    severity: str,
+    message: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "findingId": finding_id,
+        "severity": severity,
+        "confidence": "measured",
+        "message": message,
+        "evidence": evidence,
+    }
+
+
+def _recommendation(
+    recommendation_id: str,
+    priority: str,
+    action: str,
+    rationale: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "recommendationId": recommendation_id,
+        "priority": priority,
+        "action": action,
+        "rationale": rationale,
+        "evidence": evidence,
+        "executesAutomatically": False,
+    }
+
+
+def _forecast_result_review(result: dict[str, Any]) -> dict[str, Any]:
+    evaluation = _validated_result_evaluation(result)
+    safety = {
+        "deterministic": True,
+        "workerEvidenceOnly": True,
+        "rawRowsRead": False,
+        "rawEntityValuesRead": False,
+        "bedrockInvoked": False,
+        "automaticRerun": False,
+    }
+    if evaluation is None:
+        return {
+            "policyVersion": RESULT_REVIEW_POLICY_VERSION,
+            "status": "insufficient_evidence",
+            "headline": "This result predates worker-produced evaluation evidence.",
+            "findings": [
+                _finding(
+                    "evaluation.unavailable",
+                    "notice",
+                    "Model-versus-baseline and drift diagnostics are unavailable for this run.",
+                    {"reason": "missing forecast-evaluation/v1"},
+                )
+            ],
+            "recommendations": [
+                _recommendation(
+                    "experiment.new_evaluated_run",
+                    "normal",
+                    "Create a new explicitly confirmed forecast run to generate bounded evaluation evidence.",
+                    "Historical result artifacts are immutable and are not rewritten in place.",
+                    {"requiredSchema": "forecast-evaluation/v1"},
+                )
+            ],
+            "safety": safety,
+        }
+
+    findings: list[dict[str, Any]] = []
+    recommendations: list[dict[str, Any]] = []
+    skill = evaluation.get("baseline_skill")
+    if not isinstance(skill, dict):
+        raise ApiError("forecast_result_invalid", "Forecast baseline evidence is invalid", 502)
+    verdict = skill.get("verdict")
+    improvement = skill.get("relative_improvement")
+    skill_evidence = {
+        "metric": skill.get("metric"),
+        "commonRows": skill.get("common_rows"),
+        "modelValue": skill.get("model_value"),
+        "baselineValue": skill.get("baseline_value"),
+        "relativeImprovement": improvement,
+    }
+    if verdict == "better":
+        findings.append(
+            _finding(
+                "skill.model_vs_baseline",
+                "info"
+                if isinstance(improvement, (int, float)) and improvement >= 0.05
+                else "notice",
+                "The selected model beat the seasonal baseline on the common recent holdout.",
+                skill_evidence,
+            )
+        )
+    elif verdict == "worse":
+        findings.append(
+            _finding(
+                "skill.model_vs_baseline",
+                "warning",
+                "The selected model underperformed the seasonal baseline on the common recent holdout.",
+                skill_evidence,
+            )
+        )
+        recommendations.append(
+            _recommendation(
+                "experiment.compare_adapter",
+                "high",
+                "Manually compare another supported adapter on the same immutable dataset version and mapping.",
+                "The measured holdout skill is negative; another model class is the highest-value next experiment.",
+                skill_evidence,
+            )
+        )
+    elif verdict == "tied":
+        findings.append(
+            _finding(
+                "skill.model_vs_baseline",
+                "notice",
+                "The selected model and seasonal baseline were effectively tied on the recent holdout.",
+                skill_evidence,
+            )
+        )
+    else:
+        findings.append(
+            _finding(
+                "skill.model_vs_baseline",
+                "notice",
+                "A common model-versus-baseline WAPE could not be calculated.",
+                {**skill_evidence, "reason": skill.get("reason")},
+            )
+        )
+
+    cold_count = int(evaluation.get("cold_start_entity_count", 0))
+    cold_rate = float(evaluation.get("cold_start_rate", 0.0))
+    if cold_count:
+        severity = "warning" if cold_rate >= 0.10 else "notice"
+        evidence = {
+            "coldStartEntities": cold_count,
+            "evaluatedEntities": int(evaluation.get("evaluated_entity_count", 0)),
+            "coldStartRate": cold_rate,
+        }
+        findings.append(
+            _finding(
+                "entities.cold_start",
+                severity,
+                "Some forecast entities were absent from the adapter's fitted or contextual evidence.",
+                evidence,
+            )
+        )
+        recommendations.append(
+            _recommendation(
+                "experiment.cold_start_strategy",
+                "high" if severity == "warning" else "normal",
+                "Compare a zero-shot or pooled fallback strategy for the measured cold-start entities.",
+                "Cold-start entities cannot benefit from the same entity-specific history as established entities.",
+                evidence,
+            )
+        )
+
+    extrapolation_rate = float(evaluation.get("feature_extrapolation_rate", 0.0))
+    if extrapolation_rate > 0:
+        severity = "warning" if extrapolation_rate >= 0.05 else "notice"
+        evidence = {
+            "rate": extrapolation_rate,
+            "extrapolatedValues": int(evaluation.get("extrapolated_value_count", 0)),
+            "evaluatedValues": int(evaluation.get("evaluated_value_count", 0)),
+        }
+        findings.append(
+            _finding(
+                "features.extrapolation",
+                severity,
+                "Fresh forecast features contain values outside the fitted numeric ranges or categorical levels.",
+                evidence,
+            )
+        )
+        recommendations.append(
+            _recommendation(
+                "experiment.extrapolation_backtest",
+                "high" if severity == "warning" else "normal",
+                "Run an explicitly confirmed recent-origin backtest or alternate adapter comparison before relying on extrapolated covariates.",
+                "The worker measured feature values outside the training support.",
+                evidence,
+            )
+        )
+
+    shifts = evaluation.get("feature_shifts", [])
+    warning_shifts = [
+        item for item in shifts if isinstance(item, dict) and item.get("severity") == "warning"
+    ]
+    if warning_shifts:
+        evidence = {
+            "warningFeatureCount": len(warning_shifts),
+            "topFeatures": [
+                {
+                    "feature": item.get("feature"),
+                    "statistic": item.get("statistic"),
+                    "value": item.get("value"),
+                }
+                for item in warning_shifts[:5]
+            ],
+        }
+        findings.append(
+            _finding(
+                "features.train_fresh_shift",
+                "warning",
+                "One or more fresh feature distributions differ materially from the fitted evidence.",
+                evidence,
+            )
+        )
+        recommendations.append(
+            _recommendation(
+                "experiment.recent_window",
+                "high",
+                "Compare the current setup with a more recent training window while preserving the same leakage-safe holdout protocol.",
+                "Large aggregate train/fresh shifts make stale relationships a plausible failure mode.",
+                evidence,
+            )
+        )
+
+    worst = evaluation.get("worst_entities", [])
+    worst_item = worst[0] if worst and isinstance(worst[0], dict) else None
+    worst_wape = worst_item.get("model_wape") if worst_item else None
+    if isinstance(worst_wape, (int, float)) and worst_wape >= 0.50:
+        severity = "warning" if worst_wape >= 1.0 else "notice"
+        evidence = {
+            "entityKey": worst_item.get("entity_key"),
+            "modelWape": worst_wape,
+            "rows": worst_item.get("rows"),
+            "bias": worst_item.get("bias"),
+        }
+        findings.append(
+            _finding(
+                "entities.worst_case",
+                severity,
+                "The worst measured entity has materially higher recent holdout error.",
+                evidence,
+            )
+        )
+        recommendations.append(
+            _recommendation(
+                "experiment.entity_segment",
+                "normal",
+                "Inspect a bounded segment-level backtest for the worst entity cohort before changing the global model.",
+                "Aggregate model quality can hide concentrated entity-level failure.",
+                evidence,
+            )
+        )
+
+    if not recommendations:
+        recommendations.append(
+            _recommendation(
+                "experiment.additional_origin",
+                "normal",
+                "Validate the selected adapter on an additional recent rolling origin before production use.",
+                "The current result is encouraging, but one recent holdout is not a stability guarantee.",
+                {"currentVerdict": verdict, "currentHoldoutRows": skill.get("common_rows")},
+            )
+        )
+
+    attention = any(item["severity"] == "warning" for item in findings)
+    return {
+        "policyVersion": RESULT_REVIEW_POLICY_VERSION,
+        "status": "needs_attention" if attention else "ready",
+        "headline": (
+            "Measured result evidence contains issues that should be reviewed before reuse."
+            if attention
+            else "Measured result evidence is available with no warning-level finding."
+        ),
+        "findings": findings,
+        "recommendations": recommendations[:6],
+        "unavailable": evaluation.get("unavailable", []),
+        "safety": safety,
+    }
+
+
 def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
     owner = _identity(event)
     run_id = _canonical_uuid(
@@ -798,6 +1229,7 @@ def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
         raise ApiError(
             "forecast_result_invalid", "Forecast result identity does not match the run", 502
         )
+    payload["review"] = _forecast_result_review(payload)
     prefix = f"forecast-results/users/{owner}/datasets/{item['dataset_id']}/runs/{run_id}/"
     artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
     downloads: dict[str, str] = {}

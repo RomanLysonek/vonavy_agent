@@ -31,6 +31,7 @@ from vonavy_agent.forecasting.contracts import (
     InputIdentity,
     ModelArtifactManifest,
 )
+from vonavy_agent.forecasting.evaluation import build_forecast_evaluation
 from vonavy_agent.forecasting.model import ForecastRunOutput, sha256_file
 from vonavy_agent.forecasting.panel import PreparedPanel, build_panel_frames, prepare_daily_panel
 
@@ -356,6 +357,10 @@ def run_chronos2_forecast(
 
     holdout_started = time.monotonic()
     holdout_origin = prepared.training_end - pd.Timedelta(days=7)
+    holdout_actual = np.asarray([], dtype=float)
+    holdout_prediction_evidence = np.asarray([], dtype=float)
+    holdout_baseline = np.asarray([], dtype=float)
+    holdout_entities = np.asarray([], dtype=object)
     if holdout_origin - prepared.frame["timestamp"].min() < pd.Timedelta(days=35):
         holdout = HoldoutMetrics(
             supported=False,
@@ -367,6 +372,17 @@ def run_chronos2_forecast(
     else:
         try:
             holdout_prediction, _ = _predict_origin(prepared, holdout_origin, runtime)
+            actual_lookup = prepared.frame.set_index(["entity", "timestamp"])["observed_target"]
+            holdout_actual = np.asarray(
+                [
+                    actual_lookup.get((row.entity, row.timestamp), np.nan)
+                    for row in holdout_prediction.itertuples()
+                ],
+                dtype=float,
+            )
+            holdout_prediction_evidence = holdout_prediction["prediction"].to_numpy(dtype=float)
+            holdout_baseline = holdout_prediction["target_baseline"].to_numpy(dtype=float)
+            holdout_entities = holdout_prediction["entity"].to_numpy(dtype=object)
             holdout = _holdout_metrics(prepared, holdout_prediction, holdout_origin)
         except ValueError as exc:
             holdout = HoldoutMetrics(
@@ -380,6 +396,21 @@ def run_chronos2_forecast(
 
     forecast_started = time.monotonic()
     forecast, final_frames = _predict_origin(prepared, prepared.training_end, runtime)
+    no_context_entities = int(forecast.groupby("entity", sort=False)["no_context"].max().sum())
+    evaluation = build_forecast_evaluation(
+        holdout_origin=holdout.origin,
+        actual=holdout_actual,
+        prediction=holdout_prediction_evidence,
+        baseline=holdout_baseline,
+        entities=holdout_entities,
+        train_features=final_frames.context,
+        fresh_features=final_frames.future,
+        feature_columns=final_frames.feature_columns,
+        categorical_columns=tuple(final_frames.categorical_levels),
+        entity_column="item_id",
+        evaluated_entity_count_override=len(prepared.entities),
+        cold_start_entity_count_override=no_context_entities,
+    )
     for column in (
         mapping.known_future_numeric
         + mapping.known_future_categorical
@@ -472,6 +503,7 @@ def run_chronos2_forecast(
             fallback_rows=int(forecast["fallback_used"].sum()),
         ),
         holdout=holdout,
+        evaluation=evaluation,
         artifacts=ForecastArtifacts(
             forecast=ArtifactReference(
                 key="forecast.parquet",

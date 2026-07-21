@@ -167,6 +167,7 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
     assert plan["execution"]["availableAdapterIds"] == [
         "xgboost-direct-v1",
         "neuralnet-direct-v1",
+        "chronos2-zero-shot-v1",
     ]
     assert plan["privacy"]["rawRowsSentToProvider"] is False
     assert plan["privacy"]["awsIamAuthentication"] is True

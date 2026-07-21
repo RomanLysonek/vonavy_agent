@@ -83,6 +83,7 @@ def test_mapping_rejects_duplicate_roles() -> None:
 def test_adapter_selection_is_validated_and_bound_to_fingerprint() -> None:
     assert handler._adapter_id({}) == "xgboost-direct-v1"
     assert handler._adapter_id({"adapterId": "neuralnet-direct-v1"}) == "neuralnet-direct-v1"
+    assert handler._adapter_id({"adapterId": "chronos2-zero-shot-v1"}) == "chronos2-zero-shot-v1"
     try:
         handler._adapter_id({"adapterId": "unknown"})
     except handler.ApiError as exc:
@@ -94,7 +95,9 @@ def test_adapter_selection_is_validated_and_bound_to_fingerprint() -> None:
     mapping = {"timestamp_column": "DateKey", "target_column": "Quantity"}
     xgb = handler._fingerprint("dataset", mapping, "2025-01-01", "xgboost-direct-v1")
     neural = handler._fingerprint("dataset", mapping, "2025-01-01", "neuralnet-direct-v1")
+    chronos = handler._fingerprint("dataset", mapping, "2025-01-01", "chronos2-zero-shot-v1")
     assert xgb != neural
+    assert chronos not in {xgb, neural}
 
 
 def test_terminal_transaction_uses_only_expression_values_needed_by_each_update() -> None:

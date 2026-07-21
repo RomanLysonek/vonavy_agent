@@ -11,13 +11,15 @@ RUN python -m pip install "uv==${UV_VERSION}"
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable --extra aws --extra modeling --python /usr/local/bin/python
+RUN uv sync --frozen --no-dev --no-editable --extra aws --extra modeling --extra chronos --python /usr/local/bin/python
+
+RUN /opt/venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='amazon/chronos-2', revision='29ec3766d36d6f73f0696f85560a422f50e8498c', local_dir='/opt/models/chronos-2', allow_patterns=['*.json', '*.safetensors', '*.model', '*.txt'])"
 
 FROM python:3.12.3-slim-bookworm AS runtime
 
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Vonavy Agent forecast worker" \
-      org.opencontainers.image.description="AWS Batch adapter for direct seven-day XGBoost and NeuralNet retraining" \
+      org.opencontainers.image.description="AWS Batch adapters for XGBoost, NeuralNet, and Chronos-2 forecasting" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.source="https://github.com/RomanLysonek/vonavy_agent"
 
@@ -28,12 +30,17 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
-    NUMEXPR_NUM_THREADS=1
+    NUMEXPR_NUM_THREADS=1 \
+    CHRONOS2_MODEL_PATH=/opt/models/chronos-2 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false
 
 RUN groupadd --gid 10001 worker \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin worker
 
 COPY --from=build --chown=10001:10001 /opt/venv /opt/venv
+COPY --from=build --chown=10001:10001 /opt/models /opt/models
 WORKDIR /home/worker
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "vonavy_agent.forecasting.aws_batch"]

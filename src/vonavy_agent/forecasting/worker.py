@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 from pydantic import ValidationError
 
+from vonavy_agent.forecasting.chronos2 import run_chronos2_forecast
 from vonavy_agent.forecasting.contracts import (
     ADAPTER_ID,
     AdapterId,
@@ -86,11 +87,12 @@ def run_local(request_path: Path, result_relative: str, workspace: Path | None =
         output_directory = _safe_path(workspace, request.output_directory, must_exist=False)
         output_directory.mkdir(parents=True, exist_ok=True)
         raw = _load(input_path, request.media_type)
-        runner = (
-            run_neuralnet_forecast
-            if request.adapter_id == "neuralnet-direct-v1"
-            else run_xgboost_forecast
-        )
+        runners = {
+            "xgboost-direct-v1": run_xgboost_forecast,
+            "neuralnet-direct-v1": run_neuralnet_forecast,
+            "chronos2-zero-shot-v1": run_chronos2_forecast,
+        }
+        runner = runners[request.adapter_id]
         output = runner(
             raw=raw,
             mapping=request.mapping,

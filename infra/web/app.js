@@ -298,8 +298,8 @@ async function forecastDataset(dataset, output, button) {
     });
     const suggested = plan.mapping;
     const modelChoice = window.prompt(
-      "Choose model: xgboost or neuralnet",
-      "neuralnet",
+      "Choose model: xgboost, neuralnet, or chronos",
+      "chronos",
     );
     if (modelChoice === null) throw new Error("Forecast setup cancelled.");
     const normalisedModel = modelChoice.trim().toLowerCase();
@@ -307,11 +307,15 @@ async function forecastDataset(dataset, output, button) {
       ? "neuralnet-direct-v1"
       : normalisedModel === "xgboost"
         ? "xgboost-direct-v1"
-        : null;
-    if (!adapterId) throw new Error("Model must be xgboost or neuralnet.");
+        : normalisedModel === "chronos"
+          ? "chronos2-zero-shot-v1"
+          : null;
+    if (!adapterId) throw new Error("Model must be xgboost, neuralnet, or chronos.");
     const modelLabel = adapterId === "neuralnet-direct-v1"
       ? "Best NeuralNet"
-      : "Quick XGBoost";
+      : adapterId === "chronos2-zero-shot-v1"
+        ? "Chronos-2 Zero-shot"
+        : "Quick XGBoost";
     const mapping = {
       timestampColumn: promptColumn("Timestamp column", suggested.timestampColumn),
       entityColumn: promptColumn(
@@ -356,10 +360,10 @@ async function forecastDataset(dataset, output, button) {
         `Training end: ${trainingEnd}\n` +
         `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n` +
         "Privacy: only validated profile metadata was sent; no raw rows or raw string values." +
-        `${warnings}\n\nStart ${modelLabel} on the CPU scale-to-zero worker?`,
+        `${warnings}\n\nStart ${modelLabel} on the scale-to-zero worker?`,
     );
     if (!approved) throw new Error("Forecast plan was not confirmed.");
-    output.textContent = `Submitting the confirmed ${modelLabel} retraining plan…`;
+    output.textContent = `Submitting the confirmed ${modelLabel} forecast plan…`;
     const run = await api(`/api/datasets/${dataset.datasetId}/forecasts`, {
       method: "POST",
       body: JSON.stringify({

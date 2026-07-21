@@ -14,6 +14,7 @@ import pandas as pd
 from botocore.config import Config  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
+from vonavy_agent.forecasting.chronos2 import run_chronos2_forecast
 from vonavy_agent.forecasting.contracts import (
     AdapterIdentity,
     ForecastIssue,
@@ -193,11 +194,12 @@ def main() -> None:
         try:
             actual_sha256 = _download(s3, request, input_path)
             raw = _load(input_path, request.input.media_type)
-            runner = (
-                run_neuralnet_forecast
-                if request.adapter_id == "neuralnet-direct-v1"
-                else run_xgboost_forecast
-            )
+            runners = {
+                "xgboost-direct-v1": run_xgboost_forecast,
+                "neuralnet-direct-v1": run_neuralnet_forecast,
+                "chronos2-zero-shot-v1": run_chronos2_forecast,
+            }
+            runner = runners[request.adapter_id]
             output = runner(
                 raw=raw,
                 mapping=request.mapping,

@@ -720,7 +720,11 @@ def build_forecast_agent_plan(
         "requiresConfirmation": True,
         "execution": {
             "adapterId": "xgboost-direct-v1",
-            "availableAdapterIds": ["xgboost-direct-v1", "neuralnet-direct-v1"],
+            "availableAdapterIds": [
+                "xgboost-direct-v1",
+                "neuralnet-direct-v1",
+                "chronos2-zero-shot-v1",
+            ],
             "resourceClass": "cpu-small",
             "gpu": False,
             "maximumRuntimeSeconds": 3600,

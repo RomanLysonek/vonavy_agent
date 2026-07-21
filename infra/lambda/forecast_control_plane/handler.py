@@ -18,6 +18,7 @@ from agent import AgentPlanError, build_forecast_agent_plan
 from boto3.dynamodb.types import TypeSerializer  # type: ignore[import-untyped]
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from orchestrator import OrchestratorError, run_agent_turn
 
 LOGGER = logging.getLogger()
 LOGGER.setLevel(logging.INFO)
@@ -34,6 +35,8 @@ AWS_REGION_NAME = os.environ.get("AWS_REGION_NAME")
 MAX_BODY_BYTES = 32 * 1024
 MAX_VALIDATION_RESULT_BYTES = 4 * 1024 * 1024
 AGENT_DAILY_LIMIT = int(os.environ.get("AGENT_DAILY_LIMIT", "20"))
+AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "8"))
+AGENT_SESSION_TTL_DAYS = int(os.environ.get("AGENT_SESSION_TTL_DAYS", "7"))
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 MAX_INPUT_BYTES = 500_000_000
 SLOT_LEASE_SECONDS = FORECAST_JOB_TIMEOUT_SECONDS + 900
@@ -944,6 +947,258 @@ def _validation_result_for_agent(
     return result
 
 
+def _agent_session_key(owner: str, session_id: str) -> dict[str, str]:
+    return {"pk": f"USER#{owner}", "sk": f"AGENT_SESSION#{session_id}"}
+
+
+def _agent_session_item(table: Any, owner: str, session_id: str) -> dict[str, Any]:
+    response = table.get_item(
+        Key=_agent_session_key(owner, session_id),
+        ConsistentRead=True,
+    )
+    item = response.get("Item")
+    if not isinstance(item, dict) or item.get("owner_sub") != owner:
+        raise ApiError("agent_session_not_found", "Agent session does not exist", 404)
+    return item
+
+
+def _agent_session_json(value: object, field: str) -> object:
+    if value is None or value == "":
+        return None if field == "draft_plan_json" else []
+    if not isinstance(value, str):
+        raise ApiError("agent_session_invalid", "Stored agent session is invalid", 500)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ApiError("agent_session_invalid", "Stored agent session is invalid", 500) from exc
+
+
+def _agent_session_response(item: dict[str, Any]) -> dict[str, Any]:
+    history = _agent_session_json(item.get("messages_json"), "messages_json")
+    draft = _agent_session_json(item.get("draft_plan_json"), "draft_plan_json")
+    if not isinstance(history, list) or (draft is not None and not isinstance(draft, dict)):
+        raise ApiError("agent_session_invalid", "Stored agent session is invalid", 500)
+    message = ""
+    for entry in reversed(history):
+        if isinstance(entry, dict) and entry.get("role") == "assistant":
+            value = entry.get("text")
+            if isinstance(value, str):
+                message = value
+                break
+    return {
+        "schemaVersion": "forecast-agent-session/v1",
+        "sessionId": item["session_id"],
+        "datasetId": item["dataset_id"],
+        "validationJobId": item["validation_job_id"],
+        "turnCount": int(item.get("turn_count", 0)),
+        "message": message,
+        "history": history,
+        "draftPlan": draft,
+        "requiresConfirmation": draft is not None,
+        "links": {
+            "self": f"/api/forecast-agent/sessions/{item['session_id']}",
+            "messages": f"/api/forecast-agent/sessions/{item['session_id']}/messages",
+            "execute": f"/api/datasets/{item['dataset_id']}/forecasts",
+        },
+    }
+
+
+def _run_agent_session_turn(
+    *,
+    table: Any,
+    owner: str,
+    dataset: dict[str, Any],
+    dataset_id: str,
+    validation_result: dict[str, Any],
+    message: object,
+    history: object,
+) -> dict[str, Any]:
+    _consume_agent_quota(table, owner)
+    try:
+        turn = run_agent_turn(
+            dataset_id=dataset_id,
+            dataset_version_id=str(dataset["object_version_id"]),
+            validation_result=validation_result,
+            message=message,
+            history=history,
+        )
+    except OrchestratorError as exc:
+        raise ApiError(exc.code, exc.message, exc.status, exc.detail) from exc
+    return turn.as_dict()
+
+
+def _agent_session_create(event: dict[str, Any], dataset_id: str) -> dict[str, Any]:
+    owner = _identity(event)
+    dataset_id = _canonical_uuid(
+        dataset_id,
+        code="dataset_not_found",
+        message="Dataset does not exist",
+        status=404,
+    )
+    body = _parse_body(event)
+    validation_job_id = _canonical_uuid(
+        body.get("validationJobId"),
+        code="validation_not_found",
+        message="Validation job does not exist",
+        status=404,
+    )
+    s3, table, _, _ = _clients()
+    dataset = _dataset(table, owner, dataset_id)
+    validation_result = _validation_result_for_agent(
+        s3,
+        table,
+        owner=owner,
+        dataset=dataset,
+        dataset_id=dataset_id,
+        validation_job_id=validation_job_id,
+    )
+    turn = _run_agent_session_turn(
+        table=table,
+        owner=owner,
+        dataset=dataset,
+        dataset_id=dataset_id,
+        validation_result=validation_result,
+        message=body.get("message"),
+        history=[],
+    )
+    session_id = str(uuid.uuid4())
+    now = datetime.now(UTC).isoformat()
+    expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
+    item = {
+        **_agent_session_key(owner, session_id),
+        "owner_sub": owner,
+        "session_id": session_id,
+        "dataset_id": dataset_id,
+        "dataset_version_id": str(dataset["object_version_id"]),
+        "validation_job_id": validation_job_id,
+        "messages_json": json.dumps(turn["history"], separators=(",", ":")),
+        "draft_plan_json": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
+        "turn_count": 1,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": expires,
+    }
+    table.put_item(
+        Item=item,
+        ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
+    )
+    response = _agent_session_response(item)
+    response.update(
+        {
+            "toolAudit": turn["toolAudit"],
+            "provider": turn["provider"],
+            "model": turn["model"],
+            "privacy": turn["privacy"],
+        }
+    )
+    return response
+
+
+def _agent_session_message(event: dict[str, Any], session_id: str) -> dict[str, Any]:
+    owner = _identity(event)
+    session_id = _canonical_uuid(
+        session_id,
+        code="agent_session_not_found",
+        message="Agent session does not exist",
+        status=404,
+    )
+    body = _parse_body(event)
+    s3, table, _, _ = _clients()
+    item = _agent_session_item(table, owner, session_id)
+    turns = int(item.get("turn_count", 0))
+    if turns >= AGENT_SESSION_MAX_TURNS:
+        raise ApiError(
+            "agent_session_limit",
+            f"Agent sessions support at most {AGENT_SESSION_MAX_TURNS} turns",
+            429,
+        )
+    dataset_id = str(item["dataset_id"])
+    dataset = _dataset(table, owner, dataset_id)
+    if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
+        raise ApiError("agent_session_stale", "The dataset version changed", 409)
+    validation_job_id = str(item["validation_job_id"])
+    validation_result = _validation_result_for_agent(
+        s3,
+        table,
+        owner=owner,
+        dataset=dataset,
+        dataset_id=dataset_id,
+        validation_job_id=validation_job_id,
+    )
+    history = _agent_session_json(item.get("messages_json"), "messages_json")
+    turn = _run_agent_session_turn(
+        table=table,
+        owner=owner,
+        dataset=dataset,
+        dataset_id=dataset_id,
+        validation_result=validation_result,
+        message=body.get("message"),
+        history=history,
+    )
+    now = datetime.now(UTC).isoformat()
+    expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
+    try:
+        table.update_item(
+            Key=_agent_session_key(owner, session_id),
+            UpdateExpression=(
+                "SET messages_json=:messages, draft_plan_json=:draft, "
+                "turn_count=:turns, updated_at=:now, expires_at=:expires"
+            ),
+            ConditionExpression=(
+                "owner_sub=:owner AND session_id=:session AND turn_count=:expected_turns"
+            ),
+            ExpressionAttributeValues={
+                ":messages": json.dumps(turn["history"], separators=(",", ":")),
+                ":draft": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
+                ":turns": turns + 1,
+                ":now": now,
+                ":expires": expires,
+                ":owner": owner,
+                ":session": session_id,
+                ":expected_turns": turns,
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ApiError(
+                "agent_session_conflict",
+                "The agent session changed; reload it before sending another message",
+                409,
+            ) from exc
+        raise
+    item.update(
+        {
+            "messages_json": json.dumps(turn["history"], separators=(",", ":")),
+            "draft_plan_json": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
+            "turn_count": turns + 1,
+            "updated_at": now,
+            "expires_at": expires,
+        }
+    )
+    response = _agent_session_response(item)
+    response.update(
+        {
+            "toolAudit": turn["toolAudit"],
+            "provider": turn["provider"],
+            "model": turn["model"],
+            "privacy": turn["privacy"],
+        }
+    )
+    return response
+
+
+def _agent_session_get(event: dict[str, Any], session_id: str) -> dict[str, Any]:
+    owner = _identity(event)
+    session_id = _canonical_uuid(
+        session_id,
+        code="agent_session_not_found",
+        message="Agent session does not exist",
+        status=404,
+    )
+    _, table, _, _ = _clients()
+    return _agent_session_response(_agent_session_item(table, owner, session_id))
+
+
 def _agent_plan(event: dict[str, Any], dataset_id: str) -> dict[str, Any]:
     owner = _identity(event)
     dataset_id = _canonical_uuid(
@@ -987,6 +1242,12 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         route = event.get("routeKey")
         path = event.get("rawPath", "")
         parts = path.split("/")
+        if route == "POST /api/datasets/{dataset_id}/forecast-agent/sessions" and len(parts) == 6:
+            return _response(201, _agent_session_create(event, parts[3]))
+        if route == "POST /api/forecast-agent/sessions/{session_id}/messages" and len(parts) == 6:
+            return _response(200, _agent_session_message(event, parts[4]))
+        if route == "GET /api/forecast-agent/sessions/{session_id}" and len(parts) == 5:
+            return _response(200, _agent_session_get(event, parts[4]))
         if route == "POST /api/datasets/{dataset_id}/forecast-agent" and len(parts) == 5:
             return _response(200, _agent_plan(event, parts[3]))
         if route == "POST /api/datasets/{dataset_id}/forecasts" and len(parts) == 5:

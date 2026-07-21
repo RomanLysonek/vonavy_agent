@@ -775,6 +775,18 @@ class ControlPlaneStack(Stack):
 
         for path, method in (
             ("/api/datasets/{dataset_id}/forecast-agent", apigwv2.HttpMethod.POST),
+            (
+                "/api/datasets/{dataset_id}/forecast-agent/sessions",
+                apigwv2.HttpMethod.POST,
+            ),
+            (
+                "/api/forecast-agent/sessions/{session_id}/messages",
+                apigwv2.HttpMethod.POST,
+            ),
+            (
+                "/api/forecast-agent/sessions/{session_id}",
+                apigwv2.HttpMethod.GET,
+            ),
             ("/api/datasets/{dataset_id}/forecasts", apigwv2.HttpMethod.POST),
             ("/api/forecasts/{run_id}", apigwv2.HttpMethod.GET),
             ("/api/forecasts/{run_id}/result", apigwv2.HttpMethod.GET),
@@ -842,6 +854,8 @@ class ControlPlaneStack(Stack):
                         "forecastJobTimeoutSeconds": 3600,
                         "forecastAdapterId": "xgboost-direct-v1",
                         "forecastAgentEnabled": True,
+                        "forecastAgentConversationEnabled": True,
+                        "forecastAgentMaximumTurns": 8,
                         "forecastAgentModel": "eu.anthropic.claude-opus-4-6-v1",
                         "maximumActiveValidationJobsPerOwner": (
                             config.validation_max_active_jobs_per_owner

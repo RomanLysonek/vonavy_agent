@@ -308,3 +308,125 @@ def test_agent_hides_other_owner_validation_result() -> None:
         assert exc.status == 404
     else:
         raise AssertionError("cross-owner validation result was exposed")
+
+
+class AgentSessionTable:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.updates: list[dict[str, Any]] = []
+
+    def update_item(self, **kwargs: Any) -> None:
+        self.updates.append(kwargs)
+        if self.error is not None:
+            raise self.error
+
+
+def _session_turn() -> dict[str, Any]:
+    return {
+        "history": [
+            {"role": "user", "text": "Compare the models"},
+            {"role": "assistant", "text": "XGBoost is the lowest-cost trained option."},
+        ],
+        "draftPlan": {"adapterId": "xgboost-direct-v1"},
+        "toolAudit": [{"name": "compare_models", "status": "succeeded"}],
+        "provider": "amazon-bedrock",
+        "model": "eu.anthropic.claude-opus-4-6-v1",
+        "privacy": {"rawRowsSentToProvider": False},
+    }
+
+
+def test_agent_session_message_uses_optimistic_turn_lock(monkeypatch: Any) -> None:
+    session_id = "00000000-0000-0000-0000-000000000003"
+    table = AgentSessionTable()
+    item = {
+        "owner_sub": "owner",
+        "session_id": session_id,
+        "dataset_id": "00000000-0000-0000-0000-000000000001",
+        "dataset_version_id": "version-1",
+        "validation_job_id": "00000000-0000-0000-0000-000000000002",
+        "messages_json": "[]",
+        "draft_plan_json": "null",
+        "turn_count": 1,
+    }
+    monkeypatch.setattr(handler, "_identity", lambda event: "owner")
+    monkeypatch.setattr(handler, "_parse_body", lambda event: {"message": "Compare models"})
+    monkeypatch.setattr(handler, "_clients", lambda: (None, table, None, None))
+    monkeypatch.setattr(handler, "_agent_session_item", lambda *args: dict(item))
+    monkeypatch.setattr(
+        handler,
+        "_dataset",
+        lambda *args: {"object_version_id": "version-1"},
+    )
+    monkeypatch.setattr(handler, "_validation_result_for_agent", lambda *args, **kwargs: {})
+    monkeypatch.setattr(handler, "_run_agent_session_turn", lambda **kwargs: _session_turn())
+
+    response = handler._agent_session_message({}, session_id)
+
+    update = table.updates[0]
+    assert "turn_count=:expected_turns" in update["ConditionExpression"]
+    assert update["ExpressionAttributeValues"][":expected_turns"] == 1
+    assert response["turnCount"] == 2
+    assert response["draftPlan"]["adapterId"] == "xgboost-direct-v1"
+
+
+def test_agent_session_concurrent_message_returns_409(monkeypatch: Any) -> None:
+    error = handler.ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "changed"}},
+        "UpdateItem",
+    )
+    table = AgentSessionTable(error)
+    session_id = "00000000-0000-0000-0000-000000000003"
+    item = {
+        "owner_sub": "owner",
+        "session_id": session_id,
+        "dataset_id": "00000000-0000-0000-0000-000000000001",
+        "dataset_version_id": "version-1",
+        "validation_job_id": "00000000-0000-0000-0000-000000000002",
+        "messages_json": "[]",
+        "draft_plan_json": "null",
+        "turn_count": 1,
+    }
+    monkeypatch.setattr(handler, "_identity", lambda event: "owner")
+    monkeypatch.setattr(handler, "_parse_body", lambda event: {"message": "Compare models"})
+    monkeypatch.setattr(handler, "_clients", lambda: (None, table, None, None))
+    monkeypatch.setattr(handler, "_agent_session_item", lambda *args: dict(item))
+    monkeypatch.setattr(
+        handler,
+        "_dataset",
+        lambda *args: {"object_version_id": "version-1"},
+    )
+    monkeypatch.setattr(handler, "_validation_result_for_agent", lambda *args, **kwargs: {})
+    monkeypatch.setattr(handler, "_run_agent_session_turn", lambda **kwargs: _session_turn())
+
+    try:
+        handler._agent_session_message({}, session_id)
+    except handler.ApiError as exc:
+        assert exc.code == "agent_session_conflict"
+        assert exc.status == 409
+    else:
+        raise AssertionError("concurrent agent-session update was accepted")
+
+
+def test_agent_session_route_returns_persistent_session(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        handler,
+        "_agent_session_create",
+        lambda event, dataset_id: {
+            "schemaVersion": "forecast-agent-session/v1",
+            "sessionId": "00000000-0000-0000-0000-000000000003",
+            "datasetId": dataset_id,
+        },
+    )
+    response = handler.lambda_handler(
+        {
+            "routeKey": "POST /api/datasets/{dataset_id}/forecast-agent/sessions",
+            "rawPath": (
+                "/api/datasets/00000000-0000-0000-0000-000000000001/forecast-agent/sessions"
+            ),
+            "requestContext": {"authorizer": {"jwt": {"claims": {"sub": "owner"}}}},
+        },
+        type("Context", (), {"aws_request_id": "request-1"})(),
+    )
+    assert response["statusCode"] == 201
+    payload = json.loads(response["body"])
+    assert payload["schemaVersion"] == "forecast-agent-session/v1"

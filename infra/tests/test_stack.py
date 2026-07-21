@@ -294,7 +294,7 @@ def test_static_web_bucket_is_destroyed_with_auto_delete_helper() -> None:
 
 def test_every_api_route_requires_jwt_and_custom_scope() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 11
+    assert len(routes) == 14
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"

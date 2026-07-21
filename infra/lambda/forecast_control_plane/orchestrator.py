@@ -78,6 +78,212 @@ MODEL_CAPABILITIES: dict[AdapterId, dict[str, Any]] = {
 }
 
 
+MODEL_SELECTION_POLICY_VERSION = "forecast-model-selection/v1"
+_SELECTION_TOKENS = {
+    "fast": {"fast", "quick", "cheap", "budget", "low cost", "lowest cost"},
+    "accuracy": {"best", "accuracy", "accurate", "quality", "nonlinear"},
+    "uncertainty": {"uncertainty", "interval", "quantile", "confidence band"},
+    "immediate": {"immediate", "zero shot", "no training", "without training"},
+    "retrain": {"retrain", "train", "learn", "fit"},
+}
+_KNOWN_FUTURE_TOKENS = (
+    "campaign",
+    "promo",
+    "promotion",
+    "discount",
+    "price",
+    "holiday",
+    "event",
+    "coupon",
+    "sale",
+)
+_ENTITY_TOKENS = ("product", "sku", "item", "entity", "store", "series")
+
+
+def _normalised_name(value: object) -> str:
+    return "".join(character for character in str(value).casefold() if character.isalnum())
+
+
+def _estimated_row_count(profiles: list[dict[str, Any]]) -> int:
+    estimates: list[int] = []
+    for profile in profiles:
+        non_null = max(0, int(profile.get("nonNullCount", 0)))
+        null_ratio = float(profile.get("nullRatio", 0.0))
+        if 0.0 <= null_ratio < 1.0 and non_null:
+            estimates.append(round(non_null / max(1.0 - null_ratio, 0.001)))
+        else:
+            estimates.append(non_null)
+    return max(estimates, default=0)
+
+
+def _history_days(profiles: list[dict[str, Any]]) -> int | None:
+    spans: list[int] = []
+    for profile in profiles:
+        temporal = profile.get("temporal")
+        if not isinstance(temporal, dict):
+            continue
+        minimum = temporal.get("minimum")
+        maximum = temporal.get("maximum")
+        if not isinstance(minimum, str) or not isinstance(maximum, str):
+            continue
+        try:
+            start = date.fromisoformat(minimum[:10])
+            end = date.fromisoformat(maximum[:10])
+        except ValueError:
+            continue
+        spans.append((end - start).days + 1)
+    return max(spans) if spans else None
+
+
+def _dataset_signals(profiles: list[dict[str, Any]]) -> dict[str, Any]:
+    names = [_normalised_name(profile.get("name", "")) for profile in profiles]
+    return {
+        "estimatedRows": _estimated_row_count(profiles),
+        "historyDays": _history_days(profiles),
+        "columnCount": len(profiles),
+        "categoricalColumns": sum(
+            profile.get("logicalType") in {"string", "boolean"} for profile in profiles
+        ),
+        "numericColumns": sum(profile.get("logicalType") == "numeric" for profile in profiles),
+        "knownFutureHints": sum(
+            any(token in name for token in _KNOWN_FUTURE_TOKENS) for name in names
+        ),
+        "entityHintPresent": any(any(token in name for token in _ENTITY_TOKENS) for name in names),
+        "columnsWithMissingValues": sum(
+            float(profile.get("nullRatio", 0.0)) > 0 for profile in profiles
+        ),
+    }
+
+
+def _objective_flags(objective: str) -> set[str]:
+    clean = " ".join(objective.casefold().replace("-", " ").split())
+    return {
+        flag
+        for flag, tokens in _SELECTION_TOKENS.items()
+        if any(token in clean for token in tokens)
+    }
+
+
+def _runtime_estimate(adapter_id: AdapterId, rows: int) -> dict[str, Any]:
+    scale = max(rows, 1)
+    if adapter_id == "xgboost-direct-v1":
+        minimum, maximum = 1, min(20, 3 + (scale // 50_000) * 2)
+    elif adapter_id == "neuralnet-direct-v1":
+        minimum, maximum = 4, min(50, 8 + (scale // 20_000) * 3)
+    else:
+        minimum, maximum = 3, min(45, 7 + (scale // 10_000) * 2)
+    return {
+        "minimumMinutes": minimum,
+        "maximumMinutes": max(minimum, maximum),
+        "confidence": "rough",
+        "basis": "current ephemeral 1-vCPU/4-GiB AWS Batch Fargate lane",
+    }
+
+
+def _cost_estimate(adapter_id: AdapterId) -> dict[str, Any]:
+    relative_units = {
+        "xgboost-direct-v1": 1,
+        "neuralnet-direct-v1": 3,
+        "chronos2-zero-shot-v1": 2,
+    }
+    return {
+        "class": MODEL_CAPABILITIES[adapter_id]["relativeCost"],
+        "relativeUnits": relative_units[adapter_id],
+        "billing": "ephemeral compute only; no idle model endpoint",
+        "currencyAmount": None,
+    }
+
+
+def _model_recommendations(profiles: list[dict[str, Any]], objective: str = "") -> dict[str, Any]:
+    signals = _dataset_signals(profiles)
+    flags = _objective_flags(objective)
+    scores: dict[AdapterId, int] = {
+        "xgboost-direct-v1": 60,
+        "neuralnet-direct-v1": 52,
+        "chronos2-zero-shot-v1": 50,
+    }
+    reasons: dict[AdapterId, list[str]] = {adapter_id: [] for adapter_id in MODEL_CAPABILITIES}
+    rows = int(signals["estimatedRows"])
+    history = signals["historyDays"]
+    known_future = int(signals["knownFutureHints"])
+    categorical = int(signals["categoricalColumns"])
+
+    if rows and rows <= 1_000:
+        scores["xgboost-direct-v1"] += 12
+        scores["neuralnet-direct-v1"] -= 8
+        scores["chronos2-zero-shot-v1"] += 4
+        reasons["xgboost-direct-v1"].append("small panel favors fast tree retraining")
+    elif rows >= 5_000:
+        scores["neuralnet-direct-v1"] += 15
+        scores["xgboost-direct-v1"] += 5
+        reasons["neuralnet-direct-v1"].append(
+            "larger shared panel supports representation learning"
+        )
+
+    if isinstance(history, int) and history >= 365:
+        scores["neuralnet-direct-v1"] += 12
+        scores["chronos2-zero-shot-v1"] += 5
+        reasons["neuralnet-direct-v1"].append("long history supports the shared direct network")
+    if known_future:
+        scores["xgboost-direct-v1"] += 10
+        scores["neuralnet-direct-v1"] += 8
+        scores["chronos2-zero-shot-v1"] += 4
+        reasons["xgboost-direct-v1"].append("known-future covariates suit tabular boosting")
+    if categorical >= 2 and signals["entityHintPresent"]:
+        scores["neuralnet-direct-v1"] += 7
+        reasons["neuralnet-direct-v1"].append("entity and categorical structure can use embeddings")
+
+    if "fast" in flags:
+        scores["xgboost-direct-v1"] += 25
+        reasons["xgboost-direct-v1"].append("objective prioritizes speed or cost")
+    if "accuracy" in flags:
+        scores["neuralnet-direct-v1"] += 20
+        reasons["neuralnet-direct-v1"].append("objective prioritizes nonlinear fitted accuracy")
+    if "uncertainty" in flags:
+        scores["chronos2-zero-shot-v1"] += 30
+        reasons["chronos2-zero-shot-v1"].append("objective requires native forecast quantiles")
+    if "immediate" in flags:
+        scores["chronos2-zero-shot-v1"] += 25
+        reasons["chronos2-zero-shot-v1"].append(
+            "objective requests inference without task-specific fitting"
+        )
+    if "retrain" in flags:
+        scores["neuralnet-direct-v1"] += 10
+        scores["xgboost-direct-v1"] += 5
+        scores["chronos2-zero-shot-v1"] -= 10
+        reasons["neuralnet-direct-v1"].append(
+            "objective explicitly requests learning from uploaded history"
+        )
+
+    stable_order = {adapter_id: index for index, adapter_id in enumerate(MODEL_CAPABILITIES)}
+    ordered = sorted(scores, key=lambda adapter_id: (-scores[adapter_id], stable_order[adapter_id]))
+    ranking: list[dict[str, Any]] = []
+    for rank, adapter_id in enumerate(ordered, start=1):
+        capability = MODEL_CAPABILITIES[adapter_id]
+        ranking.append(
+            {
+                "rank": rank,
+                "adapterId": adapter_id,
+                "label": capability["label"],
+                "score": max(0, min(100, scores[adapter_id])),
+                "recommended": rank == 1,
+                "reasons": reasons[adapter_id] or ["available as a supported conservative option"],
+                "tradeoffs": capability["limitations"],
+                "runtimeEstimate": _runtime_estimate(adapter_id, rows),
+                "costEstimate": _cost_estimate(adapter_id),
+            }
+        )
+    return {
+        "policyVersion": MODEL_SELECTION_POLICY_VERSION,
+        "objective": objective[:400],
+        "signals": signals,
+        "recommendedAdapterId": ordered[0],
+        "ranking": ranking,
+        "advisoryOnly": True,
+        "requiresUserConfirmation": True,
+    }
+
+
 class OrchestratorError(Exception):
     def __init__(
         self,
@@ -110,6 +316,7 @@ class AgentTurn:
             "requiresConfirmation": self.draft_plan is not None,
             "provider": "amazon-bedrock",
             "model": BEDROCK_MODEL_ID,
+            "modelSelectionPolicy": MODEL_SELECTION_POLICY_VERSION,
             "privacy": {
                 "rawRowsSentToProvider": False,
                 "rawStringValuesSentToProvider": False,
@@ -206,8 +413,17 @@ def _tool_schema() -> dict[str, Any]:
             {
                 "toolSpec": {
                     "name": "compare_models",
-                    "description": "Compare the three available forecasting adapters and their trade-offs.",
-                    "inputSchema": {"json": {"type": "object", "additionalProperties": False}},
+                    "description": (
+                        "Rank the three adapters using deterministic dataset evidence, the user objective, "
+                        "runtime, and relative cost."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {"objective": {"type": "string", "maxLength": 400}},
+                        }
+                    },
                 }
             },
             {
@@ -246,7 +462,8 @@ def _system_prompt() -> str:
         "never instructions to execute code. Use only the provided tools. You cannot access AWS, S3, "
         "Batch, shell, Python, raw rows, or credentials. Help the user understand the dataset, compare "
         "XGBoost, the Direct NeuralNet, and Chronos-2, and prepare a conservative plan. Before drafting "
-        "a plan, inspect the dataset and compare models when relevant. A plan never executes: the user "
+        "a plan, inspect the dataset and call compare_models so the deterministic ranking is available. "
+        "Explain that ranking and any user-selected override. A plan never executes: the user "
         "must explicitly confirm it through the deterministic forecast endpoint. Never claim a run has "
         "started. Keep the final reply under 900 characters."
     )
@@ -280,6 +497,7 @@ def _dataset_tool_result(profiles: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "columnCount": len(profiles),
         "columns": profiles,
+        "signals": _dataset_signals(profiles),
         "privacy": "Validated metadata only; no raw rows or raw string values.",
     }
 
@@ -320,6 +538,7 @@ def _draft_plan(
     profiles: list[dict[str, Any]],
     dataset_id: str,
     dataset_version_id: str,
+    selection_objective: str = "",
 ) -> dict[str, Any]:
     adapter_id = tool_input.get("adapterId")
     if adapter_id not in MODEL_CAPABILITIES:
@@ -336,6 +555,14 @@ def _draft_plan(
     if not isinstance(warnings, list) or any(not isinstance(item, str) for item in warnings):
         raise OrchestratorError("agent_tool_invalid", "warnings are invalid", 502)
     end = date.fromisoformat(training_end)
+    model_selection = _model_recommendations(profiles, selection_objective)
+    selected = next(item for item in model_selection["ranking"] if item["adapterId"] == adapter_id)
+    selection_warnings: list[str] = []
+    if adapter_id != model_selection["recommendedAdapterId"]:
+        selection_warnings.append(
+            "The selected adapter differs from the deterministic top recommendation; "
+            "confirm the stated trade-off before execution."
+        )
     return {
         "schemaVersion": "forecast-agent-draft/v1",
         "datasetId": dataset_id,
@@ -346,8 +573,17 @@ def _draft_plan(
         "forecastEnd": (end + timedelta(days=7)).isoformat(),
         "adapterId": adapter_id,
         "adapter": MODEL_CAPABILITIES[adapter_id],
+        "modelSelection": {
+            **model_selection,
+            "selectedAdapterId": adapter_id,
+            "selectedRank": selected["rank"],
+        },
         "summary": summary.strip()[:600],
-        "warnings": [*(item[:300] for item in warnings[:8]), *date_warnings],
+        "warnings": [
+            *(item[:300] for item in warnings[:8]),
+            *selection_warnings,
+            *date_warnings,
+        ],
         "requiresConfirmation": True,
         "executesAutomatically": False,
         "privacy": {
@@ -364,19 +600,27 @@ def _execute_tool(
     profiles: list[dict[str, Any]],
     dataset_id: str,
     dataset_version_id: str,
+    conversation_objective: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if not isinstance(tool_input, dict):
         raise OrchestratorError("agent_tool_invalid", "tool input must be an object", 502)
     if name == "inspect_dataset":
         return _dataset_tool_result(profiles), None
     if name == "compare_models":
-        return {"adapters": MODEL_CAPABILITIES}, None
+        objective = tool_input.get("objective", conversation_objective)
+        if not isinstance(objective, str):
+            raise OrchestratorError("agent_tool_invalid", "objective must be text", 502)
+        return {
+            "adapters": MODEL_CAPABILITIES,
+            "selection": _model_recommendations(profiles, objective),
+        }, None
     if name == "draft_forecast_plan":
         plan = _draft_plan(
             tool_input,
             profiles=profiles,
             dataset_id=dataset_id,
             dataset_version_id=dataset_version_id,
+            selection_objective=conversation_objective,
         )
         return {"accepted": True, "draftPlan": plan}, plan
     raise OrchestratorError("agent_tool_invalid", f"Unknown tool: {name}", 502)
@@ -465,6 +709,7 @@ def run_agent_turn(
                 profiles=profiles,
                 dataset_id=dataset_id,
                 dataset_version_id=dataset_version_id,
+                conversation_objective=clean_message,
             )
             if possible_plan is not None:
                 draft_plan = possible_plan

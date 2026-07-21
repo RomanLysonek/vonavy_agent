@@ -276,6 +276,145 @@ async function waitForForecast(run, output, button) {
   output.textContent = "Forecast is still running. Refresh to check it again.";
   button.disabled = false;
 }
+
+let agentContext = null;
+
+function appendAgentMessage(role, text) {
+  const item = document.createElement("article");
+  item.className = `agent-message ${role}`;
+  item.textContent = text;
+  $("agent-messages").append(item);
+  item.scrollIntoView({ block: "end" });
+}
+
+function renderAgentPlan(plan) {
+  const root = $("agent-plan-summary");
+  root.replaceChildren();
+  const lines = [
+    plan.summary,
+    `Model: ${plan.adapter.label}`,
+    `Target: ${plan.mapping.targetColumn}`,
+    `Timestamp: ${plan.mapping.timestampColumn}`,
+    `Entity: ${plan.mapping.entityColumn || "single series"}`,
+    `Training end: ${plan.trainingEnd}`,
+    `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}`,
+  ];
+  if (plan.warnings.length) lines.push(`Warnings: ${plan.warnings.join("; ")}`);
+  for (const line of lines) {
+    const paragraph = document.createElement("p");
+    paragraph.textContent = line;
+    root.append(paragraph);
+  }
+  $("agent-plan").classList.remove("hidden");
+}
+
+async function agenticForecastDataset(dataset, output, button) {
+  const validation = state.validationResults.get(dataset.datasetId);
+  if (!validation?.jobId) {
+    output.textContent = "Validate this dataset first so the agent can inspect its safe profile.";
+    return;
+  }
+  button.disabled = true;
+  agentContext = { dataset, output, button, validation, session: null, plan: null, running: false };
+  $("agent-title").textContent = `Plan a forecast for ${dataset.name}`;
+  $("agent-messages").replaceChildren();
+  $("agent-plan").classList.add("hidden");
+  $("agent-plan-summary").replaceChildren();
+  $("agent-status").textContent = "";
+  $("agent-input").value = "";
+  appendAgentMessage(
+    "assistant",
+    "Tell me the forecasting objective. I can inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, then prepare a plan for your confirmation.",
+  );
+  $("agent-dialog").showModal();
+  $("agent-input").focus();
+}
+
+async function sendAgentMessage(event) {
+  event.preventDefault();
+  if (!agentContext) return;
+  const input = $("agent-input");
+  const message = input.value.trim();
+  if (!message) return;
+  appendAgentMessage("user", message);
+  input.value = "";
+  input.disabled = true;
+  $("agent-send").disabled = true;
+  $("agent-status").textContent = "Opus is using bounded forecast tools…";
+  try {
+    const session = agentContext.session
+      ? await api(agentContext.session.links.messages, {
+        method: "POST",
+        body: JSON.stringify({ message }),
+      })
+      : await api(`/api/datasets/${agentContext.dataset.datasetId}/forecast-agent/sessions`, {
+        method: "POST",
+        body: JSON.stringify({
+          validationJobId: agentContext.validation.jobId,
+          message,
+        }),
+      });
+    agentContext.session = session;
+    appendAgentMessage("assistant", session.message);
+    if (session.draftPlan) {
+      agentContext.plan = session.draftPlan;
+      renderAgentPlan(session.draftPlan);
+    }
+    $("agent-status").textContent = session.draftPlan
+      ? "Review the plan or continue chatting to revise it."
+      : `Turn ${session.turnCount} of 8`;
+  } catch (error) {
+    appendAgentMessage("assistant", `I could not complete that turn: ${error.message}`);
+    $("agent-status").textContent = "Agent turn failed.";
+  } finally {
+    input.disabled = false;
+    $("agent-send").disabled = false;
+    input.focus();
+  }
+}
+
+async function confirmAgentPlan() {
+  if (!agentContext?.plan || agentContext.running) return;
+  const plan = agentContext.plan;
+  const approved = window.confirm(
+    `${plan.summary}\n\nModel: ${plan.adapter.label}\n` +
+    `Target: ${plan.mapping.targetColumn}\nTraining end: ${plan.trainingEnd}\n` +
+    `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n\n` +
+    "Only validated metadata was sent to Bedrock. Confirm this immutable plan and start the scale-to-zero workflow?",
+  );
+  if (!approved) return;
+  agentContext.running = true;
+  $("agent-confirm").disabled = true;
+  $("agent-status").textContent = `Submitting ${plan.adapter.label}…`;
+  try {
+    const run = await api(`/api/datasets/${agentContext.dataset.datasetId}/forecasts`, {
+      method: "POST",
+      body: JSON.stringify({
+        requestToken: crypto.randomUUID(),
+        adapterId: plan.adapterId,
+        trainingEnd: plan.trainingEnd,
+        mapping: plan.mapping,
+      }),
+    });
+    const { output, button } = agentContext;
+    $("agent-dialog").close();
+    output.textContent = `Submitted ${plan.adapter.label} after explicit confirmation.`;
+    await waitForForecast(run, output, button);
+    agentContext = null;
+  } catch (error) {
+    appendAgentMessage("assistant", `The confirmed workflow could not start: ${error.message}`);
+    $("agent-status").textContent = "Submission failed.";
+    $("agent-confirm").disabled = false;
+    agentContext.running = false;
+  }
+}
+
+function closeAgentDialog() {
+  if (agentContext && !agentContext.running) agentContext.button.disabled = false;
+  $("agent-dialog").close();
+  agentContext = null;
+}
+
 async function forecastDataset(dataset, output, button) {
   button.disabled = true;
   try {
@@ -412,7 +551,7 @@ async function listDatasets() {
       forecastButton.className = "secondary";
       forecastButton.textContent = "AI → Forecast";
       forecastButton.addEventListener("click", () => {
-        forecastDataset(dataset, validationStatus, forecastButton);
+        agenticForecastDataset(dataset, validationStatus, forecastButton);
       });
       actions.append(forecastButton, validationStatus);
     }
@@ -443,6 +582,13 @@ async function start() {
 $("login").addEventListener("click", login);
 $("logout").addEventListener("click", logout);
 $("upload-form").addEventListener("submit", upload);
+$("agent-form").addEventListener("submit", sendAgentMessage);
+$("agent-confirm").addEventListener("click", confirmAgentPlan);
+$("agent-close").addEventListener("click", closeAgentDialog);
+$("agent-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeAgentDialog();
+});
 $("refresh").addEventListener("click", () => {
   listDatasets().catch((error) => {
     $("status").textContent = error.message;

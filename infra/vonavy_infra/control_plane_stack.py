@@ -27,6 +27,9 @@ from aws_cdk import (
     aws_batch as batch,
 )
 from aws_cdk import (
+    aws_certificatemanager as acm,
+)
+from aws_cdk import (
     aws_cloudfront as cloudfront,
 )
 from aws_cdk import (
@@ -57,6 +60,12 @@ from aws_cdk import (
     aws_logs as logs,
 )
 from aws_cdk import (
+    aws_route53 as route53,
+)
+from aws_cdk import (
+    aws_route53_targets as route53_targets,
+)
+from aws_cdk import (
     aws_s3 as s3,
 )
 from aws_cdk import (
@@ -77,6 +86,9 @@ class DeploymentConfig:
     validation_job_timeout_seconds: int = 900
     validation_max_active_jobs_per_owner: int = 1
     source_revision: str = "unknown"
+    public_domain_name: str | None = None
+    public_hosted_zone_id: str | None = None
+    public_certificate_arn: str | None = None
 
     def __post_init__(self) -> None:
         normalized = self.environment_name.replace("-", "")
@@ -109,6 +121,48 @@ class DeploymentConfig:
             or any(character not in "0123456789abcdef" for character in self.source_revision)
         ):
             raise ValueError("source_revision must be 'unknown' or a lowercase 40-character SHA")
+        domain_values = (
+            self.public_domain_name,
+            self.public_hosted_zone_id,
+            self.public_certificate_arn,
+        )
+        if any(value is not None for value in domain_values) and not all(
+            value is not None for value in domain_values
+        ):
+            raise ValueError(
+                "public_domain_name, public_hosted_zone_id, and public_certificate_arn "
+                "must be configured together"
+            )
+        if self.public_domain_name is not None:
+            assert self.public_hosted_zone_id is not None
+            assert self.public_certificate_arn is not None
+            labels = self.public_domain_name.split(".")
+            if (
+                self.public_domain_name != self.public_domain_name.lower()
+                or len(self.public_domain_name) > 253
+                or len(labels) < 2
+                or any(
+                    not label
+                    or len(label) > 63
+                    or label.startswith("-")
+                    or label.endswith("-")
+                    or any(
+                        not (character.islower() or character.isdigit() or character == "-")
+                        for character in label
+                    )
+                    for label in labels
+                )
+            ):
+                raise ValueError("public_domain_name must be a lowercase DNS name")
+            if not self.public_hosted_zone_id.startswith("Z"):
+                raise ValueError("public_hosted_zone_id must be a Route 53 hosted-zone ID")
+            if (
+                not self.public_certificate_arn.startswith("arn:aws:acm:us-east-1:")
+                or ":certificate/" not in self.public_certificate_arn
+            ):
+                raise ValueError(
+                    "public_certificate_arn must identify an ACM certificate in us-east-1"
+                )
         callback = urlsplit(self.local_callback_url)
         if (
             callback.scheme != "http"
@@ -435,9 +489,33 @@ class ControlPlaneStack(Stack):
             ),
         )
 
+        certificate: acm.ICertificate | None = None
+        hosted_zone: route53.IHostedZone | None = None
+        domain_names: list[str] | None = None
+        if config.public_domain_name is not None:
+            assert config.public_hosted_zone_id is not None
+            assert config.public_certificate_arn is not None
+            certificate = acm.Certificate.from_certificate_arn(
+                self,
+                "PublicCertificate",
+                config.public_certificate_arn,
+            )
+            hosted_zone = route53.HostedZone.from_hosted_zone_attributes(
+                self,
+                "PublicHostedZone",
+                hosted_zone_id=config.public_hosted_zone_id,
+                zone_name=config.public_domain_name,
+            )
+            domain_names = [
+                config.public_domain_name,
+                f"www.{config.public_domain_name}",
+            ]
+
         distribution = cloudfront.Distribution(
             self,
             "WebDistribution",
+            certificate=certificate,
+            domain_names=domain_names,
             default_root_object="index.html",
             default_behavior=cloudfront.BehaviorOptions(
                 origin=origins.S3BucketOrigin.with_origin_access_control(web_bucket),
@@ -464,11 +542,60 @@ class ControlPlaneStack(Stack):
             minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
             price_class=cloudfront.PriceClass.PRICE_CLASS_100,
         )
-        web_url = f"https://{distribution.distribution_domain_name}/"
+        legacy_web_url = f"https://{distribution.distribution_domain_name}/"
+        public_web_urls = (
+            [
+                f"https://{config.public_domain_name}/",
+                f"https://www.{config.public_domain_name}/",
+            ]
+            if config.public_domain_name is not None
+            else []
+        )
+        callback_urls = list(
+            dict.fromkeys([*public_web_urls, legacy_web_url, config.local_callback_url])
+        )
+        allowed_origins = [url.rstrip("/") for url in callback_urls]
+        web_url = public_web_urls[0] if public_web_urls else legacy_web_url
+
+        if hosted_zone is not None:
+            route53.ARecord(
+                self,
+                "PublicApexAliasIpv4",
+                zone=hosted_zone,
+                target=route53.RecordTarget.from_alias(
+                    route53_targets.CloudFrontTarget(distribution)
+                ),
+            )
+            route53.AaaaRecord(
+                self,
+                "PublicApexAliasIpv6",
+                zone=hosted_zone,
+                target=route53.RecordTarget.from_alias(
+                    route53_targets.CloudFrontTarget(distribution)
+                ),
+            )
+            route53.ARecord(
+                self,
+                "PublicWwwAliasIpv4",
+                zone=hosted_zone,
+                record_name="www",
+                target=route53.RecordTarget.from_alias(
+                    route53_targets.CloudFrontTarget(distribution)
+                ),
+            )
+            route53.AaaaRecord(
+                self,
+                "PublicWwwAliasIpv6",
+                zone=hosted_zone,
+                record_name="www",
+                target=route53.RecordTarget.from_alias(
+                    route53_targets.CloudFrontTarget(distribution)
+                ),
+            )
 
         upload_bucket.add_cors_rule(
             allowed_methods=[s3.HttpMethods.POST],
-            allowed_origins=[web_url.rstrip("/"), config.local_origin],
+            allowed_origins=allowed_origins,
             allowed_headers=["*"],
             exposed_headers=["ETag"],
             max_age=900,
@@ -515,8 +642,8 @@ class ControlPlaneStack(Stack):
             o_auth=cognito.OAuthSettings(
                 flows=cognito.OAuthFlows(authorization_code_grant=True),
                 scopes=[cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, api_scope],
-                callback_urls=[web_url, config.local_callback_url],
-                logout_urls=[web_url, config.local_callback_url],
+                callback_urls=callback_urls,
+                logout_urls=callback_urls,
             ),
             supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
         )
@@ -742,7 +869,7 @@ class ControlPlaneStack(Stack):
             "HttpApi",
             create_default_stage=False,
             cors_preflight=apigwv2.CorsPreflightOptions(
-                allow_origins=[web_url.rstrip("/"), config.local_callback_url.rstrip("/")],
+                allow_origins=allowed_origins,
                 allow_headers=["authorization", "content-type"],
                 expose_headers=[
                     "x-vonavy-request-id",
@@ -875,6 +1002,9 @@ class ControlPlaneStack(Stack):
         )
 
         CfnOutput(self, "WebUrl", value=web_url)
+        CfnOutput(self, "LegacyWebUrl", value=legacy_web_url)
+        if config.public_domain_name is not None:
+            CfnOutput(self, "PublicDomainName", value=config.public_domain_name)
         CfnOutput(self, "ApiUrl", value=http_api.api_endpoint)
         CfnOutput(self, "UploadBucketName", value=upload_bucket.bucket_name)
         CfnOutput(self, "DataBucketName", value=data_bucket.bucket_name)

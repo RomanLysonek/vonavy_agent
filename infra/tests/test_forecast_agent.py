@@ -33,10 +33,18 @@ class FakeBedrock:
             "output": {
                 "message": {
                     "role": "assistant",
-                    "content": [{"text": json.dumps(self.mapping)}],
+                    "content": [
+                        {
+                            "toolUse": {
+                                "toolUseId": "forecast-mapping-1",
+                                "name": agent.FORECAST_MAPPING_TOOL_NAME,
+                                "input": self.mapping,
+                            }
+                        }
+                    ],
                 }
             },
-            "stopReason": "end_turn",
+            "stopReason": "tool_use",
             "usage": {"inputTokens": 300, "outputTokens": 180},
         }
 
@@ -132,17 +140,25 @@ def _bedrock_mapping() -> dict[str, Any]:
     }
 
 
-def test_provider_request_never_contains_raw_string_values_or_tools() -> None:
+def test_provider_request_uses_forced_schema_bound_tool_without_raw_values() -> None:
     profiles = agent._column_profiles(_validation_result())
     request = agent._provider_request(profiles, "forecast demand")
     serialized = json.dumps(request)
+
     assert "SECRET_RAW_VALUE" not in serialized
     assert "top_values" not in serialized
     assert request["modelId"] == "eu.anthropic.claude-opus-4-6-v1"
     assert request["inferenceConfig"] == {"maxTokens": 1200, "temperature": 0.0}
-    assert "toolConfig" not in request
     assert "outputConfig" not in request
     assert request["requestMetadata"]["application"] == "vonavy-agent"
+
+    tool_config = request["toolConfig"]
+    assert tool_config["toolChoice"] == {"tool": {"name": agent.FORECAST_MAPPING_TOOL_NAME}}
+    assert len(tool_config["tools"]) == 1
+    tool_spec = tool_config["tools"][0]["toolSpec"]
+    assert tool_spec["name"] == agent.FORECAST_MAPPING_TOOL_NAME
+    assert tool_spec["inputSchema"] == {"json": agent._output_schema()}
+    assert tool_spec["strict"] is True
 
 
 def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
@@ -154,6 +170,7 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
         objective="Focus on promotion-aware demand.",
         bedrock_client=client,
     )
+
     assert plan["agentMode"] == "bedrock"
     assert plan["provider"] == "amazon-bedrock"
     assert plan["model"] == "eu.anthropic.claude-opus-4-6-v1"
@@ -172,7 +189,95 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
     assert plan["privacy"]["rawRowsSentToProvider"] is False
     assert plan["privacy"]["awsIamAuthentication"] is True
     assert len(plan["planId"]) == 64
-    assert client.calls[0]["modelId"] == "eu.anthropic.claude-opus-4-6-v1"
+    assert len(client.calls) == 1
+    assert client.calls[0]["toolConfig"]["toolChoice"] == {
+        "tool": {"name": agent.FORECAST_MAPPING_TOOL_NAME}
+    }
+
+
+def test_response_mapping_accepts_one_required_tool_input() -> None:
+    mapping = _bedrock_mapping()
+    response = {
+        "output": {
+            "message": {
+                "content": [
+                    {"text": "Submitting the mapping."},
+                    {
+                        "toolUse": {
+                            "toolUseId": "mapping-1",
+                            "name": agent.FORECAST_MAPPING_TOOL_NAME,
+                            "input": mapping,
+                        }
+                    },
+                ]
+            }
+        }
+    }
+
+    assert agent._response_mapping(response) == mapping
+
+
+def test_response_mapping_rejects_text_only_json() -> None:
+    response = {"output": {"message": {"content": [{"text": json.dumps(_bedrock_mapping())}]}}}
+
+    try:
+        agent._response_mapping(response)
+    except agent.AgentPlanError as exc:
+        assert exc.code == "agent_provider_invalid"
+        assert exc.status == 502
+        assert "tool call" in exc.message
+    else:
+        raise AssertionError("free-form JSON text was accepted")
+
+
+def test_response_mapping_rejects_ambiguous_or_unexpected_tool_calls() -> None:
+    mapping = _bedrock_mapping()
+    duplicate = {
+        "output": {
+            "message": {
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "mapping-1",
+                            "name": agent.FORECAST_MAPPING_TOOL_NAME,
+                            "input": mapping,
+                        }
+                    },
+                    {
+                        "toolUse": {
+                            "toolUseId": "mapping-2",
+                            "name": agent.FORECAST_MAPPING_TOOL_NAME,
+                            "input": mapping,
+                        }
+                    },
+                ]
+            }
+        }
+    }
+    unexpected = {
+        "output": {
+            "message": {
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "other-1",
+                            "name": "run_forecast",
+                            "input": mapping,
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    for response in (duplicate, unexpected):
+        try:
+            agent._response_mapping(response)
+        except agent.AgentPlanError as exc:
+            assert exc.code == "agent_provider_invalid"
+            assert exc.status == 502
+        else:
+            raise AssertionError("ambiguous or unexpected tool call was accepted")
 
 
 def test_provider_cannot_reference_unknown_or_leakage_column() -> None:

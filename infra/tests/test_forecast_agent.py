@@ -203,6 +203,32 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
     }
 
 
+def test_historical_only_plan_demotes_known_future_features() -> None:
+    validation = _validation_result()
+    target = next(column for column in validation["columns"] if column["name"] == "Quantity")
+    target["null_ratio"] = 0.0
+    target["non_null_count"] = validation["row_count"]
+
+    client = FakeBedrock(_bedrock_mapping())
+    plan = agent.build_forecast_agent_plan(
+        dataset_id="00000000-0000-0000-0000-000000000001",
+        dataset_version_id="version-1",
+        validation_result=validation,
+        objective="Train the fastest safe model.",
+        bedrock_client=client,
+    )
+
+    assert plan["trainingEnd"] == "2025-03-24"
+    assert plan["forecastStart"] == "2025-03-25"
+    assert plan["forecastEnd"] == "2025-03-31"
+    assert plan["mapping"]["knownFutureNumeric"] == []
+    assert plan["mapping"]["knownFutureCategorical"] == []
+    assert {"Discount", "Campaign", "FuturePrediction"}.issubset(plan["mapping"]["excluded"])
+    assert len(plan["mapping"]["excluded"]) == len(set(plan["mapping"]["excluded"]))
+    assert any("target-null future rows" in warning for warning in plan["warnings"])
+    assert len(client.calls) == 1
+
+
 def test_response_mapping_accepts_one_required_tool_input() -> None:
     mapping = _bedrock_mapping()
     response = {

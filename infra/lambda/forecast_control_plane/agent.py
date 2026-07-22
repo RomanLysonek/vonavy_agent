@@ -668,6 +668,32 @@ def _training_end(mapping: dict[str, Any], profiles: list[dict[str, Any]]) -> tu
     return maximum.isoformat(), warnings
 
 
+def _historical_only_mapping(mapping: dict[str, Any], profiles: list[dict[str, Any]]) -> list[str]:
+    """Remove features whose forecast-date values are absent from the upload."""
+    by_name = _profile_by_name(profiles)
+    target_profile = by_name[mapping["targetColumn"]]
+    if float(target_profile.get("nullRatio", 0.0)) > 0:
+        return []
+
+    selected = [
+        *mapping["knownFutureNumeric"],
+        *mapping["knownFutureCategorical"],
+    ]
+    if not selected:
+        return []
+
+    mapping["knownFutureNumeric"] = []
+    mapping["knownFutureCategorical"] = []
+    excluded = list(mapping["excluded"])
+    excluded.extend(column for column in selected if column not in excluded)
+    mapping["excluded"] = excluded
+    return [
+        "No target-null future rows were detected. Known-future features were "
+        "excluded so this forecast can run from historical data only; upload seven "
+        "future rows with null targets to use those features."
+    ]
+
+
 def _plan_id(
     dataset_id: str,
     dataset_version_id: str,
@@ -720,8 +746,9 @@ def build_forecast_agent_plan(
     raw = _call_bedrock(profiles, clean_objective, bedrock_client)
     mapping = _validate_provider_mapping(raw, profiles)
     mode = "bedrock"
+    future_warnings = _historical_only_mapping(mapping, profiles)
     training_end, date_warnings = _training_end(mapping, profiles)
-    warnings = [*mapping.pop("warnings"), *date_warnings]
+    warnings = [*mapping.pop("warnings"), *future_warnings, *date_warnings]
     mapping_payload = {
         key: mapping[key]
         for key in (

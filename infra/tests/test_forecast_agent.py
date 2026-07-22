@@ -184,7 +184,10 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
     assert plan["model"] == "eu.anthropic.claude-opus-4-6-v1"
     assert plan["requiresConfirmation"] is True
     assert plan["mapping"]["knownFutureNumeric"] == ["Discount"]
-    assert plan["mapping"]["excluded"] == ["FuturePrediction"]
+    assert plan["mapping"]["staticNumeric"] == []
+    assert plan["mapping"]["staticCategorical"] == []
+    assert set(plan["mapping"]["excluded"]) == {"Category", "FuturePrediction"}
+    assert any("Static features were excluded" in warning for warning in plan["warnings"])
     assert plan["trainingEnd"] == "2025-03-17"
     assert plan["forecastStart"] == "2025-03-18"
     assert plan["forecastEnd"] == "2025-03-24"
@@ -201,6 +204,19 @@ def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:
     assert client.calls[0]["toolConfig"]["toolChoice"] == {
         "tool": {"name": agent.FORECAST_MAPPING_TOOL_NAME}
     }
+
+
+def test_provider_mapping_demotes_unverified_static_features_for_async_path() -> None:
+    mapping = agent._validate_provider_mapping(
+        _bedrock_mapping(), agent._column_profiles(_validation_result())
+    )
+
+    assert mapping["knownFutureNumeric"] == ["Discount"]
+    assert mapping["knownFutureCategorical"] == ["Campaign"]
+    assert mapping["staticNumeric"] == []
+    assert mapping["staticCategorical"] == []
+    assert "Category" in mapping["excluded"]
+    assert any("Static features were excluded" in warning for warning in mapping["warnings"])
 
 
 def test_historical_only_plan_demotes_known_future_features() -> None:
@@ -223,7 +239,11 @@ def test_historical_only_plan_demotes_known_future_features() -> None:
     assert plan["forecastEnd"] == "2025-03-31"
     assert plan["mapping"]["knownFutureNumeric"] == []
     assert plan["mapping"]["knownFutureCategorical"] == []
-    assert {"Discount", "Campaign", "FuturePrediction"}.issubset(plan["mapping"]["excluded"])
+    assert plan["mapping"]["staticNumeric"] == []
+    assert plan["mapping"]["staticCategorical"] == []
+    assert {"Discount", "Campaign", "Category", "FuturePrediction"}.issubset(
+        plan["mapping"]["excluded"]
+    )
     assert len(plan["mapping"]["excluded"]) == len(set(plan["mapping"]["excluded"]))
     assert any("target-null future rows" in warning for warning in plan["warnings"])
     assert len(client.calls) == 1

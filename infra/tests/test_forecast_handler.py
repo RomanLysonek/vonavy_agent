@@ -337,6 +337,7 @@ def _session_turn() -> dict[str, Any]:
 
 def test_agent_session_message_uses_optimistic_turn_lock(monkeypatch: Any) -> None:
     session_id = "00000000-0000-0000-0000-000000000003"
+    request_token = "00000000-0000-4000-8000-000000000004"
     table = AgentSessionTable()
     item = {
         "owner_sub": "owner",
@@ -347,9 +348,15 @@ def test_agent_session_message_uses_optimistic_turn_lock(monkeypatch: Any) -> No
         "messages_json": "[]",
         "draft_plan_json": "null",
         "turn_count": 1,
+        "turn_status": "succeeded",
     }
+    queued: list[tuple[str, str, str]] = []
     monkeypatch.setattr(handler, "_identity", lambda event: "owner")
-    monkeypatch.setattr(handler, "_parse_body", lambda event: {"message": "Compare models"})
+    monkeypatch.setattr(
+        handler,
+        "_parse_body",
+        lambda event: {"message": "Compare models", "requestToken": request_token},
+    )
     monkeypatch.setattr(handler, "_clients", lambda: (None, table, None, None))
     monkeypatch.setattr(handler, "_agent_session_item", lambda *args: dict(item))
     monkeypatch.setattr(
@@ -357,16 +364,28 @@ def test_agent_session_message_uses_optimistic_turn_lock(monkeypatch: Any) -> No
         "_dataset",
         lambda *args: {"object_version_id": "version-1"},
     )
-    monkeypatch.setattr(handler, "_validation_result_for_agent", lambda *args, **kwargs: {})
-    monkeypatch.setattr(handler, "_run_agent_session_turn", lambda **kwargs: _session_turn())
+    monkeypatch.setattr(
+        handler,
+        "_enqueue_agent_turn",
+        lambda owner, current_session, turn: queued.append((owner, current_session, turn)),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_run_agent_session_turn",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("POST path ran Bedrock work")),
+    )
 
     response = handler._agent_session_message({}, session_id)
 
     update = table.updates[0]
     assert "turn_count=:expected_turns" in update["ConditionExpression"]
     assert update["ExpressionAttributeValues"][":expected_turns"] == 1
-    assert response["turnCount"] == 2
-    assert response["draftPlan"]["adapterId"] == "xgboost-direct-v1"
+    assert response["turnCount"] == 1
+    assert response["draftPlan"] is None
+    assert response["requiresConfirmation"] is False
+    assert response["turn"]["status"] == "queued"
+    assert response["turn"]["pending"] is True
+    assert queued == [("owner", session_id, response["turn"]["id"])]
 
 
 def test_agent_session_concurrent_message_returns_409(monkeypatch: Any) -> None:
@@ -385,9 +404,17 @@ def test_agent_session_concurrent_message_returns_409(monkeypatch: Any) -> None:
         "messages_json": "[]",
         "draft_plan_json": "null",
         "turn_count": 1,
+        "turn_status": "succeeded",
     }
     monkeypatch.setattr(handler, "_identity", lambda event: "owner")
-    monkeypatch.setattr(handler, "_parse_body", lambda event: {"message": "Compare models"})
+    monkeypatch.setattr(
+        handler,
+        "_parse_body",
+        lambda event: {
+            "message": "Compare models",
+            "requestToken": "00000000-0000-4000-8000-000000000004",
+        },
+    )
     monkeypatch.setattr(handler, "_clients", lambda: (None, table, None, None))
     monkeypatch.setattr(handler, "_agent_session_item", lambda *args: dict(item))
     monkeypatch.setattr(
@@ -395,8 +422,11 @@ def test_agent_session_concurrent_message_returns_409(monkeypatch: Any) -> None:
         "_dataset",
         lambda *args: {"object_version_id": "version-1"},
     )
-    monkeypatch.setattr(handler, "_validation_result_for_agent", lambda *args, **kwargs: {})
-    monkeypatch.setattr(handler, "_run_agent_session_turn", lambda **kwargs: _session_turn())
+    monkeypatch.setattr(
+        handler,
+        "_enqueue_agent_turn",
+        lambda *args: (_ for _ in ()).throw(AssertionError("conflicting turn was queued")),
+    )
 
     try:
         handler._agent_session_message({}, session_id)

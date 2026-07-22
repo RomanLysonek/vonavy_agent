@@ -518,7 +518,7 @@ def test_forecast_agent_is_pinned_to_exact_bedrock_profile() -> None:
         "ForecastControlPlaneFunction",
     )
     properties = function["Properties"]
-    assert properties["Timeout"] == 45
+    assert properties["Timeout"] == 300
     environment = properties["Environment"]["Variables"]
     assert environment["BEDROCK_MODEL_ID"] == "eu.anthropic.claude-opus-4-6-v1"
     assert environment["BEDROCK_TIMEOUT_SECONDS"] == "25"

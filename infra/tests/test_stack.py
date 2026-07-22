@@ -327,7 +327,7 @@ def test_validation_compute_is_scale_to_zero_and_has_no_nat() -> None:
     assert properties["Type"] == "managed"
     resources = properties["ComputeResources"]
     assert resources["Type"] == "FARGATE"
-    assert resources["MaxvCpus"] == 1
+    assert resources["MaxvCpus"] == 8
     assert len(resources["Subnets"]) == 2
     assert len(resources["SecurityGroupIds"]) == 1
 
@@ -464,8 +464,8 @@ def test_forecast_job_reuses_queue_and_is_bounded_fargate() -> None:
     assert properties["Timeout"]["AttemptDurationSeconds"] == 3600
     assert properties["RetryStrategy"]["Attempts"] == 1
     assert "PropagateTags" not in properties
-    assert '"Type":"VCPU","Value":"1"' in serialized
-    assert '"Type":"MEMORY","Value":"4096"' in serialized
+    assert '"Type":"VCPU","Value":"8"' in serialized
+    assert '"Type":"MEMORY","Value":"16384"' in serialized
     assert '"AssignPublicIp":"ENABLED"' in serialized
     assert "VONAVY_DATA_BUCKET" in serialized
 

@@ -356,7 +356,7 @@ class ControlPlaneStack(Stack):
             vpc=validation_vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             security_groups=[validation_security_group],
-            maxv_cpus=1,
+            maxv_cpus=8,
             spot=False,
         )
         validation_job_queue = batch.JobQueue(
@@ -422,8 +422,8 @@ class ControlPlaneStack(Stack):
             self,
             "ForecastContainer",
             image=forecast_image,
-            cpu=1,
-            memory=Size.mebibytes(4096),
+            cpu=8,
+            memory=Size.mebibytes(16384),
             assign_public_ip=True,
             execution_role=forecast_execution_role,
             job_role=forecast_job_role,

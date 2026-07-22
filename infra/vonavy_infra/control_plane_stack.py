@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from aws_cdk import (
+    ArnFormat,
     Aws,
     CfnOutput,
     Duration,
@@ -13,6 +14,7 @@ from aws_cdk import (
     RemovalPolicy,
     Size,
     Stack,
+    Tags,
 )
 from aws_cdk import (
     aws_apigatewayv2 as apigwv2,
@@ -766,7 +768,7 @@ class ControlPlaneStack(Stack):
                 str(Path(__file__).parents[1] / "lambda/forecast_control_plane"),
                 exclude=["**/__pycache__/**", "**/*.pyc", "**/*.pyo"],
             ),
-            timeout=Duration.seconds(45),
+            timeout=Duration.seconds(300),
             memory_size=256,
             log_group=forecast_control_plane_logs,
             environment={
@@ -784,7 +786,27 @@ class ControlPlaneStack(Stack):
                 "AWS_REGION_NAME": self.region,
             },
         )
+        Tags.of(forecast_control_plane_function).add(
+            "vonavy-agent:async-self-invoke",
+            "true",
+        )
         metadata_table.grant_read_write_data(forecast_control_plane_function)
+        forecast_control_plane_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[
+                    self.format_arn(
+                        service="lambda",
+                        resource="function",
+                        resource_name="*",
+                        arn_format=ArnFormat.COLON_RESOURCE_NAME,
+                    )
+                ],
+                conditions={
+                    "StringEquals": {"aws:ResourceTag/vonavy-agent:async-self-invoke": "true"}
+                },
+            )
+        )
         bedrock_inference_profile_arn = (
             f"arn:{Aws.PARTITION}:bedrock:{self.region}:{self.account}:"
             "inference-profile/eu.anthropic.claude-opus-4-6-v1"

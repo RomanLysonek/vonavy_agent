@@ -15,6 +15,18 @@ from typing import Any
 
 import boto3  # type: ignore[import-untyped]
 from agent import AgentPlanError, build_forecast_agent_plan
+from agent_async import (
+    AGENT_ACTIVE_TURN_STATUSES,
+    AGENT_ASYNC_SCHEMA_VERSION,
+    AGENT_ASYNC_SOURCE,
+    AgentAsyncValueError,
+    canonical_request_token,
+    clean_agent_message,
+    invocation_payload,
+    session_id_for,
+    turn_id_for,
+    turn_view,
+)
 from boto3.dynamodb.types import TypeSerializer  # type: ignore[import-untyped]
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -57,6 +69,7 @@ _S3 = None
 _TABLE = None
 _DDB = None
 _BATCH = None
+_LAMBDA = None
 
 
 class ApiError(Exception):
@@ -1438,8 +1451,13 @@ def _agent_session_response(item: dict[str, Any]) -> dict[str, Any]:
             if isinstance(value, str):
                 message = value
                 break
+    turn = turn_view(item)
+    tool_audit = _agent_session_json(item.get("turn_tool_audit_json"), "messages_json")
+    privacy = _agent_session_json(item.get("turn_privacy_json"), "draft_plan_json")
+    if not isinstance(tool_audit, list) or (privacy is not None and not isinstance(privacy, dict)):
+        raise ApiError("agent_session_invalid", "Stored agent session is invalid", 500)
     return {
-        "schemaVersion": "forecast-agent-session/v1",
+        "schemaVersion": "forecast-agent-session/v2",
         "sessionId": item["session_id"],
         "datasetId": item["dataset_id"],
         "validationJobId": item["validation_job_id"],
@@ -1447,7 +1465,12 @@ def _agent_session_response(item: dict[str, Any]) -> dict[str, Any]:
         "message": message,
         "history": history,
         "draftPlan": draft,
-        "requiresConfirmation": draft is not None,
+        "requiresConfirmation": draft is not None and not turn["pending"],
+        "turn": turn,
+        "toolAudit": tool_audit,
+        "provider": item.get("turn_provider"),
+        "model": item.get("turn_model"),
+        "privacy": privacy or {},
         "links": {
             "self": f"/api/forecast-agent/sessions/{item['session_id']}",
             "messages": f"/api/forecast-agent/sessions/{item['session_id']}/messages",
@@ -1480,6 +1503,215 @@ def _run_agent_session_turn(
     return turn.as_dict()
 
 
+def _lambda_client() -> Any:
+    global _LAMBDA
+    if _LAMBDA is None:
+        _LAMBDA = boto3.client("lambda", region_name=AWS_REGION_NAME, config=BOTO_CONFIG)
+    return _LAMBDA
+
+
+def _agent_request(body: dict[str, Any]) -> tuple[str, str]:
+    try:
+        return clean_agent_message(body.get("message")), canonical_request_token(
+            body.get("requestToken")
+        )
+    except AgentAsyncValueError as exc:
+        raise ApiError("invalid_agent_message", str(exc), 422) from exc
+
+
+def _enqueue_agent_turn(owner: str, session_id: str, turn_id: str) -> None:
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    if not function_name:
+        raise ApiError("agent_enqueue_failed", "Agent worker identity is unavailable", 503)
+    try:
+        response = _lambda_client().invoke(
+            FunctionName=function_name,
+            InvocationType="Event",
+            Payload=invocation_payload(owner, session_id, turn_id),
+        )
+    except ClientError as exc:
+        raise ApiError("agent_enqueue_failed", "The agent turn could not be queued", 503) from exc
+    if int(response.get("StatusCode", 0)) != 202:
+        raise ApiError("agent_enqueue_failed", "The agent turn could not be queued", 503)
+
+
+def _store_agent_turn_failure(
+    table: Any,
+    *,
+    owner: str,
+    session_id: str,
+    turn_id: str,
+    code: str,
+    message: str,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    try:
+        table.update_item(
+            Key=_agent_session_key(owner, session_id),
+            UpdateExpression=(
+                "SET #turn_status=:failed, turn_error_code=:code, "
+                "turn_error_message=:message, turn_completed_at=:now, updated_at=:now "
+                "REMOVE turn_message, turn_started_at"
+            ),
+            ConditionExpression=("owner_sub=:owner AND session_id=:session AND turn_id=:turn"),
+            ExpressionAttributeNames={"#turn_status": "turn_status"},
+            ExpressionAttributeValues={
+                ":failed": "failed",
+                ":code": code[:96],
+                ":message": message[:500],
+                ":now": now,
+                ":owner": owner,
+                ":session": session_id,
+                ":turn": turn_id,
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            LOGGER.exception("Could not persist the asynchronous agent-turn failure")
+
+
+def _agent_turn_worker(event: dict[str, Any]) -> None:
+    owner = event.get("owner")
+    session_id = event.get("sessionId")
+    turn_id = event.get("turnId")
+    if (
+        event.get("schemaVersion") != AGENT_ASYNC_SCHEMA_VERSION
+        or event.get("source") != AGENT_ASYNC_SOURCE
+        or not isinstance(owner, str)
+        or not OWNER_PATTERN.fullmatch(owner)
+    ):
+        LOGGER.warning("Rejected an invalid asynchronous agent-turn event")
+        return
+    try:
+        session_id = _canonical_uuid(
+            session_id,
+            code="agent_session_not_found",
+            message="Agent session does not exist",
+            status=404,
+        )
+        turn_id = _canonical_uuid(
+            turn_id,
+            code="agent_turn_not_found",
+            message="Agent turn does not exist",
+            status=404,
+        )
+    except ApiError:
+        LOGGER.warning("Rejected an invalid asynchronous agent-turn identity")
+        return
+
+    s3, table, _, _ = _clients()
+    try:
+        item = _agent_session_item(table, owner, session_id)
+    except ApiError:
+        return
+    if item.get("turn_id") != turn_id or item.get("turn_status") != "queued":
+        return
+
+    started = datetime.now(UTC).isoformat()
+    try:
+        table.update_item(
+            Key=_agent_session_key(owner, session_id),
+            UpdateExpression=(
+                "SET #turn_status=:processing, turn_started_at=:started, updated_at=:started"
+            ),
+            ConditionExpression=(
+                "owner_sub=:owner AND session_id=:session AND turn_id=:turn "
+                "AND #turn_status=:queued"
+            ),
+            ExpressionAttributeNames={"#turn_status": "turn_status"},
+            ExpressionAttributeValues={
+                ":processing": "processing",
+                ":started": started,
+                ":owner": owner,
+                ":session": session_id,
+                ":turn": turn_id,
+                ":queued": "queued",
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return
+        LOGGER.exception("Could not claim the asynchronous agent turn")
+        return
+
+    try:
+        dataset_id = str(item["dataset_id"])
+        dataset = _dataset(table, owner, dataset_id)
+        if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
+            raise ApiError("agent_session_stale", "The dataset version changed", 409)
+        validation_result = _validation_result_for_agent(
+            s3,
+            table,
+            owner=owner,
+            dataset=dataset,
+            dataset_id=dataset_id,
+            validation_job_id=str(item["validation_job_id"]),
+        )
+        history = _agent_session_json(item.get("messages_json"), "messages_json")
+        turn = _run_agent_session_turn(
+            table=table,
+            owner=owner,
+            dataset=dataset,
+            dataset_id=dataset_id,
+            validation_result=validation_result,
+            message=item.get("turn_message"),
+            history=history,
+        )
+        turns = int(item.get("turn_count", 0))
+        now = datetime.now(UTC).isoformat()
+        expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
+        table.update_item(
+            Key=_agent_session_key(owner, session_id),
+            UpdateExpression=(
+                "SET messages_json=:messages, draft_plan_json=:draft, turn_count=:turns, "
+                "#turn_status=:succeeded, turn_completed_at=:now, updated_at=:now, "
+                "expires_at=:expires, turn_tool_audit_json=:audit, "
+                "turn_provider=:provider, turn_model=:model, turn_privacy_json=:privacy "
+                "REMOVE turn_message, turn_error_code, turn_error_message"
+            ),
+            ConditionExpression=(
+                "owner_sub=:owner AND session_id=:session AND turn_id=:turn "
+                "AND #turn_status=:processing"
+            ),
+            ExpressionAttributeNames={"#turn_status": "turn_status"},
+            ExpressionAttributeValues={
+                ":messages": json.dumps(turn["history"], separators=(",", ":")),
+                ":draft": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
+                ":turns": turns + 1,
+                ":succeeded": "succeeded",
+                ":now": now,
+                ":expires": expires,
+                ":audit": json.dumps(turn["toolAudit"], separators=(",", ":")),
+                ":provider": turn["provider"],
+                ":model": turn["model"],
+                ":privacy": json.dumps(turn["privacy"], separators=(",", ":")),
+                ":owner": owner,
+                ":session": session_id,
+                ":turn": turn_id,
+                ":processing": "processing",
+            },
+        )
+    except ApiError as exc:
+        _store_agent_turn_failure(
+            table,
+            owner=owner,
+            session_id=session_id,
+            turn_id=turn_id,
+            code=exc.code,
+            message=exc.message,
+        )
+    except Exception:
+        LOGGER.exception("Asynchronous agent turn failed")
+        _store_agent_turn_failure(
+            table,
+            owner=owner,
+            session_id=session_id,
+            turn_id=turn_id,
+            code="agent_turn_failed",
+            message="The agent turn could not be completed.",
+        )
+
+
 def _agent_session_create(event: dict[str, Any], dataset_id: str) -> dict[str, Any]:
     owner = _identity(event)
     dataset_id = _canonical_uuid(
@@ -1495,9 +1727,10 @@ def _agent_session_create(event: dict[str, Any], dataset_id: str) -> dict[str, A
         message="Validation job does not exist",
         status=404,
     )
+    message, request_token = _agent_request(body)
     s3, table, _, _ = _clients()
     dataset = _dataset(table, owner, dataset_id)
-    validation_result = _validation_result_for_agent(
+    _validation_result_for_agent(
         s3,
         table,
         owner=owner,
@@ -1505,16 +1738,8 @@ def _agent_session_create(event: dict[str, Any], dataset_id: str) -> dict[str, A
         dataset_id=dataset_id,
         validation_job_id=validation_job_id,
     )
-    turn = _run_agent_session_turn(
-        table=table,
-        owner=owner,
-        dataset=dataset,
-        dataset_id=dataset_id,
-        validation_result=validation_result,
-        message=body.get("message"),
-        history=[],
-    )
-    session_id = str(uuid.uuid4())
+    session_id = session_id_for(owner, dataset_id, request_token)
+    turn_id = turn_id_for(session_id, request_token)
     now = datetime.now(UTC).isoformat()
     expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
     item = {
@@ -1524,27 +1749,43 @@ def _agent_session_create(event: dict[str, Any], dataset_id: str) -> dict[str, A
         "dataset_id": dataset_id,
         "dataset_version_id": str(dataset["object_version_id"]),
         "validation_job_id": validation_job_id,
-        "messages_json": json.dumps(turn["history"], separators=(",", ":")),
-        "draft_plan_json": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
-        "turn_count": 1,
+        "messages_json": "[]",
+        "draft_plan_json": "null",
+        "turn_count": 0,
+        "turn_id": turn_id,
+        "turn_status": "queued",
+        "turn_message": message,
+        "turn_request_token": request_token,
+        "turn_submitted_at": now,
         "created_at": now,
         "updated_at": now,
         "expires_at": expires,
     }
-    table.put_item(
-        Item=item,
-        ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
-    )
-    response = _agent_session_response(item)
-    response.update(
-        {
-            "toolAudit": turn["toolAudit"],
-            "provider": turn["provider"],
-            "model": turn["model"],
-            "privacy": turn["privacy"],
-        }
-    )
-    return response
+    try:
+        table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        existing = _agent_session_item(table, owner, session_id)
+        if existing.get("turn_request_token") == request_token:
+            return _agent_session_response(existing)
+        raise ApiError("agent_session_conflict", "The agent session already exists", 409) from exc
+    try:
+        _enqueue_agent_turn(owner, session_id, turn_id)
+    except ApiError as exc:
+        _store_agent_turn_failure(
+            table,
+            owner=owner,
+            session_id=session_id,
+            turn_id=turn_id,
+            code=exc.code,
+            message=exc.message,
+        )
+        raise
+    return _agent_session_response(item)
 
 
 def _agent_session_message(event: dict[str, Any], session_id: str) -> dict[str, Any]:
@@ -1556,8 +1797,13 @@ def _agent_session_message(event: dict[str, Any], session_id: str) -> dict[str, 
         status=404,
     )
     body = _parse_body(event)
-    s3, table, _, _ = _clients()
+    message, request_token = _agent_request(body)
+    _, table, _, _ = _clients()
     item = _agent_session_item(table, owner, session_id)
+    if item.get("turn_request_token") == request_token:
+        return _agent_session_response(item)
+    if item.get("turn_status") in AGENT_ACTIVE_TURN_STATUSES:
+        raise ApiError("agent_turn_in_progress", "Wait for the current agent turn to finish", 409)
     turns = int(item.get("turn_count", 0))
     if turns >= AGENT_SESSION_MAX_TURNS:
         raise ApiError(
@@ -1569,75 +1815,91 @@ def _agent_session_message(event: dict[str, Any], session_id: str) -> dict[str, 
     dataset = _dataset(table, owner, dataset_id)
     if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
         raise ApiError("agent_session_stale", "The dataset version changed", 409)
-    validation_job_id = str(item["validation_job_id"])
-    validation_result = _validation_result_for_agent(
-        s3,
-        table,
-        owner=owner,
-        dataset=dataset,
-        dataset_id=dataset_id,
-        validation_job_id=validation_job_id,
-    )
-    history = _agent_session_json(item.get("messages_json"), "messages_json")
-    turn = _run_agent_session_turn(
-        table=table,
-        owner=owner,
-        dataset=dataset,
-        dataset_id=dataset_id,
-        validation_result=validation_result,
-        message=body.get("message"),
-        history=history,
-    )
+
+    turn_id = turn_id_for(session_id, request_token)
     now = datetime.now(UTC).isoformat()
     expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
     try:
         table.update_item(
             Key=_agent_session_key(owner, session_id),
             UpdateExpression=(
-                "SET messages_json=:messages, draft_plan_json=:draft, "
-                "turn_count=:turns, updated_at=:now, expires_at=:expires"
+                "SET #turn_status=:queued, turn_id=:turn, turn_message=:message, "
+                "turn_request_token=:token, turn_submitted_at=:now, updated_at=:now, "
+                "expires_at=:expires, draft_plan_json=:draft "
+                "REMOVE turn_started_at, turn_completed_at, turn_error_code, "
+                "turn_error_message, turn_tool_audit_json, turn_provider, turn_model, "
+                "turn_privacy_json"
             ),
             ConditionExpression=(
-                "owner_sub=:owner AND session_id=:session AND turn_count=:expected_turns"
+                "owner_sub=:owner AND session_id=:session AND turn_count=:expected_turns "
+                "AND (attribute_not_exists(#turn_status) OR #turn_status=:idle "
+                "OR #turn_status=:succeeded OR #turn_status=:failed)"
             ),
+            ExpressionAttributeNames={"#turn_status": "turn_status"},
             ExpressionAttributeValues={
-                ":messages": json.dumps(turn["history"], separators=(",", ":")),
-                ":draft": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
-                ":turns": turns + 1,
+                ":queued": "queued",
+                ":turn": turn_id,
+                ":message": message,
+                ":token": request_token,
                 ":now": now,
                 ":expires": expires,
+                ":draft": "null",
                 ":owner": owner,
                 ":session": session_id,
                 ":expected_turns": turns,
+                ":idle": "idle",
+                ":succeeded": "succeeded",
+                ":failed": "failed",
             },
         )
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise ApiError(
-                "agent_session_conflict",
-                "The agent session changed; reload it before sending another message",
-                409,
-            ) from exc
-        raise
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        current = _agent_session_item(table, owner, session_id)
+        if current.get("turn_request_token") == request_token:
+            return _agent_session_response(current)
+        raise ApiError(
+            "agent_session_conflict",
+            "The agent session changed; reload it before sending another message",
+            409,
+        ) from exc
+
     item.update(
         {
-            "messages_json": json.dumps(turn["history"], separators=(",", ":")),
-            "draft_plan_json": json.dumps(turn.get("draftPlan"), separators=(",", ":")),
-            "turn_count": turns + 1,
+            "turn_status": "queued",
+            "turn_id": turn_id,
+            "turn_message": message,
+            "turn_request_token": request_token,
+            "turn_submitted_at": now,
             "updated_at": now,
             "expires_at": expires,
+            "draft_plan_json": "null",
         }
     )
-    response = _agent_session_response(item)
-    response.update(
-        {
-            "toolAudit": turn["toolAudit"],
-            "provider": turn["provider"],
-            "model": turn["model"],
-            "privacy": turn["privacy"],
-        }
-    )
-    return response
+    for field in (
+        "turn_started_at",
+        "turn_completed_at",
+        "turn_error_code",
+        "turn_error_message",
+        "turn_tool_audit_json",
+        "turn_provider",
+        "turn_model",
+        "turn_privacy_json",
+    ):
+        item.pop(field, None)
+    try:
+        _enqueue_agent_turn(owner, session_id, turn_id)
+    except ApiError as exc:
+        _store_agent_turn_failure(
+            table,
+            owner=owner,
+            session_id=session_id,
+            turn_id=turn_id,
+            code=exc.code,
+            message=exc.message,
+        )
+        raise
+    return _agent_session_response(item)
 
 
 def _agent_session_get(event: dict[str, Any], session_id: str) -> dict[str, Any]:
@@ -1690,6 +1952,9 @@ def _agent_plan(event: dict[str, Any], dataset_id: str) -> dict[str, Any]:
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    if event.get("source") == AGENT_ASYNC_SOURCE:
+        _agent_turn_worker(event)
+        return {"statusCode": 202}
     request_id = getattr(context, "aws_request_id", None)
     try:
         route = event.get("routeKey")

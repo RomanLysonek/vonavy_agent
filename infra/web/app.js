@@ -421,13 +421,198 @@ async function waitForForecast(run, output, button) {
 }
 
 let agentContext = null;
+const AGENT_TURN_POLL_INTERVAL_MS = 1200;
+const AGENT_TURN_MAX_POLLS = 300;
+
+function appendInlineMarkdown(root, text) {
+  const source = String(text || "");
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^)\s]+\))/g;
+  let offset = 0;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > offset) root.append(document.createTextNode(source.slice(offset, match.index)));
+    const token = match[0];
+    if (token.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      root.append(code);
+    } else if (token.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = token.slice(2, -2);
+      root.append(strong);
+    } else if (token.startsWith("*")) {
+      const emphasis = document.createElement("em");
+      emphasis.textContent = token.slice(1, -1);
+      root.append(emphasis);
+    } else {
+      const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      if (!parts) {
+        root.append(document.createTextNode(token));
+      } else {
+        let safe = null;
+        try {
+          const target = new URL(parts[2], location.origin);
+          if (target.protocol === "https:" || target.origin === location.origin) safe = target;
+        } catch {
+          safe = null;
+        }
+        if (!safe) {
+          root.append(document.createTextNode(parts[1]));
+        } else {
+          const link = document.createElement("a");
+          link.textContent = parts[1];
+          link.href = safe.href;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          root.append(link);
+        }
+      }
+    }
+    offset = match.index + token.length;
+  }
+  if (offset < source.length) root.append(document.createTextNode(source.slice(offset)));
+}
+
+function markdownCells(line) {
+  return line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
+}
+
+function renderSafeMarkdown(root, markdown) {
+  root.replaceChildren();
+  const lines = String(markdown || "").replaceAll("\r\n", "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    if (line.trim().startsWith("```")) {
+      const language = line.trim().slice(3).trim();
+      const values = [];
+      index += 1;
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        values.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (language) code.dataset.language = language.slice(0, 32);
+      code.textContent = values.join("\n");
+      pre.append(code);
+      root.append(pre);
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const title = document.createElement(`h${heading[1].length}`);
+      appendInlineMarkdown(title, heading[2]);
+      root.append(title);
+      index += 1;
+      continue;
+    }
+    if (
+      line.includes("|") &&
+      index + 1 < lines.length &&
+      /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1])
+    ) {
+      const headers = markdownCells(line);
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      for (const value of headers) {
+        const cell = document.createElement("th");
+        appendInlineMarkdown(cell, value);
+        headRow.append(cell);
+      }
+      head.append(headRow);
+      table.append(head);
+      const body = document.createElement("tbody");
+      index += 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        const row = document.createElement("tr");
+        for (const value of markdownCells(lines[index]).slice(0, headers.length)) {
+          const cell = document.createElement("td");
+          appendInlineMarkdown(cell, value);
+          row.append(cell);
+        }
+        body.append(row);
+        index += 1;
+      }
+      table.append(body);
+      const scroller = document.createElement("div");
+      scroller.className = "agent-markdown-table";
+      scroller.append(table);
+      root.append(scroller);
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      const list = document.createElement(unordered ? "ul" : "ol");
+      const matcher = unordered ? /^\s*[-*+]\s+(.+)$/ : /^\s*\d+[.)]\s+(.+)$/;
+      while (index < lines.length) {
+        const itemMatch = lines[index].match(matcher);
+        if (!itemMatch) break;
+        const item = document.createElement("li");
+        appendInlineMarkdown(item, itemMatch[1]);
+        list.append(item);
+        index += 1;
+      }
+      root.append(list);
+      continue;
+    }
+    if (line.startsWith("> ")) {
+      const quote = document.createElement("blockquote");
+      const values = [];
+      while (index < lines.length && lines[index].startsWith("> ")) {
+        values.push(lines[index].slice(2));
+        index += 1;
+      }
+      appendInlineMarkdown(quote, values.join(" "));
+      root.append(quote);
+      continue;
+    }
+    const paragraphLines = [line.trim()];
+    index += 1;
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^(#{1,6})\s+/.test(lines[index]) &&
+      !/^\s*([-*+]\s+|\d+[.)]\s+|>\s+)/.test(lines[index]) &&
+      !lines[index].trim().startsWith("```") &&
+      !(lines[index].includes("|") && index + 1 < lines.length && /-{3,}/.test(lines[index + 1]))
+    ) {
+      paragraphLines.push(lines[index].trim());
+      index += 1;
+    }
+    const paragraph = document.createElement("p");
+    appendInlineMarkdown(paragraph, paragraphLines.join(" "));
+    root.append(paragraph);
+  }
+}
 
 function appendAgentMessage(role, text) {
   const item = document.createElement("article");
   item.className = `agent-message ${role}`;
-  item.textContent = text;
+  if (role === "assistant") renderSafeMarkdown(item, text);
+  else item.textContent = text;
   $("agent-messages").append(item);
   item.scrollIntoView({ block: "end" });
+}
+
+function setAgentPlan(plan) {
+  if (!agentContext) return;
+  agentContext.plan = plan || null;
+  const confirm = $("agent-confirm");
+  if (!plan) {
+    $("agent-plan").classList.add("hidden");
+    $("agent-plan-summary").replaceChildren();
+    confirm.disabled = true;
+    return;
+  }
+  renderAgentPlan(plan);
+  confirm.disabled = false;
 }
 
 function renderAgentPlan(plan) {
@@ -452,32 +637,19 @@ function renderAgentPlan(plan) {
   if (preprocessing) {
     const details = document.createElement("details");
     const summary = document.createElement("summary");
-    const operations = Array.isArray(preprocessing.operations)
-      ? preprocessing.operations
-      : [];
+    const operations = Array.isArray(preprocessing.operations) ? preprocessing.operations : [];
     summary.textContent = `Preprocessing: ${operations.length} fixed operations`;
     details.append(summary);
-
     const metadata = document.createElement("p");
     const digest = preprocessing.digest?.value || "unavailable";
-    metadata.textContent =
-      `Catalogue: ${preprocessing.catalogVersion} · plan digest: ${digest.slice(0, 12)}…`;
+    metadata.textContent = `Catalogue: ${preprocessing.catalogVersion} · plan digest: ${digest.slice(0, 12)}…`;
     details.append(metadata);
-
     const review = preprocessing.review || {};
-    const findings = Array.isArray(preprocessing.findings)
-      ? preprocessing.findings
-      : [];
+    const findings = Array.isArray(preprocessing.findings) ? preprocessing.findings : [];
     const reviewLine = document.createElement("p");
-    reviewLine.textContent =
-      `Preprocessing review: ${review.status || "unavailable"} · ` +
-      `max severity: ${review.maxSeverity || "unavailable"} · ` +
-      `${findings.length} findings`;
+    reviewLine.textContent = `Preprocessing review: ${review.status || "unavailable"} · max severity: ${review.maxSeverity || "unavailable"} · ${findings.length} findings`;
     details.append(reviewLine);
-
-    const attentionFindings = findings.filter(
-      (finding) => finding.severity === "warning",
-    );
+    const attentionFindings = findings.filter((finding) => finding.severity === "warning");
     if (attentionFindings.length) {
       const findingsList = document.createElement("ul");
       for (const finding of attentionFindings) {
@@ -487,7 +659,6 @@ function renderAgentPlan(plan) {
       }
       details.append(findingsList);
     }
-
     const list = document.createElement("ol");
     for (const operation of operations) {
       const item = document.createElement("li");
@@ -507,13 +678,23 @@ async function agenticForecastDataset(dataset, output, button) {
     return;
   }
   button.disabled = true;
-  agentContext = { dataset, output, button, validation, session: null, plan: null, running: false };
+  agentContext = {
+    dataset,
+    output,
+    button,
+    validation,
+    session: null,
+    plan: null,
+    running: false,
+    pending: false,
+  };
   $("agent-title").textContent = `Plan a forecast for ${dataset.name}`;
   $("agent-messages").replaceChildren();
-  $("agent-plan").classList.add("hidden");
-  $("agent-plan-summary").replaceChildren();
   $("agent-status").textContent = "";
   $("agent-input").value = "";
+  $("agent-input").disabled = false;
+  $("agent-send").disabled = false;
+  setAgentPlan(null);
   appendAgentMessage(
     "assistant",
     "Tell me the forecasting objective. I can inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, compile a fixed safe preprocessing plan, then prepare everything for your confirmation.",
@@ -522,9 +703,22 @@ async function agenticForecastDataset(dataset, output, button) {
   $("agent-input").focus();
 }
 
+async function waitForAgentTurn(session) {
+  let current = session;
+  for (let poll = 0; poll < AGENT_TURN_MAX_POLLS; poll += 1) {
+    if (!current.turn?.pending) return current;
+    const label = current.turn.status === "queued" ? "queued" : "working";
+    $("agent-status").textContent = `Agent turn ${label}…`;
+    await sleep(AGENT_TURN_POLL_INTERVAL_MS);
+    current = await api(current.links.self);
+    if (agentContext) agentContext.session = current;
+  }
+  throw new Error("The agent turn did not finish within six minutes.");
+}
+
 async function sendAgentMessage(event) {
   event.preventDefault();
-  if (!agentContext) return;
+  if (!agentContext || agentContext.pending || agentContext.running) return;
   const input = $("agent-input");
   const message = input.value.trim();
   if (!message) return;
@@ -532,46 +726,69 @@ async function sendAgentMessage(event) {
   input.value = "";
   input.disabled = true;
   $("agent-send").disabled = true;
-  $("agent-status").textContent = "Opus is using bounded forecast tools…";
+  agentContext.pending = true;
+  setAgentPlan(null);
+  $("agent-status").textContent = "Queueing the agent turn…";
   try {
-    const session = agentContext.session
+    const requestToken = crypto.randomUUID();
+    const queued = agentContext.session
       ? await api(agentContext.session.links.messages, {
         method: "POST",
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, requestToken }),
       })
       : await api(`/api/datasets/${agentContext.dataset.datasetId}/forecast-agent/sessions`, {
         method: "POST",
         body: JSON.stringify({
           validationJobId: agentContext.validation.jobId,
           message,
+          requestToken,
         }),
       });
+    agentContext.session = queued;
+    const session = await waitForAgentTurn(queued);
     agentContext.session = session;
-    appendAgentMessage("assistant", session.message);
-    if (session.draftPlan) {
-      agentContext.plan = session.draftPlan;
-      renderAgentPlan(session.draftPlan);
+    if (session.turn?.status === "failed") {
+      const failure = session.turn.error?.message || "The agent turn could not be completed.";
+      appendAgentMessage("assistant", `I could not complete that turn: ${failure}`);
+      $("agent-status").textContent = "Agent turn failed. You can try again.";
+      return;
     }
+    if (session.message) appendAgentMessage("assistant", session.message);
+    if (session.draftPlan) setAgentPlan(session.draftPlan);
     $("agent-status").textContent = session.draftPlan
       ? "Review the plan or continue chatting to revise it."
       : `Turn ${session.turnCount} of 8`;
   } catch (error) {
     appendAgentMessage("assistant", `I could not complete that turn: ${error.message}`);
-    $("agent-status").textContent = "Agent turn failed.";
+    $("agent-status").textContent = "Agent turn failed. You can try again.";
   } finally {
-    input.disabled = false;
-    $("agent-send").disabled = false;
-    input.focus();
+    if (agentContext) {
+      agentContext.pending = false;
+      input.disabled = false;
+      $("agent-send").disabled = false;
+      input.focus();
+    }
   }
 }
 
 async function confirmAgentPlan() {
-  if (!agentContext?.plan || agentContext.running) return;
+  if (!agentContext) return;
+  if (agentContext.pending) {
+    $("agent-status").textContent = "Wait for the current agent turn to finish.";
+    return;
+  }
+  if (agentContext.running) {
+    $("agent-status").textContent = "The confirmed forecast is already being submitted.";
+    return;
+  }
+  if (!agentContext.plan) {
+    $("agent-status").textContent = "Ask the agent to prepare a confirmable plan first.";
+    appendAgentMessage("assistant", "A confirmable plan has not been created yet.");
+    return;
+  }
   const plan = agentContext.plan;
   const preprocessing = plan.preprocessingPlan;
-  const operationCount = Array.isArray(preprocessing?.operations)
-    ? preprocessing.operations.length
-    : 0;
+  const operationCount = Array.isArray(preprocessing?.operations) ? preprocessing.operations.length : 0;
   const preprocessingDigest = preprocessing?.digest?.value || "unavailable";
   const preprocessingReview = preprocessing?.review?.status || "unavailable";
   const attentionCount = Array.isArray(preprocessing?.review?.attentionFindingIds)

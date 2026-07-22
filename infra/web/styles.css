@@ -55,3 +55,28 @@ pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
 .agent-form textarea:focus { outline: 2px solid #60a5fa; outline-offset: 2px; }
 .agent-actions { display: flex; align-items: center; gap: 12px; }
 @media (max-width: 620px) { .agent-heading { flex-direction: column; } .agent-message { max-width: 96%; } }
+
+.agent-message.assistant { white-space: normal; overflow-x: auto; }
+.agent-message.assistant > :first-child { margin-top: 0; }
+.agent-message.assistant > :last-child { margin-bottom: 0; }
+.agent-message.assistant h1,
+.agent-message.assistant h2,
+.agent-message.assistant h3,
+.agent-message.assistant h4,
+.agent-message.assistant h5,
+.agent-message.assistant h6 { margin: .7em 0 .35em; color: #f8fafc; line-height: 1.25; }
+.agent-message.assistant p,
+.agent-message.assistant ul,
+.agent-message.assistant ol,
+.agent-message.assistant blockquote { margin: .55em 0; }
+.agent-message.assistant code { padding: .12em .35em; border-radius: 5px; background: #09090b; color: #bfdbfe; }
+.agent-message.assistant pre { overflow-x: auto; margin: .7em 0; padding: 12px; border: 1px solid #3f3f46; border-radius: 8px; background: #09090b; }
+.agent-message.assistant pre code { padding: 0; background: transparent; }
+.agent-message.assistant blockquote { padding-left: 12px; border-left: 3px solid #60a5fa; color: #cbd5e1; }
+.agent-message.assistant a { color: #93c5fd; }
+.agent-markdown-table { max-width: 100%; overflow-x: auto; margin: .7em 0; }
+.agent-markdown-table table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.agent-markdown-table th,
+.agent-markdown-table td { padding: 8px 10px; border: 1px solid #475569; text-align: left; vertical-align: top; }
+.agent-markdown-table th { background: #172554; color: #f8fafc; }
+.agent-message.user { white-space: pre-wrap; }

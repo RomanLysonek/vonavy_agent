@@ -80,3 +80,4 @@ pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
 .agent-markdown-table td { padding: 8px 10px; border: 1px solid #475569; text-align: left; vertical-align: top; }
 .agent-markdown-table th { background: #172554; color: #f8fafc; }
 .agent-message.user { white-space: pre-wrap; }
+.agent-message.assistant { width: 100%; max-width: 100%; min-width: 0; justify-self: stretch; }

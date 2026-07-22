@@ -297,8 +297,16 @@ def _deterministic_mapping(profiles: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _output_schema() -> dict[str, Any]:
-    nullable_string = {"type": ["string", "null"]}
-    string_array = {"type": "array", "items": {"type": "string"}, "maxItems": 250}
+    # Keep the provider-facing schema within Bedrock's portable tool-use subset.
+    # Cardinality, length, confidence, and semantic limits remain enforced by
+    # _validate_provider_mapping after the single forced tool call returns.
+    nullable_string = {
+        "anyOf": [
+            {"type": "string"},
+            {"type": "null"},
+        ]
+    }
+    string_array = {"type": "array", "items": {"type": "string"}}
     return {
         "type": "object",
         "additionalProperties": False,
@@ -327,17 +335,15 @@ def _output_schema() -> dict[str, Any]:
             "staticNumeric": string_array,
             "staticCategorical": string_array,
             "excluded": string_array,
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "summary": {"type": "string", "maxLength": 600},
+            "confidence": {"type": "number"},
+            "summary": {"type": "string"},
             "preprocessingSteps": {
                 "type": "array",
-                "items": {"type": "string", "maxLength": 300},
-                "maxItems": 8,
+                "items": {"type": "string"},
             },
             "warnings": {
                 "type": "array",
-                "items": {"type": "string", "maxLength": 300},
-                "maxItems": 8,
+                "items": {"type": "string"},
             },
         },
     }
@@ -394,7 +400,6 @@ def _provider_request(profiles: list[dict[str, Any]], objective: str) -> dict[st
                             "only and cannot execute training or mutate AWS resources."
                         ),
                         "inputSchema": {"json": _output_schema()},
-                        "strict": True,
                     }
                 }
             ],

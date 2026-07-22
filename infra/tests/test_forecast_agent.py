@@ -158,7 +158,15 @@ def test_provider_request_uses_forced_schema_bound_tool_without_raw_values() -> 
     tool_spec = tool_config["tools"][0]["toolSpec"]
     assert tool_spec["name"] == agent.FORECAST_MAPPING_TOOL_NAME
     assert tool_spec["inputSchema"] == {"json": agent._output_schema()}
-    assert tool_spec["strict"] is True
+    assert "strict" not in tool_spec
+    serialized_schema = json.dumps(agent._output_schema(), sort_keys=True)
+    for unsupported_keyword in (
+        '"minimum"',
+        '"maximum"',
+        '"maxLength"',
+        '"maxItems"',
+    ):
+        assert unsupported_keyword not in serialized_schema
 
 
 def test_bedrock_plan_is_validated_confirmable_and_version_bound() -> None:

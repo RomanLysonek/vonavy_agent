@@ -352,7 +352,7 @@ class ControlPlaneStack(Stack):
         )
         validation_compute_environment = batch.FargateComputeEnvironment(
             self,
-            "ValidationComputeEnvironment",
+            "ValidationComputeEnvironment8Cpu",
             vpc=validation_vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             security_groups=[validation_security_group],

@@ -534,6 +534,47 @@ def _string_list(value: object, name: str) -> list[str]:
     return clean
 
 
+def _append_mapping_warning(mapping: dict[str, Any], warning: str) -> None:
+    warnings = mapping["warnings"]
+    if warning not in warnings and len(warnings) < 8:
+        warnings.append(warning[:300])
+
+
+def _demote_mapping_roles(mapping: dict[str, Any], roles: tuple[str, ...]) -> list[str]:
+    selected = [column for role in roles for column in mapping[role]]
+    if not selected:
+        return []
+    for role in roles:
+        mapping[role] = []
+    excluded = mapping["excluded"]
+    excluded.extend(column for column in selected if column not in excluded)
+    return selected
+
+
+def _apply_execution_role_guard(mapping: dict[str, Any], profiles: list[dict[str, Any]]) -> None:
+    by_name = _profile_by_name(profiles)
+    target_profile = by_name[mapping["targetColumn"]]
+    if float(target_profile.get("nullRatio", 0.0)) <= 0:
+        known_future = _demote_mapping_roles(
+            mapping, ("knownFutureNumeric", "knownFutureCategorical")
+        )
+        if known_future:
+            _append_mapping_warning(
+                mapping,
+                "No target-null future rows were detected. Known-future features were "
+                "excluded so this forecast can run from historical data only; upload "
+                "seven future rows with null targets to use those features.",
+            )
+
+    static = _demote_mapping_roles(mapping, ("staticNumeric", "staticCategorical"))
+    if static:
+        _append_mapping_warning(
+            mapping,
+            "Static features were excluded because aggregate validation cannot prove "
+            "that they remain constant within every entity.",
+        )
+
+
 def _validate_provider_mapping(
     raw: dict[str, Any], profiles: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -615,7 +656,7 @@ def _validate_provider_mapping(
         or not 0 <= float(confidence) <= 1
     ):
         raise AgentPlanError("agent_provider_invalid", "Bedrock returned invalid confidence", 502)
-    return {
+    mapping = {
         "timestampColumn": raw["timestampColumn"],
         "entityColumn": raw.get("entityColumn"),
         "targetColumn": raw["targetColumn"],
@@ -630,6 +671,8 @@ def _validate_provider_mapping(
         "preprocessingSteps": [value[:300] for value in arrays["preprocessingSteps"][:8]],
         "warnings": [value[:300] for value in arrays["warnings"][:8]],
     }
+    _apply_execution_role_guard(mapping, profiles)
+    return mapping
 
 
 def _parse_temporal_max(profile: dict[str, Any]) -> date:

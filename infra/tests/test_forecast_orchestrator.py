@@ -227,3 +227,28 @@ def test_history_and_message_limits_are_enforced() -> None:
             message="x" * 2001,
             bedrock_client=FakeBedrock([]),
         )
+
+
+def test_model_capabilities_disclose_adapter_capacity_policies() -> None:
+    module = _load()
+
+    xgboost = module.MODEL_CAPABILITIES["xgboost-direct-v1"]["capacity"]
+    neural = module.MODEL_CAPABILITIES["neuralnet-direct-v1"]["capacity"]
+    chronos = module.MODEL_CAPABILITIES["chronos2-zero-shot-v1"]["capacity"]
+
+    assert xgboost["overflowPolicy"] == "use-full-direct-panel"
+    assert neural == {
+        "maxDirectPanelTrainRows": 300_000,
+        "overflowPolicy": "most-recent-complete-origins",
+    }
+    assert chronos == {
+        "maxInputRows": 500_000,
+        "maxEntities": 100,
+        "contextRowsPerEntity": 8_192,
+        "overflowPolicy": "reject-input-over-cap",
+    }
+
+    recommendations = module._model_recommendations(_profiles(), "train the best model")
+    by_id = {item["adapterId"]: item for item in recommendations["ranking"]}
+    assert by_id["neuralnet-direct-v1"]["capacity"] == neural
+    assert by_id["chronos2-zero-shot-v1"]["capacity"] == chronos

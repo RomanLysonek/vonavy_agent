@@ -10,6 +10,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from vonavy_agent.forecasting import neural_net as neural_net_module
 from vonavy_agent.forecasting.contracts import (
     ForecastLimits,
     ForecastMapping,
@@ -94,6 +95,39 @@ def test_neuralnet_parameters_match_the_proven_direct_architecture() -> None:
     assert NEURALNET_PARAMETERS["loss"] == "mse"
     assert NEURALNET_PARAMETERS["target"] == "log1p_residual"
     assert FINAL_SEEDS == (42, 123, 777)
+    assert NEURALNET_PARAMETERS["max_train_rows"] == 300_000
+    assert NEURALNET_PARAMETERS["train_row_selection"] == "most_recent_complete_origins"
+
+
+def test_neuralnet_bounds_large_panel_to_recent_complete_origins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(neural_net_module, "MAX_NEURAL_TRAIN_ROWS", 12)
+    rows: list[dict[str, object]] = []
+    origins = pd.date_range("2025-01-01", periods=4, freq="D")
+    for origin in origins:
+        for entity in ("A", "B"):
+            for horizon in (1, 2):
+                rows.append(
+                    {
+                        "origin": origin,
+                        "entity": entity,
+                        "horizon": horizon,
+                        "target_date": origin + pd.Timedelta(days=horizon),
+                        "target": float(horizon),
+                        "target_baseline": 1.0,
+                    }
+                )
+
+    bounded, warning = neural_net_module._bounded_training_frame(pd.DataFrame(rows))
+
+    assert len(bounded) == 12
+    assert set(bounded["origin"]) == set(origins[-3:])
+    assert bounded.groupby("origin").size().eq(4).all()
+    assert warning is not None
+    assert warning.code == "neuralnet_training_rows_bounded"
+    assert warning.count == 4
+    assert "most recent 12 of 16" in warning.message
 
 
 def test_neuralnet_produces_versionable_nonnegative_forecast(

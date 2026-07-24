@@ -51,6 +51,10 @@ MODEL_CAPABILITIES: dict[AdapterId, dict[str, Any]] = {
             "small and medium daily panels",
         ],
         "limitations": ["point forecast only", "must fit on uploaded history"],
+        "capacity": {
+            "inputPolicy": "validated platform dataset limits",
+            "overflowPolicy": "use-full-direct-panel",
+        },
     },
     "neuralnet-direct-v1": {
         "label": "Best NeuralNet",
@@ -62,7 +66,15 @@ MODEL_CAPABILITIES: dict[AdapterId, dict[str, Any]] = {
             "nonlinear product and campaign interactions",
             "richer shared panel history",
         ],
-        "limitations": ["slower CPU training", "point forecast only"],
+        "limitations": [
+            "slower CPU training",
+            "point forecast only",
+            "large direct panels use a bounded recent training window",
+        ],
+        "capacity": {
+            "maxDirectPanelTrainRows": 300_000,
+            "overflowPolicy": "most-recent-complete-origins",
+        },
     },
     "chronos2-zero-shot-v1": {
         "label": "Chronos-2 Zero-shot",
@@ -74,7 +86,17 @@ MODEL_CAPABILITIES: dict[AdapterId, dict[str, Any]] = {
             "uncertainty quantiles",
             "no task-specific model fit",
         ],
-        "limitations": ["large worker image", "does not learn a new model from the upload"],
+        "limitations": [
+            "large worker image",
+            "does not learn a new model from the upload",
+            "limited to 500,000 input rows and 100 entities",
+        ],
+        "capacity": {
+            "maxInputRows": 500_000,
+            "maxEntities": 100,
+            "contextRowsPerEntity": 8_192,
+            "overflowPolicy": "reject-input-over-cap",
+        },
     },
 }
 
@@ -270,6 +292,7 @@ def _model_recommendations(profiles: list[dict[str, Any]], objective: str = "") 
                 "recommended": rank == 1,
                 "reasons": reasons[adapter_id] or ["available as a supported conservative option"],
                 "tradeoffs": capability["limitations"],
+                "capacity": capability["capacity"],
                 "runtimeEstimate": _runtime_estimate(adapter_id, rows),
                 "costEstimate": _cost_estimate(adapter_id),
             }

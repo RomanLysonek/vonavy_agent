@@ -18,6 +18,7 @@ from vonavy_agent.forecasting.contracts import (
     AdapterIdentity,
     ArtifactReference,
     ForecastArtifacts,
+    ForecastIssue,
     ForecastMapping,
     ForecastProfile,
     ForecastResult,
@@ -63,6 +64,13 @@ NEURALNET_PARAMETERS: dict[str, int | float | str | bool] = {
     "numeric_preprocessing": "median_impute+missing_indicator+standardize",
 }
 MAX_NEURAL_TRAIN_ROWS = 300_000
+NEURALNET_PARAMETERS.update(
+    {
+        "max_train_rows": MAX_NEURAL_TRAIN_ROWS,
+        "train_row_selection": "most_recent_complete_origins",
+    }
+)
+
 FINAL_SEEDS = (42, 123, 777)
 HOLDOUT_SEEDS = (42,)
 
@@ -276,6 +284,58 @@ def _train_seed(
     return model
 
 
+def _bounded_training_frame(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, ForecastIssue | None]:
+    available_rows = len(frame)
+    if available_rows <= MAX_NEURAL_TRAIN_ROWS:
+        return frame, None
+
+    required = {"origin", "entity", "horizon", "target_date"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(
+            "NeuralNet training frame is missing deterministic ordering columns: "
+            + ", ".join(missing)
+        )
+
+    ordered = frame.sort_values(
+        ["origin", "entity", "horizon", "target_date"],
+        kind="mergesort",
+    )
+    origin_sizes = (
+        ordered.groupby("origin", sort=True, observed=True).size().sort_index(ascending=False)
+    )
+    selected_origins: list[object] = []
+    selected_rows = 0
+    for origin, size in origin_sizes.items():
+        group_rows = int(size)
+        if selected_origins and selected_rows + group_rows > MAX_NEURAL_TRAIN_ROWS:
+            break
+        selected_origins.append(origin)
+        selected_rows += group_rows
+        if selected_rows >= MAX_NEURAL_TRAIN_ROWS:
+            break
+
+    bounded = ordered.loc[ordered["origin"].isin(selected_origins)]
+    if len(bounded) > MAX_NEURAL_TRAIN_ROWS:
+        bounded = bounded.head(MAX_NEURAL_TRAIN_ROWS)
+    bounded = bounded.reset_index(drop=True)
+    if bounded.empty:
+        raise ValueError("NeuralNet row budgeting produced no trainable rows")
+
+    warning = ForecastIssue(
+        code="neuralnet_training_rows_bounded",
+        message=(
+            f"NeuralNet training used the most recent {len(bounded)} of "
+            f"{available_rows} direct-panel rows to stay within the "
+            f"{MAX_NEURAL_TRAIN_ROWS}-row execution budget."
+        ),
+        count=available_rows - len(bounded),
+    )
+    return bounded, warning
+
+
 def _fit_models(
     frames: PanelFrames,
     seeds: tuple[int, ...],
@@ -284,14 +344,15 @@ def _fit_models(
     NumericState,
     tuple[dict[str, dict[str, int]], ...],
     TensorFrame,
+    pd.DataFrame,
+    ForecastIssue | None,
 ]:
-    if len(frames.train) > MAX_NEURAL_TRAIN_ROWS:
-        raise ValueError(f"NeuralNet v1 supports at most {MAX_NEURAL_TRAIN_ROWS} direct-panel rows")
-    numeric_state, numeric = _fit_numeric(frames.train, _numeric_columns(frames))
+    training_frame, training_warning = _bounded_training_frame(frames.train)
+    numeric_state, numeric = _fit_numeric(training_frame, _numeric_columns(frames))
     category_maps = _category_maps(frames)
-    train_tensors = _tensor_frame(frames.train, numeric, category_maps)
-    target = frames.train["target"].to_numpy(dtype=np.float32)
-    baseline = frames.train["target_baseline"].to_numpy(dtype=np.float32)
+    train_tensors = _tensor_frame(training_frame, numeric, category_maps)
+    target = training_frame["target"].to_numpy(dtype=np.float32)
+    baseline = training_frame["target_baseline"].to_numpy(dtype=np.float32)
     residual = np.log1p(target) - np.log1p(np.clip(baseline, 0.0, None))
     if not np.isfinite(residual).all():
         raise ValueError("NeuralNet target preprocessing produced non-finite residuals")
@@ -308,7 +369,14 @@ def _fit_models(
     ]
     predict_numeric = _transform_numeric(frames.predict, numeric_state)
     predict_tensors = _tensor_frame(frames.predict, predict_numeric, category_maps)
-    return models, numeric_state, category_maps, predict_tensors
+    return (
+        models,
+        numeric_state,
+        category_maps,
+        predict_tensors,
+        training_frame,
+        training_warning,
+    )
 
 
 def _predict_models(
@@ -339,12 +407,13 @@ def _artifact_payload(
     numeric_state: NumericState,
     category_maps: tuple[dict[str, dict[str, int]], ...],
     frames: PanelFrames,
+    parameters: dict[str, int | float | str | bool],
 ) -> dict[str, Any]:
     category_sizes, category_dims = _category_dimensions(category_maps)
     return {
         "schema_version": "neuralnet-direct-artifact/v1",
         "adapter_id": NEURALNET_ADAPTER_ID,
-        "parameters": NEURALNET_PARAMETERS,
+        "parameters": parameters,
         "feature_order": frames.feature_columns,
         "categorical_columns": frames.categorical_columns,
         "category_maps": category_maps,
@@ -415,7 +484,7 @@ def run_neuralnet_forecast(
     else:
         try:
             holdout_frames = build_panel_frames(prepared, holdout_origin, holdout_origin)
-            models, _, _, predict_tensors = _fit_models(holdout_frames, HOLDOUT_SEEDS)
+            models, _, _, predict_tensors, _, _ = _fit_models(holdout_frames, HOLDOUT_SEEDS)
             holdout_prediction, _ = _predict_models(
                 models,
                 predict_tensors,
@@ -453,10 +522,23 @@ def run_neuralnet_forecast(
     final_frames = build_panel_frames(prepared, prepared.training_end, prepared.training_end)
     if len(final_frames.train) < 10:
         raise ValueError("The mapped dataset produced fewer than 10 trainable direct-panel rows")
-    models, numeric_state, category_maps, predict_tensors = _fit_models(
+    (
+        models,
+        numeric_state,
+        category_maps,
+        predict_tensors,
+        fitted_train,
+        training_warning,
+    ) = _fit_models(
         final_frames,
         FINAL_SEEDS,
     )
+    run_warnings = prepared.warnings + ((training_warning,) if training_warning is not None else ())
+    run_parameters = {
+        **NEURALNET_PARAMETERS,
+        "available_train_rows": len(final_frames.train),
+        "selected_train_rows": len(fitted_train),
+    }
     fit_seconds = time.monotonic() - fit_started
 
     forecast_started = time.monotonic()
@@ -471,7 +553,7 @@ def run_neuralnet_forecast(
         prediction=holdout_prediction_evidence,
         baseline=holdout_baseline,
         entities=holdout_entities,
-        train_features=final_frames.train,
+        train_features=fitted_train,
         fresh_features=final_frames.predict,
         feature_columns=final_frames.feature_columns,
         categorical_columns=final_frames.categorical_columns,
@@ -496,7 +578,7 @@ def run_neuralnet_forecast(
     manifest_path = output_directory / "model-manifest.json"
     _write_forecast(forecast, forecast_path)
     torch.save(
-        _artifact_payload(models, numeric_state, category_maps, final_frames),
+        _artifact_payload(models, numeric_state, category_maps, final_frames, run_parameters),
         model_path,
     )
     forecast_seconds = time.monotonic() - forecast_started
@@ -513,7 +595,7 @@ def run_neuralnet_forecast(
         input=input_identity,
         mapping=mapping,
         training_end=prepared.training_end.date(),
-        parameters=NEURALNET_PARAMETERS,
+        parameters=run_parameters,
         feature_order=final_frames.feature_columns,
         categorical_levels=final_frames.categorical_levels,
         holdout=holdout,
@@ -545,7 +627,7 @@ def run_neuralnet_forecast(
             training_end=prepared.training_end.date(),
             forecast_start=prepared.forecast_dates[0].date(),
             forecast_end=prepared.forecast_dates[-1].date(),
-            trainable_rows=len(final_frames.train),
+            trainable_rows=len(fitted_train),
             fallback_rows=int(fallback.sum()),
         ),
         holdout=holdout,
@@ -567,7 +649,7 @@ def run_neuralnet_forecast(
                 byte_size=manifest_path.stat().st_size,
             ),
         ),
-        warnings=prepared.warnings,
+        warnings=run_warnings,
         timing=ForecastTiming(
             prepare_seconds=prepare_seconds,
             holdout_seconds=holdout_seconds,

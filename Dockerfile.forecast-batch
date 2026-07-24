@@ -10,10 +10,29 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 RUN python -m pip install "uv==${UV_VERSION}"
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md ./
+
+# Keep dependency and immutable model layers independent of application-source
+# changes. A source-only worker update must not re-download Chronos-2.
+RUN uv sync --frozen --no-dev --no-install-project --extra aws --extra modeling --extra chronos --python /usr/local/bin/python
+
+RUN set -eu; \
+    attempt=1; \
+    while true; do \
+        if /opt/venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='amazon/chronos-2', revision='29ec3766d36d6f73f0696f85560a422f50e8498c', local_dir='/opt/models/chronos-2', allow_patterns=['*.json', '*.safetensors', '*.model', '*.txt'])"; then \
+            break; \
+        fi; \
+        if [ "$attempt" -ge 6 ]; then \
+            echo "Chronos-2 snapshot download failed after ${attempt} attempts" >&2; \
+            exit 1; \
+        fi; \
+        delay=$((attempt * 10)); \
+        echo "Chronos-2 snapshot download failed; retrying in ${delay}s (attempt ${attempt}/6)" >&2; \
+        sleep "$delay"; \
+        attempt=$((attempt + 1)); \
+    done
+
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable --extra aws --extra modeling --extra chronos --python /usr/local/bin/python
-
-RUN /opt/venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='amazon/chronos-2', revision='29ec3766d36d6f73f0696f85560a422f50e8498c', local_dir='/opt/models/chronos-2', allow_patterns=['*.json', '*.safetensors', '*.model', '*.txt'])"
 
 FROM python:3.12.3-slim-bookworm AS runtime
 

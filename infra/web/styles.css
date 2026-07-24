@@ -44,10 +44,10 @@ pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
 .agent-shell { display: grid; gap: 18px; padding: 24px; }
 .agent-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .agent-heading p { margin: 4px 0 0; }
-.agent-messages { display: grid; gap: 12px; min-height: 180px; max-height: 340px; overflow-y: auto; padding: 16px; background: #09090b; border: 1px solid #334155; border-radius: 14px; }
+.agent-messages { display: grid; grid-auto-rows: max-content; align-content: start; gap: 12px; min-height: 180px; max-height: 340px; overflow-y: auto; padding: 16px; background: #09090b; border: 1px solid #334155; border-radius: 14px; }
 .agent-message { max-width: 86%; padding: 12px 14px; border-radius: 14px; white-space: pre-wrap; line-height: 1.5; }
 .agent-message.user { justify-self: end; background: #1d4ed8; color: white; }
-.agent-message.assistant { justify-self: start; background: #27272a; color: #e2e8f0; }
+.agent-message.assistant { width: 100%; max-width: 100%; min-width: 0; justify-self: stretch; background: #27272a; color: #e2e8f0; }
 .agent-plan { display: grid; gap: 12px; padding: 16px; border: 1px solid #2563eb; border-radius: 14px; background: rgba(30, 64, 175, .16); }
 .agent-plan p { margin: 0; }
 .agent-form { margin-top: 0; }
@@ -80,4 +80,3 @@ pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
 .agent-markdown-table td { padding: 8px 10px; border: 1px solid #475569; text-align: left; vertical-align: top; }
 .agent-markdown-table th { background: #172554; color: #f8fafc; }
 .agent-message.user { white-space: pre-wrap; }
-.agent-message.assistant { width: 100%; max-width: 100%; min-width: 0; justify-self: stretch; }

@@ -88,6 +88,7 @@ class DeploymentConfig:
     validation_job_timeout_seconds: int = 900
     validation_max_active_jobs_per_owner: int = 1
     source_revision: str = "unknown"
+    forecast_seed_image: str | None = None
     public_domain_name: str | None = None
     public_hosted_zone_id: str | None = None
     public_certificate_arn: str | None = None
@@ -404,11 +405,15 @@ class ControlPlaneStack(Stack):
                 resources=[data_bucket.arn_for_objects("forecast-results/users/*")],
             )
         )
+        forecast_build_args = {"VCS_REF": config.source_revision}
+        if config.forecast_seed_image is not None:
+            forecast_build_args["CHRONOS_SEED_IMAGE"] = config.forecast_seed_image
+
         forecast_image = ecs.ContainerImage.from_asset(
             str(Path(__file__).parents[2]),
             file="Dockerfile.forecast-batch",
             platform=ecr_assets.Platform.LINUX_AMD64,
-            build_args={"VCS_REF": config.source_revision},
+            build_args=forecast_build_args,
             exclude=[
                 "docs",
                 "infra",

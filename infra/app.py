@@ -42,6 +42,7 @@ config = DeploymentConfig(
         os.getenv("VONAVY_VALIDATION_MAX_ACTIVE_JOBS_PER_OWNER", "1")
     ),
     source_revision=os.getenv("VONAVY_SOURCE_REVISION", "unknown"),
+    forecast_seed_image=_optional("VONAVY_FORECAST_SEED_IMAGE"),
     public_domain_name=_optional("VONAVY_PUBLIC_DOMAIN_NAME"),
     public_hosted_zone_id=_optional("VONAVY_PUBLIC_HOSTED_ZONE_ID"),
     public_certificate_arn=_optional("VONAVY_PUBLIC_CERTIFICATE_ARN"),

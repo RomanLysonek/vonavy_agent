@@ -1,10 +1,13 @@
 const API_REQUEST_TIMEOUT_MS = 15_000;
 const API_RETRY_DELAYS_MS = [250, 750];
 const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504]);
+const FORECAST_TERMINAL_STATUSES = new Set(["succeeded", "invalid", "failed"]);
+const FORECAST_RUN_STORAGE_PREFIX = "vonavy_forecast_runs";
 
 const state = {
   config: null,
   tokens: null,
+  ownerId: null,
   validationResults: new Map(),
   sourceRevision: null,
 };
@@ -53,6 +56,69 @@ function loadTokens() {
     sessionStorage.removeItem("vonavy_tokens");
     return null;
   }
+}
+
+function forecastRunStorageKey() {
+  return state.ownerId ? `${FORECAST_RUN_STORAGE_PREFIX}:${state.ownerId}` : null;
+}
+
+function loadRememberedForecastRuns() {
+  const key = forecastRunStorageKey();
+  if (!key) return {};
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return value;
+  } catch {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+    return {};
+  }
+}
+
+function saveRememberedForecastRuns(runs) {
+  const key = forecastRunStorageKey();
+  if (!key) return;
+  try {
+    if (Object.keys(runs).length) localStorage.setItem(key, JSON.stringify(runs));
+    else localStorage.removeItem(key);
+  } catch {
+    // Forecast execution remains usable even when durable browser storage is unavailable.
+  }
+}
+
+function rememberForecastRun(run) {
+  const datasetId = run?.datasetId;
+  const forecastRunId = run?.forecastRunId;
+  const status = run?.links?.status;
+  if (!datasetId || !forecastRunId || typeof status !== "string") return;
+  const runs = loadRememberedForecastRuns();
+  runs[datasetId] = {
+    datasetId,
+    forecastRunId,
+    status: run.status,
+    resultAvailable: Boolean(run.resultAvailable),
+    links: {
+      status,
+      result: run.links?.result || null,
+    },
+    updatedAt: run.updatedAt || new Date().toISOString(),
+  };
+  saveRememberedForecastRuns(runs);
+}
+
+function rememberedForecastRun(datasetId) {
+  return loadRememberedForecastRuns()[datasetId] || null;
+}
+
+function forgetForecastRun(datasetId) {
+  const runs = loadRememberedForecastRuns();
+  if (!(datasetId in runs)) return;
+  delete runs[datasetId];
+  saveRememberedForecastRuns(runs);
 }
 
 class ApiRequestError extends Error {
@@ -189,6 +255,7 @@ async function exchangeCode(code, returnedState) {
 function logout() {
   sessionStorage.removeItem("vonavy_tokens");
   state.tokens = null;
+  state.ownerId = null;
   const params = new URLSearchParams({
     client_id: state.config.userPoolClientId,
     logout_uri: state.config.redirectUri,
@@ -393,6 +460,7 @@ function showForecastResult(output, run, result) {
     const link = document.createElement("a");
     link.href = url;
     link.textContent = `Download ${name}`;
+    link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.className = "artifact-link";
     output.append(document.createTextNode(" "), link);
@@ -400,12 +468,12 @@ function showForecastResult(output, run, result) {
 }
 
 async function waitForForecast(run, output, button) {
-  const terminal = new Set(["succeeded", "invalid", "failed"]);
   let current = run;
+  rememberForecastRun(current);
   const maxAttempts = Math.ceil((state.config.forecastJobTimeoutSeconds + 900) / 3);
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     output.textContent = forecastMessage(current);
-    if (terminal.has(current.status)) {
+    if (FORECAST_TERMINAL_STATUSES.has(current.status)) {
       if (current.resultAvailable) {
         const result = await api(current.links.result);
         showForecastResult(output, current, result);
@@ -415,9 +483,41 @@ async function waitForForecast(run, output, button) {
     }
     await new Promise((resolve) => setTimeout(resolve, 3000));
     current = await api(current.links.status);
+    rememberForecastRun(current);
   }
-  output.textContent = "Forecast is still running. Refresh to check it again.";
+  output.textContent = "Forecast is still running. Refresh to restore its latest status.";
   button.disabled = false;
+}
+
+async function restoreForecast(dataset, output, button) {
+  const remembered = rememberedForecastRun(dataset.datasetId);
+  if (!remembered?.links?.status) return;
+
+  button.disabled = true;
+  output.textContent = "Restoring the latest forecast…";
+  try {
+    const run = await api(remembered.links.status);
+    rememberForecastRun(run);
+    if (FORECAST_TERMINAL_STATUSES.has(run.status)) {
+      if (run.resultAvailable) {
+        const result = await api(run.links.result);
+        showForecastResult(output, run, result);
+      } else {
+        output.textContent = forecastMessage(run);
+      }
+      button.disabled = false;
+      return;
+    }
+    await waitForForecast(run, output, button);
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 404) {
+      forgetForecastRun(dataset.datasetId);
+      output.textContent = "";
+    } else {
+      output.textContent = `Latest forecast could not be restored: ${error.message}`;
+    }
+    button.disabled = false;
+  }
 }
 
 let agentContext = null;
@@ -975,6 +1075,7 @@ async function listDatasets() {
         agenticForecastDataset(dataset, validationStatus, forecastButton);
       });
       actions.append(forecastButton, validationStatus);
+      restoreForecast(dataset, validationStatus, forecastButton);
     }
     item.append(title, meta, actions);
     root.append(item);
@@ -995,6 +1096,7 @@ async function start() {
   $("signed-in").classList.toggle("hidden", !state.tokens);
   if (state.tokens) {
     const claims = decodeJwt(state.tokens.access_token);
+    state.ownerId = claims.sub;
     $("identity").textContent = claims.username || claims.sub;
     await listDatasets();
   }

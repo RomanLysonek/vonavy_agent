@@ -20,9 +20,11 @@ sys.modules["agent"] = agent
 orchestrator = types.ModuleType("orchestrator")
 orchestrator.OrchestratorError = RuntimeError
 orchestrator.run_agent_turn = lambda **kwargs: None
+orchestrator.run_result_agent_turn = lambda **kwargs: None
 sys.modules["orchestrator"] = orchestrator
 
 PATH = Path(__file__).parents[1] / "lambda/forecast_control_plane/handler.py"
+sys.path.insert(0, str(PATH.parent))
 SPEC = importlib.util.spec_from_file_location("phase4d_handler", PATH)
 assert SPEC and SPEC.loader
 handler = importlib.util.module_from_spec(SPEC)

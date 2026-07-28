@@ -294,7 +294,7 @@ def test_static_web_bucket_is_destroyed_with_auto_delete_helper() -> None:
 
 def test_every_api_route_requires_jwt_and_custom_scope() -> None:
     routes = _template().find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 14
+    assert len(routes) == 15
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"
@@ -523,7 +523,8 @@ def test_forecast_agent_is_pinned_to_exact_bedrock_profile() -> None:
     assert environment["BEDROCK_MODEL_ID"] == "eu.anthropic.claude-opus-4-6-v1"
     assert environment["BEDROCK_TIMEOUT_SECONDS"] == "25"
     assert environment["BEDROCK_MAX_OUTPUT_TOKENS"] == "1200"
-    assert environment["AGENT_DAILY_LIMIT"] == "20"
+    assert environment["AGENT_DAILY_LIMIT"] == "50"
+    assert environment["AGENT_SESSION_MAX_TURNS"] == "20"
     assert not any(key.startswith("OPENAI_") for key in environment)
 
     statements = _policy_statements(template)
@@ -567,6 +568,7 @@ def test_forecast_routes_are_jwt_protected() -> None:
         "POST /api/datasets/{dataset_id}/forecasts",
         "GET /api/forecasts/{run_id}",
         "GET /api/forecasts/{run_id}/result",
+        "POST /api/forecasts/{run_id}/agent/sessions",
     }
     assert expected <= set(by_key)
     for key in expected:

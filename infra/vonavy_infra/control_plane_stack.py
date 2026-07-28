@@ -785,7 +785,8 @@ class ControlPlaneStack(Stack):
                 "BEDROCK_MODEL_ID": "eu.anthropic.claude-opus-4-6-v1",
                 "BEDROCK_TIMEOUT_SECONDS": "25",
                 "BEDROCK_MAX_OUTPUT_TOKENS": "1200",
-                "AGENT_DAILY_LIMIT": "20",
+                "AGENT_DAILY_LIMIT": "50",
+                "AGENT_SESSION_MAX_TURNS": "20",
                 "UPLOAD_RETENTION_DAYS": str(config.upload_retention_days),
                 "SOURCE_REVISION": config.source_revision,
                 "AWS_REGION_NAME": self.region,
@@ -946,6 +947,10 @@ class ControlPlaneStack(Stack):
                 "/api/forecast-agent/sessions/{session_id}",
                 apigwv2.HttpMethod.GET,
             ),
+            (
+                "/api/forecasts/{run_id}/agent/sessions",
+                apigwv2.HttpMethod.POST,
+            ),
             ("/api/datasets/{dataset_id}/forecasts", apigwv2.HttpMethod.POST),
             ("/api/forecasts/{run_id}", apigwv2.HttpMethod.GET),
             ("/api/forecasts/{run_id}/result", apigwv2.HttpMethod.GET),
@@ -1014,7 +1019,7 @@ class ControlPlaneStack(Stack):
                         "forecastAdapterId": "xgboost-direct-v1",
                         "forecastAgentEnabled": True,
                         "forecastAgentConversationEnabled": True,
-                        "forecastAgentMaximumTurns": 8,
+                        "forecastAgentMaximumTurns": 20,
                         "forecastAgentModel": "eu.anthropic.claude-opus-4-6-v1",
                         "maximumActiveValidationJobsPerOwner": (
                             config.validation_max_active_jobs_per_owner

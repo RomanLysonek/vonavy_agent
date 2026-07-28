@@ -30,7 +30,7 @@ from agent_async import (
 from boto3.dynamodb.types import TypeSerializer  # type: ignore[import-untyped]
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from orchestrator import OrchestratorError, run_agent_turn
+from orchestrator import OrchestratorError, run_agent_turn, run_result_agent_turn
 
 LOGGER = logging.getLogger()
 LOGGER.setLevel(logging.INFO)
@@ -46,8 +46,8 @@ AWS_REGION_NAME = os.environ.get("AWS_REGION_NAME")
 
 MAX_BODY_BYTES = 32 * 1024
 MAX_VALIDATION_RESULT_BYTES = 4 * 1024 * 1024
-AGENT_DAILY_LIMIT = int(os.environ.get("AGENT_DAILY_LIMIT", "20"))
-AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "8"))
+AGENT_DAILY_LIMIT = int(os.environ.get("AGENT_DAILY_LIMIT", "50"))
+AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "20"))
 AGENT_SESSION_TTL_DAYS = int(os.environ.get("AGENT_SESSION_TTL_DAYS", "7"))
 MAX_RESULT_BYTES = 2 * 1024 * 1024
 RESULT_REVIEW_POLICY_VERSION = "forecast-result-review/v1"
@@ -1289,6 +1289,29 @@ def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
     return payload
 
 
+def _agent_result_context(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "schema_version",
+        "status",
+        "dataset_id",
+        "run_id",
+        "adapter",
+        "profile",
+        "holdout",
+        "evaluation",
+        "review",
+    )
+    context = {field: payload[field] for field in fields if field in payload}
+    encoded = json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
+    if len(encoded) > 64 * 1024:
+        raise ApiError(
+            "forecast_result_too_large",
+            "The bounded forecast result summary is too large for conversation",
+            502,
+        )
+    return context
+
+
 def _consume_agent_quota(table: Any, owner: str) -> None:
     today = datetime.now(UTC).date()
     now = datetime.now(UTC).isoformat()
@@ -1314,7 +1337,7 @@ def _consume_agent_quota(table: Any, owner: str) -> None:
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             raise ApiError(
                 "agent_rate_limit_exceeded",
-                "The daily AI planning limit has been reached",
+                "The daily AI conversation limit has been reached",
                 429,
             ) from exc
         raise
@@ -1430,7 +1453,11 @@ def _agent_session_item(table: Any, owner: str, session_id: str) -> dict[str, An
 
 def _agent_session_json(value: object, field: str) -> object:
     if value is None or value == "":
-        return None if field == "draft_plan_json" else []
+        if field == "draft_plan_json":
+            return None
+        if field == "result_context_json":
+            return {}
+        return []
     if not isinstance(value, str):
         raise ApiError("agent_session_invalid", "Stored agent session is invalid", 500)
     try:
@@ -1456,26 +1483,35 @@ def _agent_session_response(item: dict[str, Any]) -> dict[str, Any]:
     privacy = _agent_session_json(item.get("turn_privacy_json"), "draft_plan_json")
     if not isinstance(tool_audit, list) or (privacy is not None and not isinstance(privacy, dict)):
         raise ApiError("agent_session_invalid", "Stored agent session is invalid", 500)
+    phase = str(item.get("session_phase") or "planning")
+    forecast_run_id = item.get("forecast_run_id")
+    links = {
+        "self": f"/api/forecast-agent/sessions/{item['session_id']}",
+        "messages": f"/api/forecast-agent/sessions/{item['session_id']}/messages",
+    }
+    if phase == "planning":
+        links["execute"] = f"/api/datasets/{item['dataset_id']}/forecasts"
+    elif isinstance(forecast_run_id, str):
+        links["result"] = f"/api/forecasts/{forecast_run_id}/result"
     return {
         "schemaVersion": "forecast-agent-session/v2",
         "sessionId": item["session_id"],
+        "conversationPhase": phase,
         "datasetId": item["dataset_id"],
-        "validationJobId": item["validation_job_id"],
+        "validationJobId": item.get("validation_job_id"),
+        "forecastRunId": forecast_run_id,
         "turnCount": int(item.get("turn_count", 0)),
+        "maximumTurns": AGENT_SESSION_MAX_TURNS,
         "message": message,
         "history": history,
         "draftPlan": draft,
-        "requiresConfirmation": draft is not None and not turn["pending"],
+        "requiresConfirmation": phase == "planning" and draft is not None and not turn["pending"],
         "turn": turn,
         "toolAudit": tool_audit,
         "provider": item.get("turn_provider"),
         "model": item.get("turn_model"),
         "privacy": privacy or {},
-        "links": {
-            "self": f"/api/forecast-agent/sessions/{item['session_id']}",
-            "messages": f"/api/forecast-agent/sessions/{item['session_id']}/messages",
-            "execute": f"/api/datasets/{item['dataset_id']}/forecasts",
-        },
+        "links": links,
     }
 
 
@@ -1495,6 +1531,28 @@ def _run_agent_session_turn(
             dataset_id=dataset_id,
             dataset_version_id=str(dataset["object_version_id"]),
             validation_result=validation_result,
+            message=message,
+            history=history,
+        )
+    except OrchestratorError as exc:
+        raise ApiError(exc.code, exc.message, exc.status, exc.detail) from exc
+    return turn.as_dict()
+
+
+def _run_result_agent_session_turn(
+    *,
+    table: Any,
+    owner: str,
+    run_id: str,
+    result_context: dict[str, Any],
+    message: object,
+    history: object,
+) -> dict[str, Any]:
+    _consume_agent_quota(table, owner)
+    try:
+        turn = run_result_agent_turn(
+            run_id=run_id,
+            result_context=result_context,
             message=message,
             history=history,
         )
@@ -1636,27 +1694,45 @@ def _agent_turn_worker(event: dict[str, Any]) -> None:
 
     try:
         dataset_id = str(item["dataset_id"])
-        dataset = _dataset(table, owner, dataset_id)
-        if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
-            raise ApiError("agent_session_stale", "The dataset version changed", 409)
-        validation_result = _validation_result_for_agent(
-            s3,
-            table,
-            owner=owner,
-            dataset=dataset,
-            dataset_id=dataset_id,
-            validation_job_id=str(item["validation_job_id"]),
-        )
         history = _agent_session_json(item.get("messages_json"), "messages_json")
-        turn = _run_agent_session_turn(
-            table=table,
-            owner=owner,
-            dataset=dataset,
-            dataset_id=dataset_id,
-            validation_result=validation_result,
-            message=item.get("turn_message"),
-            history=history,
-        )
+        phase = str(item.get("session_phase") or "planning")
+        if phase == "planning":
+            dataset = _dataset(table, owner, dataset_id)
+            if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
+                raise ApiError("agent_session_stale", "The dataset version changed", 409)
+            validation_result = _validation_result_for_agent(
+                s3,
+                table,
+                owner=owner,
+                dataset=dataset,
+                dataset_id=dataset_id,
+                validation_job_id=str(item["validation_job_id"]),
+            )
+            turn = _run_agent_session_turn(
+                table=table,
+                owner=owner,
+                dataset=dataset,
+                dataset_id=dataset_id,
+                validation_result=validation_result,
+                message=item.get("turn_message"),
+                history=history,
+            )
+        elif phase == "result":
+            result_context = _agent_session_json(
+                item.get("result_context_json"), "result_context_json"
+            )
+            if not isinstance(result_context, dict):
+                raise ApiError("agent_session_invalid", "Stored result context is invalid", 500)
+            turn = _run_result_agent_session_turn(
+                table=table,
+                owner=owner,
+                run_id=str(item["forecast_run_id"]),
+                result_context=result_context,
+                message=item.get("turn_message"),
+                history=history,
+            )
+        else:
+            raise ApiError("agent_session_invalid", "Stored conversation phase is invalid", 500)
         turns = int(item.get("turn_count", 0))
         now = datetime.now(UTC).isoformat()
         expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
@@ -1746,9 +1822,78 @@ def _agent_session_create(event: dict[str, Any], dataset_id: str) -> dict[str, A
         **_agent_session_key(owner, session_id),
         "owner_sub": owner,
         "session_id": session_id,
+        "session_phase": "planning",
         "dataset_id": dataset_id,
         "dataset_version_id": str(dataset["object_version_id"]),
         "validation_job_id": validation_job_id,
+        "messages_json": "[]",
+        "draft_plan_json": "null",
+        "turn_count": 0,
+        "turn_id": turn_id,
+        "turn_status": "queued",
+        "turn_message": message,
+        "turn_request_token": request_token,
+        "turn_submitted_at": now,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": expires,
+    }
+    try:
+        table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        existing = _agent_session_item(table, owner, session_id)
+        if existing.get("turn_request_token") == request_token:
+            return _agent_session_response(existing)
+        raise ApiError("agent_session_conflict", "The agent session already exists", 409) from exc
+    try:
+        _enqueue_agent_turn(owner, session_id, turn_id)
+    except ApiError as exc:
+        _store_agent_turn_failure(
+            table,
+            owner=owner,
+            session_id=session_id,
+            turn_id=turn_id,
+            code=exc.code,
+            message=exc.message,
+        )
+        raise
+    return _agent_session_response(item)
+
+
+def _result_agent_session_create(event: dict[str, Any], run_id: str) -> dict[str, Any]:
+    owner = _identity(event)
+    run_id = _canonical_uuid(
+        run_id,
+        code="forecast_not_found",
+        message="Forecast run does not exist",
+        status=404,
+    )
+    body = _parse_body(event)
+    message, request_token = _agent_request(body)
+    payload = _result(event, run_id)
+    result_context = _agent_result_context(payload)
+    identity = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    dataset_id = str(payload["dataset_id"])
+    dataset_version_id = str(identity["version_id"])
+    _, table, _, _ = _clients()
+    session_id = session_id_for(owner, f"result:{run_id}", request_token)
+    turn_id = turn_id_for(session_id, request_token)
+    now = datetime.now(UTC).isoformat()
+    expires = int(time.time()) + AGENT_SESSION_TTL_DAYS * 86400
+    item = {
+        **_agent_session_key(owner, session_id),
+        "owner_sub": owner,
+        "session_id": session_id,
+        "session_phase": "result",
+        "forecast_run_id": run_id,
+        "dataset_id": dataset_id,
+        "dataset_version_id": dataset_version_id,
+        "result_context_json": json.dumps(result_context, separators=(",", ":")),
         "messages_json": "[]",
         "draft_plan_json": "null",
         "turn_count": 0,
@@ -1811,10 +1956,14 @@ def _agent_session_message(event: dict[str, Any], session_id: str) -> dict[str, 
             f"Agent sessions support at most {AGENT_SESSION_MAX_TURNS} turns",
             429,
         )
-    dataset_id = str(item["dataset_id"])
-    dataset = _dataset(table, owner, dataset_id)
-    if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
-        raise ApiError("agent_session_stale", "The dataset version changed", 409)
+    phase = str(item.get("session_phase") or "planning")
+    if phase == "planning":
+        dataset_id = str(item["dataset_id"])
+        dataset = _dataset(table, owner, dataset_id)
+        if str(dataset.get("object_version_id")) != str(item.get("dataset_version_id")):
+            raise ApiError("agent_session_stale", "The dataset version changed", 409)
+    elif phase != "result":
+        raise ApiError("agent_session_invalid", "Stored conversation phase is invalid", 500)
 
     turn_id = turn_id_for(session_id, request_token)
     now = datetime.now(UTC).isoformat()
@@ -1962,6 +2111,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         parts = path.split("/")
         if route == "POST /api/datasets/{dataset_id}/forecast-agent/sessions" and len(parts) == 6:
             return _response(201, _agent_session_create(event, parts[3]))
+        if route == "POST /api/forecasts/{run_id}/agent/sessions" and len(parts) == 6:
+            return _response(201, _result_agent_session_create(event, parts[3]))
         if route == "POST /api/forecast-agent/sessions/{session_id}/messages" and len(parts) == 6:
             return _response(200, _agent_session_message(event, parts[4]))
         if route == "GET /api/forecast-agent/sessions/{session_id}" and len(parts) == 5:

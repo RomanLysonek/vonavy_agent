@@ -465,8 +465,17 @@ function showForecastResult(output, run, result) {
     link.className = "artifact-link";
     output.append(document.createTextNode(" "), link);
   }
+  if (run.status === "succeeded") {
+    const discuss = document.createElement("button");
+    discuss.type = "button";
+    discuss.className = "secondary";
+    discuss.textContent = "Discuss result with AI";
+    discuss.addEventListener("click", () => {
+      reviewForecastResult(run, output, discuss);
+    });
+    output.append(document.createTextNode(" "), discuss);
+  }
 }
-
 async function waitForForecast(run, output, button) {
   let current = run;
   rememberForecastRun(current);
@@ -701,11 +710,19 @@ function appendAgentMessage(role, text) {
   item.scrollIntoView({ block: "end" });
 }
 
+function agentMaximumTurns(session = null) {
+  const configured = Number(
+    session?.maximumTurns ?? state.config?.forecastAgentMaximumTurns ?? 20,
+  );
+  return Number.isInteger(configured) && configured > 0 ? configured : 20;
+}
 function setAgentPlan(plan) {
   if (!agentContext) return;
-  agentContext.plan = plan || null;
+  const planning = agentContext.phase === "planning";
+  agentContext.plan = planning ? plan || null : null;
   const confirm = $("agent-confirm");
-  if (!plan) {
+  confirm.classList.toggle("hidden", !planning);
+  if (!planning || !plan) {
     $("agent-plan").classList.add("hidden");
     $("agent-plan-summary").replaceChildren();
     confirm.disabled = true;
@@ -714,7 +731,6 @@ function setAgentPlan(plan) {
   renderAgentPlan(plan);
   confirm.disabled = false;
 }
-
 function renderAgentPlan(plan) {
   const root = $("agent-plan-summary");
   root.replaceChildren();
@@ -779,6 +795,7 @@ async function agenticForecastDataset(dataset, output, button) {
   }
   button.disabled = true;
   agentContext = {
+    phase: "planning",
     dataset,
     output,
     button,
@@ -797,12 +814,37 @@ async function agenticForecastDataset(dataset, output, button) {
   setAgentPlan(null);
   appendAgentMessage(
     "assistant",
-    "Tell me the forecasting objective. I can inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, compile a fixed safe preprocessing plan, then prepare everything for your confirmation.",
+    `Tell me the forecasting objective. You have up to ${agentMaximumTurns()} turns to inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, compile a fixed safe preprocessing plan, and prepare everything for your confirmation.`,
   );
   $("agent-dialog").showModal();
   $("agent-input").focus();
 }
-
+function reviewForecastResult(run, output, button) {
+  button.disabled = true;
+  agentContext = {
+    phase: "result",
+    run,
+    output,
+    button,
+    session: null,
+    plan: null,
+    running: false,
+    pending: false,
+  };
+  $("agent-title").textContent = "Review the completed forecast";
+  $("agent-messages").replaceChildren();
+  $("agent-status").textContent = "";
+  $("agent-input").value = "";
+  $("agent-input").disabled = false;
+  $("agent-send").disabled = false;
+  setAgentPlan(null);
+  appendAgentMessage(
+    "assistant",
+    `Ask me about the completed forecast for up to ${agentMaximumTurns()} turns. I can explain its measured evaluation, deterministic review, warnings, and practical implications. I cannot rerun or modify the forecast from this conversation.`,
+  );
+  $("agent-dialog").showModal();
+  $("agent-input").focus();
+}
 async function waitForAgentTurn(session) {
   let current = session;
   for (let poll = 0; poll < AGENT_TURN_MAX_POLLS; poll += 1) {
@@ -827,23 +869,34 @@ async function sendAgentMessage(event) {
   input.disabled = true;
   $("agent-send").disabled = true;
   agentContext.pending = true;
-  setAgentPlan(null);
+  if (agentContext.phase === "planning") setAgentPlan(null);
   $("agent-status").textContent = "Queueing the agent turn…";
   try {
     const requestToken = crypto.randomUUID();
-    const queued = agentContext.session
-      ? await api(agentContext.session.links.messages, {
+    let queued;
+    if (agentContext.session) {
+      queued = await api(agentContext.session.links.messages, {
         method: "POST",
         body: JSON.stringify({ message, requestToken }),
-      })
-      : await api(`/api/datasets/${agentContext.dataset.datasetId}/forecast-agent/sessions`, {
-        method: "POST",
-        body: JSON.stringify({
-          validationJobId: agentContext.validation.jobId,
-          message,
-          requestToken,
-        }),
       });
+    } else if (agentContext.phase === "result") {
+      queued = await api(`/api/forecasts/${agentContext.run.forecastRunId}/agent/sessions`, {
+        method: "POST",
+        body: JSON.stringify({ message, requestToken }),
+      });
+    } else {
+      queued = await api(
+        `/api/datasets/${agentContext.dataset.datasetId}/forecast-agent/sessions`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            validationJobId: agentContext.validation.jobId,
+            message,
+            requestToken,
+          }),
+        },
+      );
+    }
     agentContext.session = queued;
     const session = await waitForAgentTurn(queued);
     agentContext.session = session;
@@ -854,25 +907,33 @@ async function sendAgentMessage(event) {
       return;
     }
     if (session.message) appendAgentMessage("assistant", session.message);
-    if (session.draftPlan) setAgentPlan(session.draftPlan);
-    $("agent-status").textContent = session.draftPlan
-      ? "Review the plan or continue chatting to revise it."
-      : `Turn ${session.turnCount} of 8`;
+    if (agentContext.phase === "planning" && session.draftPlan) {
+      setAgentPlan(session.draftPlan);
+    }
+    const maximumTurns = agentMaximumTurns(session);
+    if (session.draftPlan) {
+      $("agent-status").textContent = "Review the plan or continue chatting to revise it.";
+    } else if (session.turnCount >= maximumTurns) {
+      $("agent-status").textContent = `${maximumTurns}-turn conversation complete.`;
+    } else {
+      $("agent-status").textContent = `Turn ${session.turnCount} of ${maximumTurns}`;
+    }
   } catch (error) {
     appendAgentMessage("assistant", `I could not complete that turn: ${error.message}`);
     $("agent-status").textContent = "Agent turn failed. You can try again.";
   } finally {
     if (agentContext) {
       agentContext.pending = false;
-      input.disabled = false;
-      $("agent-send").disabled = false;
-      input.focus();
+      const complete =
+        Number(agentContext.session?.turnCount || 0) >= agentMaximumTurns(agentContext.session);
+      input.disabled = complete;
+      $("agent-send").disabled = complete;
+      if (!complete) input.focus();
     }
   }
 }
-
 async function confirmAgentPlan() {
-  if (!agentContext) return;
+  if (!agentContext || agentContext.phase !== "planning") return;
   if (agentContext.pending) {
     $("agent-status").textContent = "Wait for the current agent turn to finish.";
     return;
@@ -931,11 +992,12 @@ async function confirmAgentPlan() {
 }
 
 function closeAgentDialog() {
-  if (agentContext && !agentContext.running) agentContext.button.disabled = false;
+  if (agentContext && !agentContext.running && agentContext.button) {
+    agentContext.button.disabled = false;
+  }
   $("agent-dialog").close();
   agentContext = null;
 }
-
 async function forecastDataset(dataset, output, button) {
   button.disabled = true;
   try {

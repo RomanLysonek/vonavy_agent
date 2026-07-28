@@ -184,7 +184,7 @@ def test_agent_quota_is_owner_scoped_and_bounded() -> None:
     request = table.calls[0]
     assert request["Key"]["pk"] == "USER#owner"
     assert request["Key"]["sk"].startswith("AGENT_QUOTA#")
-    assert request["ExpressionAttributeValues"][":limit"] == 20
+    assert request["ExpressionAttributeValues"][":limit"] == 50
     assert "call_count < :limit" in request["ConditionExpression"]
 
 

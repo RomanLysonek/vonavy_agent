@@ -139,7 +139,7 @@ def test_custom_domain_does_not_change_api_authority() -> None:
         )
     )
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
-    assert len(routes) == 14
+    assert len(routes) == 15
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"

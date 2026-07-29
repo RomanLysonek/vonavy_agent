@@ -268,7 +268,9 @@ def _validate_comparison_request(
     base["adapter_id"] = adapter_ids[0]
     base.pop("adapter_ids", None)
     base.pop("child_runs", None)
-    request = ForecastRequest.model_validate(base)
+    request = ForecastRequest.model_validate_json(
+        json.dumps(base, sort_keys=True, separators=(",", ":"))
+    )
     _validate_scope(request)
     return request, tuple(normalized)
 

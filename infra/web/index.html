@@ -63,29 +63,30 @@
 
   <dialog id="agent-dialog" class="agent-dialog">
     <div class="agent-shell">
-      <div class="agent-heading">
-        <div>
-          <p class="label">BEDROCK FORECAST COPILOT</p>
-          <h2 id="agent-title">Plan a forecast</h2>
-          <p>Validated metadata only. No raw rows, code execution, or automatic training.</p>
-        </div>
-        <button id="agent-close" type="button" class="secondary">Close</button>
+      <div class="agent-view">
+        <div id="agent-messages" class="agent-messages" aria-live="polite"></div>
+        <section id="agent-plan" class="agent-plan hidden" aria-label="Confirmable forecast plan">
+          <p class="label">CONFIRMABLE PLAN</p>
+          <div id="agent-plan-summary"></div>
+        </section>
       </div>
-      <div id="agent-messages" class="agent-messages" aria-live="polite"></div>
-      <section id="agent-plan" class="agent-plan hidden">
-        <p class="label">CONFIRMABLE PLAN</p>
-        <div id="agent-plan-summary"></div>
-        <button id="agent-confirm" type="button">Confirm and start</button>
-      </section>
       <form id="agent-form" class="agent-form">
-        <label>
-          Message
+        <label class="agent-input-label">
+          <span class="visually-hidden">Message</span>
           <textarea id="agent-input" maxlength="2000" rows="3" required
             placeholder="Ask about the data, compare models, or request a forecast plan."></textarea>
         </label>
-        <div class="agent-actions">
-          <button id="agent-send" type="submit">Send</button>
-          <span id="agent-status" class="validation-status"></span>
+        <div class="agent-footer">
+          <div class="agent-send-group">
+            <button id="agent-send" type="submit">Send</button>
+            <span id="agent-status" class="validation-status"></span>
+          </div>
+          <div class="agent-footer-actions">
+            <button id="agent-plan-toggle" type="button" class="secondary hidden"
+              aria-controls="agent-plan" aria-pressed="false">Plan</button>
+            <button id="agent-confirm" type="button" class="hidden">Confirm and start</button>
+            <button id="agent-close" type="button" class="secondary">Close</button>
+          </div>
         </div>
       </form>
     </div>

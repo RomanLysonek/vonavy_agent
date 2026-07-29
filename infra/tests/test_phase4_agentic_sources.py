@@ -33,4 +33,9 @@ def test_agentic_routes_and_session_guards_are_materialized() -> None:
     assert 'id="agent-dialog"' in index
     assert 'id="agent-messages"' in index
     assert ".agent-dialog" in styles
-    assert "No raw rows, code execution, or automatic training" in index
+    assert "BEDROCK FORECAST COPILOT" not in index
+    assert "Validated metadata only" not in index
+    assert 'id="agent-plan-toggle"' in index
+    assert 'id="agent-confirm"' in index
+    assert 'id="agent-close"' in index
+    assert "height: calc(100dvh - 24px)" in styles

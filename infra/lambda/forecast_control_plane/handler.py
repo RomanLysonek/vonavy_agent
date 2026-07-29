@@ -59,7 +59,7 @@ SUPPORTED_ADAPTERS = {
     "neuralnet-direct-v1",
     "chronos2-zero-shot-v1",
 }
-TERMINAL = {"succeeded", "invalid", "failed"}
+TERMINAL = {"succeeded", "partial", "invalid", "failed"}
 OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 COLUMN_PATTERN = re.compile(r"^.{1,128}$", re.DOTALL)
 SERIALIZER = TypeSerializer()
@@ -272,6 +272,64 @@ def _adapter_id(payload: dict[str, Any]) -> str:
     return str(value)
 
 
+def _adapter_ids(payload: dict[str, Any]) -> tuple[str, ...]:
+    raw = payload.get("adapterIds")
+    if raw is None:
+        return (_adapter_id(payload),)
+    if not isinstance(raw, list) or not 1 <= len(raw) <= len(SUPPORTED_ADAPTERS):
+        raise ApiError(
+            "unsupported_forecast_adapter",
+            "adapterIds must contain one to three supported adapters",
+            422,
+        )
+    values = tuple(str(value) for value in raw)
+    if any(value not in SUPPORTED_ADAPTERS for value in values) or len(set(values)) != len(values):
+        raise ApiError(
+            "unsupported_forecast_adapter",
+            "adapterIds must contain unique supported adapters",
+            422,
+        )
+    legacy = payload.get("adapterId")
+    if legacy is not None and (not isinstance(legacy, str) or legacy not in values):
+        raise ApiError(
+            "invalid_forecast_request",
+            "adapterId must agree with adapterIds when both are supplied",
+            422,
+        )
+    return values
+
+
+def _stored_adapter_ids(item: dict[str, Any]) -> tuple[str, ...]:
+    raw = item.get("adapter_ids_json")
+    if isinstance(raw, str):
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ApiError("forecast_state_invalid", "Stored adapter list is invalid", 500) from exc
+        if (
+            isinstance(values, list)
+            and values
+            and all(isinstance(value, str) and value in SUPPORTED_ADAPTERS for value in values)
+            and len(values) == len(set(values))
+        ):
+            return tuple(values)
+        raise ApiError("forecast_state_invalid", "Stored adapter list is invalid", 500)
+    return (str(item.get("adapter_id", "xgboost-direct-v1")),)
+
+
+def _stored_child_runs(item: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = item.get("child_runs_json")
+    if not isinstance(raw, str):
+        return []
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ApiError("forecast_state_invalid", "Stored comparison runs are invalid", 500) from exc
+    if not isinstance(values, list) or any(not isinstance(value, dict) for value in values):
+        raise ApiError("forecast_state_invalid", "Stored comparison runs are invalid", 500)
+    return values
+
+
 def _media_type(filename: str) -> str:
     suffix = PurePath(filename).suffix.lower()
     if suffix == ".csv":
@@ -313,14 +371,21 @@ def _item(table: Any, owner: str, run_id: str) -> dict[str, Any] | None:
 
 
 def _fingerprint(
-    dataset_id: str, mapping: dict[str, Any], training_end: str, adapter_id: str
+    dataset_id: str,
+    mapping: dict[str, Any],
+    training_end: str,
+    adapter_ids: str | tuple[str, ...] | list[str],
 ) -> str:
+    normalized = [adapter_ids] if isinstance(adapter_ids, str) else list(adapter_ids)
+    selection = (
+        {"adapter_id": normalized[0]} if len(normalized) == 1 else {"adapter_ids": normalized}
+    )
     encoded = json.dumps(
         {
             "dataset_id": dataset_id,
             "mapping": mapping,
             "training_end": training_end,
-            "adapter_id": adapter_id,
+            **selection,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -352,16 +417,33 @@ def _links(run_id: str) -> dict[str, str]:
 
 
 def _payload(item: dict[str, Any]) -> dict[str, Any]:
+    adapter_ids = _stored_adapter_ids(item)
+    comparison = len(adapter_ids) > 1
     payload: dict[str, Any] = {
         "forecastRunId": item["run_id"],
         "datasetId": item["dataset_id"],
         "status": item["status"],
-        "adapterId": item.get("adapter_id", "xgboost-direct-v1"),
         "createdAt": item["created_at"],
         "updatedAt": item["updated_at"],
         "resultAvailable": bool(item.get("result_version_id")),
         "links": _links(item["run_id"]),
     }
+    if comparison:
+        payload.update(
+            {
+                "runMode": "comparison",
+                "adapterIds": list(adapter_ids),
+                "childRuns": _stored_child_runs(item),
+                "timeoutSeconds": int(
+                    item.get(
+                        "timeout_seconds",
+                        FORECAST_JOB_TIMEOUT_SECONDS * len(adapter_ids),
+                    )
+                ),
+            }
+        )
+    else:
+        payload["adapterId"] = adapter_ids[0]
     if item.get("batch_job_id"):
         payload["batchJobId"] = item["batch_job_id"]
     if item.get("failure_code"):
@@ -369,7 +451,27 @@ def _payload(item: dict[str, Any]) -> dict[str, Any]:
             "code": item["failure_code"],
             "message": item.get("failure_message", "Forecast run failed"),
         }
-    if item.get("holdout_wape") is not None:
+    if comparison:
+        summary: dict[str, Any] = {"modelsRequested": len(adapter_ids)}
+        stored_summary = item.get("comparison_summary_json")
+        if isinstance(stored_summary, str):
+            try:
+                parsed = json.loads(stored_summary)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                summary.update(
+                    {
+                        "modelsSucceeded": int(parsed.get("succeeded_models", 0)),
+                        "modelsFailed": int(parsed.get("failed_models", 0)),
+                        "forecastRows": int(parsed.get("forecast_rows", 0)),
+                        "fallbackRows": int(parsed.get("fallback_rows", 0)),
+                        "bestAdapterId": parsed.get("best_adapter_id"),
+                        "leaderboardComparable": bool(parsed.get("leaderboard_comparable", False)),
+                    }
+                )
+        payload["summary"] = summary
+    elif item.get("holdout_wape") is not None:
         value = float(item["holdout_wape"])
         payload["summary"] = {
             "holdoutWape": None if value < 0 else value,
@@ -388,11 +490,16 @@ def _request_document(
     mapping: dict[str, Any],
     training_end: str,
     requested_at: str,
-    adapter_id: str,
+    adapter_id: str | None = None,
+    adapter_ids: tuple[str, ...] | None = None,
+    child_runs: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    selected = adapter_ids or ((adapter_id or "xgboost-direct-v1"),)
     prefix = f"forecast-results/users/{owner}/datasets/{dataset_id}/runs/{run_id}/"
-    return {
-        "schema_version": "forecast-request/v1",
+    request: dict[str, Any] = {
+        "schema_version": (
+            "forecast-comparison-request/v1" if len(selected) > 1 else "forecast-request/v1"
+        ),
         "owner_id": owner,
         "dataset_id": dataset_id,
         "run_id": run_id,
@@ -408,7 +515,6 @@ def _request_document(
         "mapping": mapping,
         "training_end": training_end,
         "horizon_days": 7,
-        "adapter_id": adapter_id,
         "seed": 42,
         "limits": {
             "max_bytes": MAX_INPUT_BYTES,
@@ -420,6 +526,14 @@ def _request_document(
         "source_revision": SOURCE_REVISION,
         "requested_at": requested_at,
     }
+    if len(selected) == 1:
+        request["adapter_id"] = selected[0]
+    else:
+        if child_runs is None or len(child_runs) != len(selected):
+            raise ApiError("forecast_state_invalid", "Comparison child runs are incomplete", 500)
+        request["adapter_ids"] = list(selected)
+        request["child_runs"] = child_runs
+    return request
 
 
 def _release_failure(ddb: Any, owner: str, run_id: str, code: str, message: str) -> None:
@@ -492,11 +606,23 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
     )
     mapping = _mapping(body)
     training_end = _training_end(body)
-    adapter_id = _adapter_id(body)
+    adapter_ids = _adapter_ids(body)
     _, table, ddb, batch = _clients()
     dataset = _dataset(table, owner, dataset_id)
     run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"vonavy-forecast:{owner}:{token}"))
-    fingerprint = _fingerprint(dataset_id, mapping, training_end, adapter_id)
+    child_runs = (
+        [
+            {
+                "adapter_id": adapter_id,
+                "run_id": str(uuid.uuid5(uuid.UUID(run_id), f"adapter:{adapter_id}")),
+                "status": "queued",
+            }
+            for adapter_id in adapter_ids
+        ]
+        if len(adapter_ids) > 1
+        else []
+    )
+    fingerprint = _fingerprint(dataset_id, mapping, training_end, adapter_ids)
     existing = _item(table, owner, run_id)
     if existing is not None:
         if (
@@ -505,9 +631,10 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
         ):
             raise ApiError("forecast_request_conflict", "requestToken is already in use", 409)
         return 200, _payload(existing)
-
     created = datetime.now(UTC).isoformat()
     now = int(time.time())
+    comparison = len(adapter_ids) > 1
+    timeout_seconds = FORECAST_JOB_TIMEOUT_SECONDS * len(adapter_ids)
     request = _request_document(
         owner=owner,
         dataset_id=dataset_id,
@@ -516,9 +643,38 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
         mapping=mapping,
         training_end=training_end,
         requested_at=created,
-        adapter_id=adapter_id,
+        adapter_ids=adapter_ids,
+        child_runs=[
+            {"adapter_id": child["adapter_id"], "run_id": child["run_id"]} for child in child_runs
+        ],
     )
     owner_pk = f"USER#{owner}"
+    record = {
+        "pk": owner_pk,
+        "sk": f"FORECAST#{run_id}",
+        "entity_type": "FORECAST",
+        "owner_sub": owner,
+        "run_id": run_id,
+        "dataset_id": dataset_id,
+        "request_token": token,
+        "request_fingerprint": fingerprint,
+        "adapter_id": adapter_ids[0],
+        "status": "submitting",
+        "created_at": created,
+        "updated_at": created,
+        "expires_at": now + UPLOAD_RETENTION_DAYS * 86400,
+        "input_version_id": dataset["object_version_id"],
+        "result_key": request["output"]["prefix"] + "result.json",
+    }
+    if comparison:
+        record.update(
+            {
+                "adapter_ids_json": json.dumps(list(adapter_ids), separators=(",", ":")),
+                "child_runs_json": json.dumps(child_runs, separators=(",", ":")),
+                "run_mode": "comparison",
+                "timeout_seconds": timeout_seconds,
+            }
+        )
     try:
         ddb.transact_write_items(
             TransactItems=[
@@ -528,7 +684,8 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
                         "Key": _key(owner_pk, "FORECAST_SLOT#0000"),
                         "UpdateExpression": (
                             "SET entity_type=:entity, owner_sub=:owner, run_id=:run, "
-                            "dataset_id=:dataset, #s=:active, updated_at=:created, expires_at=:expires"
+                            "dataset_id=:dataset, #s=:active, "
+                            "updated_at=:created, expires_at=:expires"
                         ),
                         "ConditionExpression": (
                             "attribute_not_exists(pk) OR #s=:released OR expires_at<=:now"
@@ -543,7 +700,11 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
                                 ":active": "active",
                                 ":released": "released",
                                 ":created": created,
-                                ":expires": now + SLOT_LEASE_SECONDS,
+                                ":expires": (
+                                    now + timeout_seconds + 900
+                                    if comparison
+                                    else now + SLOT_LEASE_SECONDS
+                                ),
                                 ":now": now,
                             }
                         ),
@@ -552,25 +713,7 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
                 {
                     "Put": {
                         "TableName": METADATA_TABLE,
-                        "Item": _ddb_item(
-                            {
-                                "pk": owner_pk,
-                                "sk": f"FORECAST#{run_id}",
-                                "entity_type": "FORECAST",
-                                "owner_sub": owner,
-                                "run_id": run_id,
-                                "dataset_id": dataset_id,
-                                "request_token": token,
-                                "request_fingerprint": fingerprint,
-                                "adapter_id": adapter_id,
-                                "status": "submitting",
-                                "created_at": created,
-                                "updated_at": created,
-                                "expires_at": now + UPLOAD_RETENTION_DAYS * 86400,
-                                "input_version_id": dataset["object_version_id"],
-                                "result_key": request["output"]["prefix"] + "result.json",
-                            }
-                        ),
+                        "Item": _ddb_item(record),
                         "ConditionExpression": "attribute_not_exists(pk)",
                     }
                 },
@@ -585,13 +728,12 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
         raise ApiError(
             "forecast_capacity_exceeded", "Another forecast is already active", 429
         ) from exc
-
     try:
-        submitted = batch.submit_job(
-            jobName=f"forecast-{run_id}",
-            jobQueue=FORECAST_JOB_QUEUE,
-            jobDefinition=FORECAST_JOB_DEFINITION,
-            containerOverrides={
+        submit: dict[str, Any] = {
+            "jobName": f"forecast-{run_id}",
+            "jobQueue": FORECAST_JOB_QUEUE,
+            "jobDefinition": FORECAST_JOB_DEFINITION,
+            "containerOverrides": {
                 "environment": [
                     {
                         "name": "VONAVY_FORECAST_REQUEST_JSON",
@@ -599,7 +741,10 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
                     }
                 ]
             },
-        )
+        }
+        if comparison:
+            submit["timeout"] = {"attemptDurationSeconds": timeout_seconds}
+        submitted = batch.submit_job(**submit)
         batch_job_id = submitted.get("jobId")
         if not isinstance(batch_job_id, str) or not batch_job_id:
             raise RuntimeError("AWS Batch returned no jobId")
@@ -634,7 +779,75 @@ def _create(event: dict[str, Any], dataset_id: str) -> tuple[int, dict[str, Any]
     return 202, _payload(current)
 
 
-def _terminalize(
+def _comparison_result_models(
+    owner: str,
+    item: dict[str, Any],
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    adapter_ids = _stored_adapter_ids(item)
+    child_runs = _stored_child_runs(item)
+    expected_children = {
+        str(child.get("adapter_id")): str(child.get("run_id"))
+        for child in child_runs
+        if isinstance(child.get("adapter_id"), str) and isinstance(child.get("run_id"), str)
+    }
+    expected_child_runs = [
+        {"adapter_id": adapter_id, "run_id": expected_children[adapter_id]}
+        for adapter_id in adapter_ids
+        if adapter_id in expected_children
+    ]
+    identity = result.get("input") if isinstance(result.get("input"), dict) else {}
+    models = result.get("models")
+    if (
+        result.get("schema_version") != "forecast-comparison-result/v1"
+        or result.get("owner_id") != owner
+        or result.get("run_id") != item["run_id"]
+        or result.get("dataset_id") != item["dataset_id"]
+        or identity.get("version_id") != item["input_version_id"]
+        or result.get("adapter_ids") != list(adapter_ids)
+        or result.get("child_runs") != expected_child_runs
+        or not isinstance(models, list)
+        or len(models) != len(adapter_ids)
+        or set(expected_children) != set(adapter_ids)
+    ):
+        raise ApiError(
+            "forecast_result_invalid",
+            "Forecast comparison identity does not match the run",
+            502,
+        )
+    seen: set[str] = set()
+    validated: list[dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict):
+            raise ApiError("forecast_result_invalid", "Forecast comparison model is invalid", 502)
+        adapter = model.get("adapter") if isinstance(model.get("adapter"), dict) else {}
+        model_input = model.get("input") if isinstance(model.get("input"), dict) else {}
+        adapter_id = adapter.get("id")
+        status = model.get("status")
+        if (
+            adapter_id not in adapter_ids
+            or adapter_id in seen
+            or status not in {"succeeded", "invalid", "failed"}
+            or model.get("owner_id") != owner
+            or model.get("dataset_id") != item["dataset_id"]
+            or model.get("run_id") != expected_children.get(str(adapter_id))
+            or model_input.get("version_id") != item["input_version_id"]
+        ):
+            raise ApiError(
+                "forecast_result_invalid",
+                "Forecast comparison child identity does not match the run",
+                502,
+            )
+        if status == "succeeded":
+            _validated_result_evaluation(model)
+        seen.add(str(adapter_id))
+        validated.append(model)
+    if seen != set(adapter_ids):
+        raise ApiError("forecast_result_invalid", "Forecast comparison is incomplete", 502)
+    return validated
+
+
+def _terminalize_comparison(
     ddb: Any,
     owner: str,
     item: dict[str, Any],
@@ -643,6 +856,212 @@ def _terminalize(
 ) -> None:
     status = result.get("status")
     if status not in TERMINAL:
+        raise ApiError("forecast_result_invalid", "Forecast result has invalid status", 502)
+    models = _comparison_result_models(owner, item, result)
+    succeeded = [model for model in models if model.get("status") == "succeeded"]
+    expected_status = (
+        "succeeded"
+        if len(succeeded) == len(models)
+        else "partial"
+        if succeeded
+        else "invalid"
+        if all(model.get("status") == "invalid" for model in models)
+        else "failed"
+    )
+    if status != expected_status:
+        raise ApiError("forecast_result_invalid", "Forecast comparison status is inconsistent", 502)
+    leaderboard = result.get("leaderboard")
+    summary = result.get("summary")
+    if (
+        not isinstance(leaderboard, list)
+        or len(leaderboard) != len(models)
+        or not isinstance(summary, dict)
+    ):
+        raise ApiError("forecast_result_invalid", "Forecast comparison summary is invalid", 502)
+    adapter_ids = _stored_adapter_ids(item)
+    models_by_adapter = {str(model["adapter"]["id"]): model for model in models}
+    seen_entries: set[str] = set()
+    succeeded_entries: list[dict[str, Any]] = []
+    for entry in leaderboard:
+        if not isinstance(entry, dict):
+            raise ApiError(
+                "forecast_result_invalid",
+                "Forecast comparison leaderboard is invalid",
+                502,
+            )
+        adapter_id = entry.get("adapter_id")
+        model = models_by_adapter.get(str(adapter_id))
+        if (
+            model is None
+            or adapter_id in seen_entries
+            or entry.get("run_id") != model["run_id"]
+            or entry.get("status") != model["status"]
+            or entry.get("holdout_rows") != (model.get("holdout") or {}).get("rows")
+            or entry.get("holdout_wape") != (model.get("holdout") or {}).get("wape")
+        ):
+            raise ApiError(
+                "forecast_result_invalid",
+                "Forecast comparison leaderboard is invalid",
+                502,
+            )
+        seen_entries.add(str(adapter_id))
+        if entry.get("status") == "succeeded":
+            succeeded_entries.append(entry)
+    if seen_entries != set(adapter_ids):
+        raise ApiError(
+            "forecast_result_invalid",
+            "Forecast comparison leaderboard is incomplete",
+            502,
+        )
+    comparable = summary.get("leaderboard_comparable")
+    if not isinstance(comparable, bool):
+        raise ApiError("forecast_result_invalid", "Forecast comparison basis is invalid", 502)
+    best_adapter_id: str | None = None
+    best_wape = Decimal("-1")
+    if comparable:
+        ranks = [entry.get("rank") for entry in succeeded_entries]
+        if (
+            len(succeeded_entries) < 2
+            or any(not isinstance(rank, int) or isinstance(rank, bool) for rank in ranks)
+            or sorted(ranks) != list(range(1, len(ranks) + 1))
+        ):
+            raise ApiError("forecast_result_invalid", "Forecast comparison ranks are invalid", 502)
+        ranked = sorted(succeeded_entries, key=lambda entry: int(entry["rank"]))
+        values = [entry.get("holdout_wape") for entry in ranked]
+        if any(not isinstance(value, (int, float)) for value in values):
+            raise ApiError(
+                "forecast_result_invalid",
+                "Forecast comparison WAPE values are invalid",
+                502,
+            )
+        if values != sorted(values):
+            raise ApiError(
+                "forecast_result_invalid",
+                "Forecast comparison ranks are inconsistent",
+                502,
+            )
+        best_adapter_id = str(ranked[0]["adapter_id"])
+        best_wape = Decimal(str(ranked[0]["holdout_wape"]))
+    elif any(entry.get("rank") is not None for entry in leaderboard):
+        raise ApiError("forecast_result_invalid", "Unranked comparison contains ranks", 502)
+    if summary.get("best_adapter_id") != best_adapter_id:
+        raise ApiError("forecast_result_invalid", "Forecast comparison winner is inconsistent", 502)
+    if (
+        summary.get("requested_models") != len(models)
+        or summary.get("succeeded_models") != len(succeeded)
+        or summary.get("failed_models") != len(models) - len(succeeded)
+    ):
+        raise ApiError(
+            "forecast_result_invalid",
+            "Forecast comparison counts are inconsistent",
+            502,
+        )
+    child_statuses = [
+        {
+            "adapter_id": model["adapter"]["id"],
+            "run_id": model["run_id"],
+            "status": model["status"],
+        }
+        for model in models
+    ]
+    common_rows = summary.get("common_rows")
+    comparison_reason = summary.get("comparison_reason")
+    holdout_origin = summary.get("holdout_origin")
+    if (
+        not isinstance(common_rows, int)
+        or isinstance(common_rows, bool)
+        or common_rows < 0
+        or (comparison_reason is not None and not isinstance(comparison_reason, str))
+        or (holdout_origin is not None and not isinstance(holdout_origin, str))
+    ):
+        raise ApiError("forecast_result_invalid", "Forecast comparison basis is invalid", 502)
+    normalized_summary = {
+        "requested_models": len(models),
+        "succeeded_models": len(succeeded),
+        "failed_models": len(models) - len(succeeded),
+        "forecast_rows": sum(
+            int((model.get("profile") or {}).get("entities", 0)) * 7 for model in models
+        ),
+        "fallback_rows": sum(
+            int((model.get("profile") or {}).get("fallback_rows", 0)) for model in models
+        ),
+        "best_adapter_id": best_adapter_id,
+        "leaderboard_comparable": comparable,
+        "comparison_reason": comparison_reason,
+        "holdout_origin": holdout_origin,
+        "common_rows": common_rows,
+    }
+    now = datetime.now(UTC).isoformat()
+    expires = int(time.time()) + UPLOAD_RETENTION_DAYS * 86400
+    run_values = {
+        ":status": status,
+        ":now": now,
+        ":version": version_id,
+        ":expires": expires,
+        ":owner": owner,
+        ":run": item["run_id"],
+        ":rows": normalized_summary["forecast_rows"],
+        ":fallback": normalized_summary["fallback_rows"],
+        ":wape": best_wape,
+        ":summary": json.dumps(normalized_summary, sort_keys=True, separators=(",", ":")),
+        ":children": json.dumps(child_statuses, sort_keys=True, separators=(",", ":")),
+    }
+    slot_values = {
+        ":released": "released",
+        ":now": now,
+        ":expires": expires,
+        ":owner": owner,
+        ":run": item["run_id"],
+    }
+    try:
+        ddb.transact_write_items(
+            TransactItems=[
+                {
+                    "Update": {
+                        "TableName": METADATA_TABLE,
+                        "Key": _key(f"USER#{owner}", f"FORECAST#{item['run_id']}"),
+                        "UpdateExpression": (
+                            "SET #s=:status, updated_at=:now, result_version_id=:version, "
+                            "forecast_rows=:rows, fallback_rows=:fallback, holdout_wape=:wape, "
+                            "comparison_summary_json=:summary, child_runs_json=:children, "
+                            "expires_at=:expires"
+                        ),
+                        "ConditionExpression": "owner_sub=:owner AND run_id=:run",
+                        "ExpressionAttributeNames": {"#s": "status"},
+                        "ExpressionAttributeValues": _expression(run_values),
+                    }
+                },
+                {
+                    "Update": {
+                        "TableName": METADATA_TABLE,
+                        "Key": _key(f"USER#{owner}", "FORECAST_SLOT#0000"),
+                        "UpdateExpression": (
+                            "SET #s=:released, updated_at=:now, expires_at=:expires"
+                        ),
+                        "ConditionExpression": "owner_sub=:owner AND run_id=:run",
+                        "ExpressionAttributeNames": {"#s": "status"},
+                        "ExpressionAttributeValues": _expression(slot_values),
+                    }
+                },
+            ]
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+            raise
+
+
+def _terminalize(
+    ddb: Any,
+    owner: str,
+    item: dict[str, Any],
+    result: dict[str, Any],
+    version_id: str,
+) -> None:
+    if result.get("schema_version") == "forecast-comparison-result/v1":
+        _terminalize_comparison(ddb, owner, item, result, version_id)
+        return
+    status = result.get("status")
+    if status not in TERMINAL - {"partial"}:
         raise ApiError("forecast_result_invalid", "Forecast result has invalid status", 502)
     identity = result.get("input") if isinstance(result.get("input"), dict) else {}
     adapter = result.get("adapter") if isinstance(result.get("adapter"), dict) else {}
@@ -704,7 +1123,9 @@ def _terminalize(
                     "Update": {
                         "TableName": METADATA_TABLE,
                         "Key": _key(f"USER#{owner}", "FORECAST_SLOT#0000"),
-                        "UpdateExpression": "SET #s=:released, updated_at=:now, expires_at=:expires",
+                        "UpdateExpression": (
+                            "SET #s=:released, updated_at=:now, expires_at=:expires"
+                        ),
                         "ConditionExpression": "owner_sub=:owner AND run_id=:run",
                         "ExpressionAttributeNames": {"#s": "status"},
                         "ExpressionAttributeValues": _expression(slot_values),
@@ -1221,6 +1642,144 @@ def _forecast_result_review(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _artifact_downloads(
+    s3: Any,
+    *,
+    artifacts: object,
+    expected_prefix: str,
+) -> dict[str, str]:
+    values = artifacts if isinstance(artifacts, dict) else {}
+    downloads: dict[str, str] = {}
+    for name in ("forecast", "model", "manifest"):
+        artifact = values.get(name) if isinstance(values.get(name), dict) else None
+        if artifact is None:
+            continue
+        key = artifact.get("key")
+        artifact_version = artifact.get("version_id")
+        if (
+            not isinstance(key, str)
+            or not key.startswith(expected_prefix)
+            or not isinstance(artifact_version, str)
+            or not artifact_version
+        ):
+            raise ApiError("forecast_result_invalid", "Forecast artifact identity is invalid", 502)
+        downloads[name] = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": DATA_BUCKET, "Key": key, "VersionId": artifact_version},
+            ExpiresIn=900,
+        )
+    return downloads
+
+
+def _forecast_comparison_review(payload: dict[str, Any]) -> dict[str, Any]:
+    models = payload.get("models") if isinstance(payload.get("models"), list) else []
+    leaderboard = payload.get("leaderboard") if isinstance(payload.get("leaderboard"), list) else []
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    findings: list[dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict) or model.get("status") == "succeeded":
+            continue
+        adapter = model.get("adapter") if isinstance(model.get("adapter"), dict) else {}
+        failure = model.get("failure") if isinstance(model.get("failure"), dict) else {}
+        findings.append(
+            {
+                "id": f"model.{adapter.get('id', 'unknown')}.terminal",
+                "severity": "warning",
+                "message": (
+                    f"{adapter.get('id', 'A requested adapter')} finished as "
+                    f"{model.get('status')}: "
+                    f"{failure.get('message', 'no additional failure detail was recorded')}"
+                )[:500],
+            }
+        )
+    comparable = summary.get("leaderboard_comparable") is True
+    best = next(
+        (
+            entry
+            for entry in leaderboard
+            if isinstance(entry, dict)
+            and entry.get("status") == "succeeded"
+            and entry.get("rank") == 1
+        ),
+        None,
+    )
+    if comparable and isinstance(best, dict):
+        value = best.get("holdout_wape")
+        suffix = f" with holdout WAPE {float(value):.4f}" if isinstance(value, (int, float)) else ""
+        findings.insert(
+            0,
+            {
+                "id": "comparison.best_adapter",
+                "severity": "info",
+                "message": f"The best comparable adapter was {best.get('adapter_id')}{suffix}.",
+            },
+        )
+    elif not comparable:
+        findings.insert(
+            0,
+            {
+                "id": "comparison.not_rankable",
+                "severity": "notice",
+                "message": str(
+                    summary.get("comparison_reason")
+                    or "A common ranked leaderboard was unavailable for this comparison."
+                )[:500],
+            },
+        )
+    attention = any(item["severity"] == "warning" for item in findings)
+    return {
+        "policyVersion": "forecast-comparison-review/v1",
+        "status": "needs_attention" if attention else "ready",
+        "headline": (
+            "The comparison completed with one or more adapters unavailable."
+            if attention
+            else "All requested adapters completed with a comparable ranked leaderboard."
+            if comparable
+            else (
+                "The requested adapters completed, but a common ranked leaderboard was unavailable."
+            )
+        ),
+        "findings": findings[:8],
+        "recommendations": [
+            {
+                "recommendationId": "comparison.inspect_leaderboard",
+                "priority": "normal",
+                "action": (
+                    "Review the common-evidence leaderboard and model-specific "
+                    "diagnostics before selecting an adapter."
+                    if comparable
+                    else (
+                        "Review model-specific diagnostics and the recorded comparison "
+                        "limitation before selecting an adapter."
+                    )
+                ),
+                "rationale": (
+                    "Accuracy, coverage, runtime, and operational suitability may "
+                    "differ by adapter."
+                ),
+                "evidence": {
+                    "requestedModels": len(models),
+                    "successfulModels": sum(
+                        isinstance(model, dict) and model.get("status") == "succeeded"
+                        for model in models
+                    ),
+                    "leaderboardComparable": comparable,
+                },
+                "executesAutomatically": False,
+            }
+        ],
+        "unavailable": [] if comparable else ["common ranked leaderboard"],
+        "safety": {
+            "deterministic": True,
+            "workerEvidenceOnly": True,
+            "rawRowsRead": False,
+            "rawEntityValuesRead": False,
+            "bedrockInvoked": False,
+            "automaticRerun": False,
+        },
+    }
+
+
 def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
     owner = _identity(event)
     run_id = _canonical_uuid(
@@ -1251,6 +1810,22 @@ def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
         raise ApiError("forecast_result_invalid", "Forecast result is not valid JSON", 502) from exc
     if not isinstance(payload, dict):
         raise ApiError("forecast_result_invalid", "Forecast result must be a JSON object", 502)
+    parent_prefix = f"forecast-results/users/{owner}/datasets/{item['dataset_id']}/runs/{run_id}/"
+    if payload.get("schema_version") == "forecast-comparison-result/v1":
+        models = _comparison_result_models(owner, item, payload)
+        for model in models:
+            adapter = model.get("adapter") if isinstance(model.get("adapter"), dict) else {}
+            adapter_id = str(adapter.get("id"))
+            if model.get("status") == "succeeded":
+                model["review"] = _forecast_result_review(model)
+            model["downloads"] = _artifact_downloads(
+                s3,
+                artifacts=model.get("artifacts"),
+                expected_prefix=parent_prefix + f"models/{adapter_id}/",
+            )
+        payload["review"] = _forecast_comparison_review(payload)
+        payload["downloads"] = {}
+        return payload
     identity = payload.get("input") if isinstance(payload.get("input"), dict) else {}
     adapter = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else {}
     if (
@@ -1264,44 +1839,145 @@ def _result(event: dict[str, Any], run_id: str) -> dict[str, Any]:
             "forecast_result_invalid", "Forecast result identity does not match the run", 502
         )
     payload["review"] = _forecast_result_review(payload)
-    prefix = f"forecast-results/users/{owner}/datasets/{item['dataset_id']}/runs/{run_id}/"
-    artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
-    downloads: dict[str, str] = {}
-    for name in ("forecast", "model", "manifest"):
-        artifact = artifacts.get(name) if isinstance(artifacts.get(name), dict) else None
-        if artifact is None:
-            continue
-        key = artifact.get("key")
-        artifact_version = artifact.get("version_id")
-        if (
-            not isinstance(key, str)
-            or not key.startswith(prefix)
-            or not isinstance(artifact_version, str)
-            or not artifact_version
-        ):
-            raise ApiError("forecast_result_invalid", "Forecast artifact identity is invalid", 502)
-        downloads[name] = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": DATA_BUCKET, "Key": key, "VersionId": artifact_version},
-            ExpiresIn=900,
-        )
-    payload["downloads"] = downloads
+    payload["downloads"] = _artifact_downloads(
+        s3,
+        artifacts=payload.get("artifacts"),
+        expected_prefix=parent_prefix,
+    )
     return payload
 
 
-def _agent_result_context(payload: dict[str, Any]) -> dict[str, Any]:
-    fields = (
-        "schema_version",
-        "status",
-        "dataset_id",
-        "run_id",
-        "adapter",
-        "profile",
-        "holdout",
-        "evaluation",
-        "review",
+def _bounded_mapping(value: object, fields: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {field: value[field] for field in fields if field in value}
+
+
+def _bounded_review(value: object) -> dict[str, Any]:
+    review = _bounded_mapping(
+        value,
+        ("policyVersion", "status", "headline", "unavailable", "safety"),
     )
-    context = {field: payload[field] for field in fields if field in payload}
+    source = value if isinstance(value, dict) else {}
+    findings = source.get("findings")
+    if isinstance(findings, list):
+        review["findings"] = [
+            _bounded_mapping(item, ("id", "severity", "message"))
+            for item in findings[:8]
+            if isinstance(item, dict)
+        ]
+    recommendations = source.get("recommendations")
+    if isinstance(recommendations, list):
+        review["recommendations"] = [
+            _bounded_mapping(
+                item,
+                (
+                    "recommendationId",
+                    "priority",
+                    "action",
+                    "rationale",
+                    "evidence",
+                    "executesAutomatically",
+                ),
+            )
+            for item in recommendations[:4]
+            if isinstance(item, dict)
+        ]
+    return review
+
+
+def _bounded_evaluation(value: object) -> dict[str, Any]:
+    evaluation = _bounded_mapping(
+        value,
+        (
+            "schema_version",
+            "evidence_basis",
+            "holdout_origin",
+            "baseline_skill",
+            "unavailable",
+            "evaluated_entity_count",
+            "cold_start_entity_count",
+            "cold_start_rate",
+            "evaluated_feature_count",
+            "extrapolated_value_count",
+            "evaluated_value_count",
+            "feature_extrapolation_rate",
+            "safety",
+        ),
+    )
+    source = value if isinstance(value, dict) else {}
+    for field in ("worst_entities", "feature_shifts"):
+        items = source.get(field)
+        if isinstance(items, list):
+            evaluation[field] = items[:3]
+    return evaluation
+
+
+def _comparison_agent_model_context(model: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": model.get("status"),
+        "run_id": model.get("run_id"),
+        "adapter": _bounded_mapping(model.get("adapter"), ("id", "label")),
+        "profile": _bounded_mapping(
+            model.get("profile"),
+            (
+                "rows",
+                "entities",
+                "history_start",
+                "training_end",
+                "forecast_start",
+                "forecast_end",
+                "trainable_rows",
+                "fallback_rows",
+            ),
+        ),
+        "holdout": _bounded_mapping(
+            model.get("holdout"),
+            (
+                "supported",
+                "origin",
+                "rows",
+                "coverage",
+                "wape",
+                "unsupported_reason",
+            ),
+        ),
+        "evaluation": _bounded_evaluation(model.get("evaluation")),
+        "failure": _bounded_mapping(model.get("failure"), ("code", "message")),
+        "review": _bounded_review(model.get("review")),
+    }
+
+
+def _agent_result_context(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("schema_version") == "forecast-comparison-result/v1":
+        fields = (
+            "schema_version",
+            "status",
+            "dataset_id",
+            "run_id",
+            "adapter_ids",
+            "leaderboard",
+            "summary",
+        )
+        context = {field: payload[field] for field in fields if field in payload}
+        context["review"] = _bounded_review(payload.get("review"))
+        models = payload.get("models") if isinstance(payload.get("models"), list) else []
+        context["models"] = [
+            _comparison_agent_model_context(model) for model in models if isinstance(model, dict)
+        ]
+    else:
+        fields = (
+            "schema_version",
+            "status",
+            "dataset_id",
+            "run_id",
+            "adapter",
+            "profile",
+            "holdout",
+            "evaluation",
+            "review",
+        )
+        context = {field: payload[field] for field in fields if field in payload}
     encoded = json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
     if len(encoded) > 64 * 1024:
         raise ApiError(

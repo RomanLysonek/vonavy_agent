@@ -1,7 +1,7 @@
 const API_REQUEST_TIMEOUT_MS = 15_000;
 const API_RETRY_DELAYS_MS = [250, 750];
 const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504]);
-const FORECAST_TERMINAL_STATUSES = new Set(["succeeded", "invalid", "failed"]);
+const FORECAST_TERMINAL_STATUSES = new Set(["succeeded", "partial", "invalid", "failed"]);
 const FORECAST_RUN_STORAGE_PREFIX = "vonavy_forecast_runs";
 
 const state = {
@@ -100,6 +100,11 @@ function rememberForecastRun(run) {
     datasetId,
     forecastRunId,
     status: run.status,
+    runMode: run.runMode || "single",
+    adapterId: run.adapterId || null,
+    adapterIds: Array.isArray(run.adapterIds) ? run.adapterIds : [],
+    childRuns: Array.isArray(run.childRuns) ? run.childRuns : [],
+    timeoutSeconds: Number(run.timeoutSeconds || 0),
     resultAvailable: Boolean(run.resultAvailable),
     links: {
       status,
@@ -109,7 +114,6 @@ function rememberForecastRun(run) {
   };
   saveRememberedForecastRuns(runs);
 }
-
 function rememberedForecastRun(datasetId) {
   return loadRememberedForecastRuns()[datasetId] || null;
 }
@@ -367,6 +371,21 @@ async function validateDataset(dataset, output, button) {
 }
 
 function forecastMessage(run, result = null) {
+  if (result?.schema_version === "forecast-comparison-result/v1") {
+    const summary = result.summary || {};
+    const requested = Number(summary.requested_models || result.adapter_ids?.length || 0);
+    const succeeded = Number(summary.succeeded_models || 0);
+    const best = summary.best_adapter_id
+      ? ` Best comparable adapter: ${summary.best_adapter_id}.`
+      : "";
+    const limitation = summary.leaderboard_comparable === false && summary.comparison_reason
+      ? ` ${summary.comparison_reason}`
+      : "";
+    return (
+      `Model comparison ${result.status}: ${succeeded}/${requested} adapters ` +
+      `succeeded.${best}${limitation}`
+    );
+  }
   if (run.status === "succeeded" && result) {
     const wape = result.holdout?.wape;
     const quality = typeof wape === "number" ? ` Holdout WAPE ${(wape * 100).toFixed(2)}%.` : "";
@@ -375,7 +394,12 @@ function forecastMessage(run, result = null) {
   if (run.status === "invalid" && result) {
     return result.failure?.message || "The forecast mapping or data is invalid.";
   }
+  if (run.status === "partial") return "Model comparison completed with partial results.";
   if (run.status === "failed") return run.failure?.message || "Forecast worker failed.";
+  if (run.runMode === "comparison") {
+    const total = Array.isArray(run.adapterIds) ? run.adapterIds.length : 0;
+    return `Model comparison status: ${run.status}${total ? ` (${total} adapters)` : ""}.`;
+  }
   return `Forecast status: ${run.status}.`;
 }
 function promptColumn(label, fallback, optional = false) {
@@ -453,19 +477,94 @@ function appendResultReview(output, result) {
   output.append(document.createTextNode(" "), details);
 }
 
-function showForecastResult(output, run, result) {
-  output.replaceChildren(document.createTextNode(forecastMessage(run, result)));
-  appendResultReview(output, result);
-  for (const [name, url] of Object.entries(result.downloads || {})) {
+function appendComparisonLeaderboard(output, result) {
+  const leaderboard = Array.isArray(result.leaderboard) ? result.leaderboard : [];
+  if (!leaderboard.length) return;
+  const details = document.createElement("details");
+  details.open = true;
+  const heading = document.createElement("summary");
+  heading.textContent = result.summary?.leaderboard_comparable
+    ? "Common-evidence model leaderboard"
+    : "Model results (common leaderboard unavailable)";
+  details.append(heading);
+  const table = document.createElement("table");
+  table.className = "comparison-leaderboard";
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const label of ["Rank", "Model", "Status", "Holdout WAPE", "Rows"]) {
+    const cell = document.createElement("th");
+    cell.textContent = label;
+    headRow.append(cell);
+  }
+  head.append(headRow);
+  table.append(head);
+  const body = document.createElement("tbody");
+  for (const entry of leaderboard) {
+    const row = document.createElement("tr");
+    const values = [
+      entry.rank ?? "—",
+      entry.adapter_id,
+      entry.status,
+      typeof entry.holdout_wape === "number"
+        ? `${(entry.holdout_wape * 100).toFixed(2)}%`
+        : "unavailable",
+      Number(entry.forecast_rows || 0).toLocaleString(),
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = String(value);
+      row.append(cell);
+    }
+    body.append(row);
+  }
+  table.append(body);
+  details.append(table);
+  output.append(document.createTextNode(" "), details);
+}
+function appendDownloads(output, downloads, prefix = "") {
+  for (const [name, url] of Object.entries(downloads || {})) {
     const link = document.createElement("a");
     link.href = url;
-    link.textContent = `Download ${name}`;
+    link.textContent = `Download ${prefix}${name}`;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.className = "artifact-link";
     output.append(document.createTextNode(" "), link);
   }
-  if (run.status === "succeeded") {
+}
+function appendComparisonModels(output, result) {
+  for (const model of result.models || []) {
+    const adapter = model.adapter?.id || "model";
+    const details = document.createElement("details");
+    details.className = "comparison-model";
+    const summary = document.createElement("summary");
+    const wape = model.holdout?.wape;
+    summary.textContent = `${adapter}: ${model.status}${
+      typeof wape === "number" ? ` · WAPE ${(wape * 100).toFixed(2)}%` : ""
+    }`;
+    details.append(summary);
+    const body = document.createElement("div");
+    if (model.failure?.message) {
+      const failure = document.createElement("p");
+      failure.textContent = model.failure.message;
+      body.append(failure);
+    }
+    appendResultReview(body, model);
+    appendDownloads(body, model.downloads, `${adapter} `);
+    details.append(body);
+    output.append(document.createTextNode(" "), details);
+  }
+}
+function showForecastResult(output, run, result) {
+  output.replaceChildren(document.createTextNode(forecastMessage(run, result)));
+  appendResultReview(output, result);
+  if (result.schema_version === "forecast-comparison-result/v1") {
+    appendComparisonLeaderboard(output, result);
+    appendComparisonModels(output, result);
+  } else {
+    appendDownloads(output, result.downloads);
+  }
+  if (["succeeded", "partial"].includes(run.status)) {
     const discuss = document.createElement("button");
     discuss.type = "button";
     discuss.className = "secondary";
@@ -479,7 +578,12 @@ function showForecastResult(output, run, result) {
 async function waitForForecast(run, output, button) {
   let current = run;
   rememberForecastRun(current);
-  const maxAttempts = Math.ceil((state.config.forecastJobTimeoutSeconds + 900) / 3);
+  const requestedModels = Math.max(1, Number(current.adapterIds?.length || 1));
+  const configuredTimeout = Number(current.timeoutSeconds || 0);
+  const timeoutSeconds = configuredTimeout > 0
+    ? configuredTimeout
+    : state.config.forecastJobTimeoutSeconds * requestedModels;
+  const maxAttempts = Math.ceil((timeoutSeconds + 900) / 3);
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     output.textContent = forecastMessage(current);
     if (FORECAST_TERMINAL_STATUSES.has(current.status)) {
@@ -490,14 +594,13 @@ async function waitForForecast(run, output, button) {
       button.disabled = false;
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await sleep(3000);
     current = await api(current.links.status);
     rememberForecastRun(current);
   }
-  output.textContent = "Forecast is still running. Refresh to restore its latest status.";
+  output.textContent = "Forecast is still running. Refresh to restore its current state.";
   button.disabled = false;
 }
-
 async function restoreForecast(dataset, output, button) {
   const remembered = rememberedForecastRun(dataset.datasetId);
   if (!remembered?.links?.status) return;
@@ -716,77 +819,115 @@ function agentMaximumTurns(session = null) {
   );
   return Number.isInteger(configured) && configured > 0 ? configured : 20;
 }
+function showAgentPane(name) {
+  if (!agentContext) return;
+  const showPlan = name === "plan" && agentContext.phase === "planning" && agentContext.plan;
+  agentContext.planVisible = Boolean(showPlan);
+  $("agent-messages").classList.toggle("hidden", Boolean(showPlan));
+  $("agent-plan").classList.toggle("hidden", !showPlan);
+  $("agent-plan-toggle").setAttribute("aria-pressed", String(Boolean(showPlan)));
+}
+function toggleAgentPlan() {
+  if (!agentContext?.plan || agentContext.phase !== "planning") return;
+  showAgentPane(agentContext.planVisible ? "chat" : "plan");
+}
 function setAgentPlan(plan) {
   if (!agentContext) return;
   const planning = agentContext.phase === "planning";
   agentContext.plan = planning ? plan || null : null;
   const confirm = $("agent-confirm");
+  const toggle = $("agent-plan-toggle");
   confirm.classList.toggle("hidden", !planning);
+  toggle.classList.toggle("hidden", !planning || !plan);
   if (!planning || !plan) {
-    $("agent-plan").classList.add("hidden");
     $("agent-plan-summary").replaceChildren();
     confirm.disabled = true;
+    showAgentPane("chat");
     return;
   }
   renderAgentPlan(plan);
   confirm.disabled = false;
+  showAgentPane("chat");
+}
+function appendPreprocessingPlan(root, item) {
+  const preprocessing = item?.plan || item;
+  if (!preprocessing) return;
+  const adapterLabel = item?.adapter?.label || item?.adapterId || "Model";
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  const operations = Array.isArray(preprocessing.operations) ? preprocessing.operations : [];
+  summary.textContent = `Preprocessing: ${operations.length} fixed operations · ${adapterLabel}`;
+  details.append(summary);
+  const metadata = document.createElement("p");
+  const digest = preprocessing.digest?.value || "unavailable";
+  metadata.textContent = `Catalogue: ${preprocessing.catalogVersion} · plan digest: ${digest.slice(0, 12)}…`;
+  details.append(metadata);
+  const review = preprocessing.review || {};
+  const findings = Array.isArray(preprocessing.findings) ? preprocessing.findings : [];
+  const attentionFindingLabel = findings.length === 1 ? "attention finding" : "attention findings";
+  const reviewLine = document.createElement("p");
+  reviewLine.textContent = `Preprocessing review: ${review.status || "unavailable"} · max severity: ${review.maxSeverity || "unavailable"} · ${findings.length} ${attentionFindingLabel}`;
+  details.append(reviewLine);
+  const attentionFindings = findings.filter((finding) => finding.severity === "warning");
+  if (attentionFindings.length) {
+    const findingsList = document.createElement("ul");
+    for (const finding of attentionFindings) {
+      const listItem = document.createElement("li");
+      listItem.textContent = `${finding.severity}: ${finding.message}`;
+      findingsList.append(listItem);
+    }
+    details.append(findingsList);
+  }
+  const list = document.createElement("ol");
+  for (const operation of operations) {
+    const listItem = document.createElement("li");
+    listItem.textContent = `${operation.action} (${operation.status})`;
+    list.append(listItem);
+  }
+  details.append(list);
+  root.append(details);
 }
 function renderAgentPlan(plan) {
   const root = $("agent-plan-summary");
   root.replaceChildren();
-  const preprocessing = plan.preprocessingPlan;
+  const adapters = Array.isArray(plan.adapters) && plan.adapters.length
+    ? plan.adapters
+    : plan.adapter
+      ? [{ id: plan.adapterId, ...plan.adapter }]
+      : [];
   const lines = [
     plan.summary,
-    `Model: ${plan.adapter.label}`,
+    `${plan.executionMode === "comparison" ? "Models" : "Model"}: ${
+      adapters.map((adapter) => adapter.label || adapter.id).join(", ")
+    }`,
     `Target: ${plan.mapping.targetColumn}`,
     `Timestamp: ${plan.mapping.timestampColumn}`,
     `Entity: ${plan.mapping.entityColumn || "single series"}`,
     `Training end: ${plan.trainingEnd}`,
     `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}`,
   ];
-  if (plan.warnings.length) lines.push(`Warnings: ${plan.warnings.join("; ")}`);
-  for (const line of lines) {
+  if (plan.executionMode === "comparison") {
+    lines.push("Execution: one bounded sequential comparison job; results appear after every model is terminal.");
+  }
+  if (plan.warnings?.length) lines.push(`Warnings: ${plan.warnings.join("; ")}`);
+  for (const line of lines.filter(Boolean)) {
     const paragraph = document.createElement("p");
     paragraph.textContent = line;
     root.append(paragraph);
   }
-  if (preprocessing) {
-    const details = document.createElement("details");
-    const summary = document.createElement("summary");
-    const operations = Array.isArray(preprocessing.operations) ? preprocessing.operations : [];
-    summary.textContent = `Preprocessing: ${operations.length} fixed operations`;
-    details.append(summary);
-    const metadata = document.createElement("p");
-    const digest = preprocessing.digest?.value || "unavailable";
-    metadata.textContent = `Catalogue: ${preprocessing.catalogVersion} · plan digest: ${digest.slice(0, 12)}…`;
-    details.append(metadata);
-    const review = preprocessing.review || {};
-    const findings = Array.isArray(preprocessing.findings) ? preprocessing.findings : [];
-    const reviewLine = document.createElement("p");
-    reviewLine.textContent = `Preprocessing review: ${review.status || "unavailable"} · max severity: ${review.maxSeverity || "unavailable"} · ${findings.length} findings`;
-    details.append(reviewLine);
-    const attentionFindings = findings.filter((finding) => finding.severity === "warning");
-    if (attentionFindings.length) {
-      const findingsList = document.createElement("ul");
-      for (const finding of attentionFindings) {
-        const item = document.createElement("li");
-        item.textContent = `${finding.severity}: ${finding.message}`;
-        findingsList.append(item);
-      }
-      details.append(findingsList);
-    }
-    const list = document.createElement("ol");
-    for (const operation of operations) {
-      const item = document.createElement("li");
-      item.textContent = `${operation.action} (${operation.status})`;
-      list.append(item);
-    }
-    details.append(list);
-    root.append(details);
-  }
-  $("agent-plan").classList.remove("hidden");
+  const preprocessingPlans = Array.isArray(plan.preprocessingPlans) && plan.preprocessingPlans.length
+    ? plan.preprocessingPlans
+    : plan.preprocessingPlan
+      ? [{ adapterId: plan.adapterId, adapter: plan.adapter, plan: plan.preprocessingPlan }]
+      : [];
+  for (const preprocessing of preprocessingPlans) appendPreprocessingPlan(root, preprocessing);
 }
-
+function configureAgentDialog(phase) {
+  const planning = phase === "planning";
+  $("agent-plan-toggle").classList.toggle("hidden", !planning || !agentContext?.plan);
+  $("agent-confirm").classList.toggle("hidden", !planning);
+  showAgentPane("chat");
+}
 async function agenticForecastDataset(dataset, output, button) {
   const validation = state.validationResults.get(dataset.datasetId);
   if (!validation?.jobId) {
@@ -802,19 +943,20 @@ async function agenticForecastDataset(dataset, output, button) {
     validation,
     session: null,
     plan: null,
+    planVisible: false,
     running: false,
     pending: false,
   };
-  $("agent-title").textContent = `Plan a forecast for ${dataset.name}`;
   $("agent-messages").replaceChildren();
-  $("agent-status").textContent = "";
+  $("agent-status").textContent = `0 of ${agentMaximumTurns()} turns`;
   $("agent-input").value = "";
   $("agent-input").disabled = false;
   $("agent-send").disabled = false;
   setAgentPlan(null);
+  configureAgentDialog("planning");
   appendAgentMessage(
     "assistant",
-    `Tell me the forecasting objective. You have up to ${agentMaximumTurns()} turns to inspect the validated metadata, compare XGBoost, the Direct NeuralNet, and Chronos-2, compile a fixed safe preprocessing plan, and prepare everything for your confirmation.`,
+    `Tell me the forecasting objective. You have up to ${agentMaximumTurns()} turns. If you ask to run multiple models, the confirmable plan will list every adapter and execute a real all-terminal comparison.`,
   );
   $("agent-dialog").showModal();
   $("agent-input").focus();
@@ -828,19 +970,20 @@ function reviewForecastResult(run, output, button) {
     button,
     session: null,
     plan: null,
+    planVisible: false,
     running: false,
     pending: false,
   };
-  $("agent-title").textContent = "Review the completed forecast";
   $("agent-messages").replaceChildren();
-  $("agent-status").textContent = "";
+  $("agent-status").textContent = `0 of ${agentMaximumTurns()} turns`;
   $("agent-input").value = "";
   $("agent-input").disabled = false;
   $("agent-send").disabled = false;
   setAgentPlan(null);
+  configureAgentDialog("result");
   appendAgentMessage(
     "assistant",
-    `Ask me about the completed forecast for up to ${agentMaximumTurns()} turns. I can explain its measured evaluation, deterministic review, warnings, and practical implications. I cannot rerun or modify the forecast from this conversation.`,
+    `Ask me about this completed ${run.runMode === "comparison" ? "model comparison" : "forecast"} for up to ${agentMaximumTurns()} turns. I can explain measured evidence and practical implications, but I cannot rerun or modify it.`,
   );
   $("agent-dialog").showModal();
   $("agent-input").focus();
@@ -939,7 +1082,7 @@ async function confirmAgentPlan() {
     return;
   }
   if (agentContext.running) {
-    $("agent-status").textContent = "The confirmed forecast is already being submitted.";
+    $("agent-status").textContent = "The confirmed workflow is already being submitted.";
     return;
   }
   if (!agentContext.plan) {
@@ -948,49 +1091,82 @@ async function confirmAgentPlan() {
     return;
   }
   const plan = agentContext.plan;
-  const preprocessing = plan.preprocessingPlan;
-  const operationCount = Array.isArray(preprocessing?.operations) ? preprocessing.operations.length : 0;
-  const preprocessingDigest = preprocessing?.digest?.value || "unavailable";
-  const preprocessingReview = preprocessing?.review?.status || "unavailable";
-  const attentionCount = Array.isArray(preprocessing?.review?.attentionFindingIds)
-    ? preprocessing.review.attentionFindingIds.length
-    : 0;
+  const adapterIds = Array.isArray(plan.adapterIds) && plan.adapterIds.length
+    ? plan.adapterIds
+    : [plan.adapterId];
+  const labels = Array.isArray(plan.adapters) && plan.adapters.length
+    ? plan.adapters.map((adapter) => adapter.label || adapter.id)
+    : [plan.adapter?.label || plan.adapterId];
+  const preprocessingPlans = (
+    Array.isArray(plan.preprocessingPlans) && plan.preprocessingPlans.length
+  )
+    ? plan.preprocessingPlans.map((item) => item.plan)
+    : [plan.preprocessingPlan].filter(Boolean);
+  const preprocessingDigest = preprocessingPlans[0]?.digest?.value || "unavailable";
+  const operationCount = preprocessingPlans.reduce(
+    (total, preprocessing) => total + (
+      Array.isArray(preprocessing?.operations)
+        ? preprocessing.operations.length
+        : 0
+    ),
+    0,
+  );
+  const attentionCount = preprocessingPlans.reduce(
+    (total, preprocessing) => total + (
+      Array.isArray(preprocessing?.review?.attentionFindingIds)
+        ? preprocessing.review.attentionFindingIds.length
+        : 0
+    ),
+    0,
+  );
   const approved = window.confirm(
-    `${plan.summary}\n\nModel: ${plan.adapter.label}\n` +
+    `${plan.summary}\n\n${adapterIds.length > 1 ? "Models" : "Model"}: ${labels.join(", ")}\n` +
       `Target: ${plan.mapping.targetColumn}\nTraining end: ${plan.trainingEnd}\n` +
       `Forecast: ${plan.forecastStart} through ${plan.forecastEnd}\n` +
-      `Preprocessing: ${operationCount} fixed operations\n` +
-      `Review: ${preprocessingReview} (${attentionCount} attention findings)\n` +
-      `Plan digest: ${preprocessingDigest.slice(0, 12)}…\n\n` +
-      "Only validated metadata was sent to Bedrock. Confirm this immutable plan and start the scale-to-zero workflow?",
+      `Preprocessing: ${operationCount} fixed operations across ` +
+      `${preprocessingPlans.length} plan(s) · ` +
+      `${preprocessingDigest.slice(0, 12)}…\n` +
+      `Attention findings: ${attentionCount}\n\n` +
+      (adapterIds.length > 1
+        ? "Confirm this immutable comparison. All listed models will run " +
+          "sequentially in one bounded job, and the final result will appear only " +
+          "after every model is terminal."
+        : "Confirm this immutable plan and start the scale-to-zero workflow?"),
   );
   if (!approved) return;
   agentContext.running = true;
   $("agent-confirm").disabled = true;
-  $("agent-status").textContent = `Submitting ${plan.adapter.label}…`;
+  $("agent-plan-toggle").disabled = true;
+  $("agent-status").textContent = adapterIds.length > 1
+    ? `Submitting ${adapterIds.length}-model comparison…`
+    : `Submitting ${labels[0]}…`;
   try {
+    const request = {
+      requestToken: crypto.randomUUID(),
+      trainingEnd: plan.trainingEnd,
+      mapping: plan.mapping,
+    };
+    if (adapterIds.length > 1) request.adapterIds = adapterIds;
+    else request.adapterId = adapterIds[0];
     const run = await api(`/api/datasets/${agentContext.dataset.datasetId}/forecasts`, {
       method: "POST",
-      body: JSON.stringify({
-        requestToken: crypto.randomUUID(),
-        adapterId: plan.adapterId,
-        trainingEnd: plan.trainingEnd,
-        mapping: plan.mapping,
-      }),
+      body: JSON.stringify(request),
     });
     const { output, button } = agentContext;
     $("agent-dialog").close();
-    output.textContent = `Submitted ${plan.adapter.label} after explicit confirmation.`;
+    output.textContent = adapterIds.length > 1
+      ? `Submitted ${adapterIds.length}-model comparison after explicit confirmation.`
+      : `Submitted ${labels[0]} after explicit confirmation.`;
     await waitForForecast(run, output, button);
     agentContext = null;
   } catch (error) {
     appendAgentMessage("assistant", `The confirmed workflow could not start: ${error.message}`);
     $("agent-status").textContent = "Submission failed.";
     $("agent-confirm").disabled = false;
+    $("agent-plan-toggle").disabled = false;
     agentContext.running = false;
   }
 }
-
 function closeAgentDialog() {
   if (agentContext && !agentContext.running && agentContext.button) {
     agentContext.button.disabled = false;
@@ -1169,6 +1345,7 @@ $("logout").addEventListener("click", logout);
 $("upload-form").addEventListener("submit", upload);
 $("agent-form").addEventListener("submit", sendAgentMessage);
 $("agent-confirm").addEventListener("click", confirmAgentPlan);
+$("agent-plan-toggle").addEventListener("click", toggleAgentPlan);
 $("agent-close").addEventListener("click", closeAgentDialog);
 $("agent-dialog").addEventListener("cancel", (event) => {
   event.preventDefault();

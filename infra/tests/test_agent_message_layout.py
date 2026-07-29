@@ -31,3 +31,8 @@ def test_agent_messages_keep_natural_height_and_assistant_width() -> None:
     assert _has_declaration(assistants, "max-width", "100%")
     assert _has_declaration(assistants, "min-width", "0")
     assert _has_declaration(assistants, "justify-self", "stretch")
+
+
+def test_hidden_agent_messages_do_not_push_plan_below_the_footer() -> None:
+    hidden_messages = _declarations(".agent-messages.hidden")
+    assert _has_declaration(hidden_messages, "display", "none")

@@ -79,6 +79,7 @@ pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
   align-content: start;
   gap: 12px;
 }
+.agent-messages.hidden { display: none; }
 .agent-message { max-width: 86%; padding: 12px 14px; border-radius: 14px; white-space: pre-wrap; line-height: 1.5; }
 .agent-message.user { justify-self: end; background: #1d4ed8; color: white; }
 .agent-message.assistant { width: 100%; max-width: 100%; min-width: 0; justify-self: stretch; background: #27272a; color: #e2e8f0; }

@@ -3,6 +3,8 @@ const API_RETRY_DELAYS_MS = [250, 750];
 const RETRYABLE_API_STATUSES = new Set([429, 502, 503, 504]);
 const FORECAST_TERMINAL_STATUSES = new Set(["succeeded", "partial", "invalid", "failed"]);
 const FORECAST_RUN_STORAGE_PREFIX = "vonavy_forecast_runs";
+const ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
+let tokenRefreshPromise = null;
 
 const state = {
   config: null,
@@ -36,9 +38,35 @@ function decodeJwt(token) {
   return JSON.parse(atob(payload.padEnd(Math.ceil(payload.length / 4) * 4, "=")));
 }
 
+function tokenExpiresSoon(token) {
+  try {
+    const expiresAt = Number(decodeJwt(token).exp) * 1000;
+    return !Number.isFinite(expiresAt) || expiresAt <= Date.now() + ACCESS_TOKEN_REFRESH_SKEW_MS;
+  } catch {
+    return true;
+  }
+}
 function saveTokens(tokens) {
-  state.tokens = tokens;
-  sessionStorage.setItem("vonavy_tokens", JSON.stringify(tokens));
+  const existing = state.tokens && typeof state.tokens === "object" ? state.tokens : {};
+  const next = { ...existing, ...tokens };
+  if (typeof next.access_token !== "string" || !next.access_token) {
+    throw new Error("Cognito returned no access token.");
+  }
+  if (typeof next.refresh_token !== "string" || !next.refresh_token) delete next.refresh_token;
+  state.tokens = next;
+  sessionStorage.setItem("vonavy_tokens", JSON.stringify(next));
+}
+function clearTokens() {
+  sessionStorage.removeItem("vonavy_tokens");
+  state.tokens = null;
+  state.ownerId = null;
+}
+function showAuthenticationState() {
+  const signedOut = $("signed-out");
+  const signedIn = $("signed-in");
+  if (!signedOut || !signedIn) return;
+  signedOut.classList.toggle("hidden", Boolean(state.tokens));
+  signedIn.classList.toggle("hidden", !state.tokens);
 }
 
 function loadTokens() {
@@ -46,8 +74,11 @@ function loadTokens() {
   if (!raw) return null;
   try {
     const tokens = JSON.parse(raw);
-    const claims = decodeJwt(tokens.access_token);
-    if (claims.exp * 1000 <= Date.now() + 30_000) {
+    if (!tokens || typeof tokens !== "object" || typeof tokens.access_token !== "string") {
+      throw new Error("Stored tokens are invalid.");
+    }
+    decodeJwt(tokens.access_token);
+    if (tokenExpiresSoon(tokens.access_token) && !tokens.refresh_token) {
       sessionStorage.removeItem("vonavy_tokens");
       return null;
     }
@@ -143,31 +174,115 @@ class ApiRequestError extends Error {
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
+async function timedFetch(url, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+async function refreshAccessToken() {
+  if (tokenRefreshPromise) return tokenRefreshPromise;
+  const refreshToken = state.tokens?.refresh_token;
+  if (typeof refreshToken !== "string" || !refreshToken) {
+    clearTokens();
+    showAuthenticationState();
+    throw new ApiRequestError("Your sign-in session expired. Sign in again to continue.", {
+      status: 401,
+      sourceRevision: state.sourceRevision,
+    });
+  }
+  tokenRefreshPromise = (async () => {
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: state.config.userPoolClientId,
+      refresh_token: refreshToken,
+    });
+    let response;
+    try {
+      response = await timedFetch(`${state.config.cognitoDomain}/oauth2/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body,
+      });
+    } catch (error) {
+      throw new ApiRequestError(
+        error?.name === "AbortError"
+          ? "Refreshing the sign-in session timed out."
+          : "The sign-in session could not be refreshed.",
+        { status: 401, sourceRevision: state.sourceRevision },
+      );
+    }
+    const tokenResponse = await response.json().catch(() => ({}));
+    if (!response.ok || typeof tokenResponse.access_token !== "string") {
+      clearTokens();
+      showAuthenticationState();
+      throw new ApiRequestError("Your sign-in session expired. Sign in again to continue.", {
+        status: 401,
+        sourceRevision: state.sourceRevision,
+      });
+    }
+    saveTokens({ ...tokenResponse, refresh_token: tokenResponse.refresh_token || refreshToken });
+    return state.tokens.access_token;
+  })();
+  try {
+    return await tokenRefreshPromise;
+  } finally {
+    tokenRefreshPromise = null;
+  }
+}
+async function ensureFreshAccessToken(force = false) {
+  const accessToken = state.tokens?.access_token;
+  if (typeof accessToken !== "string" || !accessToken) return null;
+  if (force || tokenExpiresSoon(accessToken)) return refreshAccessToken();
+  return accessToken;
+}
 
 async function api(path, options = {}) {
-  const headers = new Headers(options.headers || {});
-  if (state.tokens) headers.set("authorization", `Bearer ${state.tokens.access_token}`);
-  if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
+  const baseHeaders = new Headers(options.headers || {});
+  if (options.body && !baseHeaders.has("content-type")) {
+    baseHeaders.set("content-type", "application/json");
+  }
 
   const method = String(options.method || "GET").toUpperCase();
   const attempts = method === "GET" ? 3 : 1;
   let lastError = null;
+  let authReplayAvailable = Boolean(state.tokens?.refresh_token);
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+    const headers = new Headers(baseHeaders);
     try {
-      const response = await fetch(`${state.config.apiBaseUrl}${path}`, {
-        ...options,
-        method,
-        headers,
-        signal: controller.signal,
-      });
+      const accessToken = await ensureFreshAccessToken();
+      if (accessToken) headers.set("authorization", `Bearer ${accessToken}`);
+      const execute = () =>
+        timedFetch(`${state.config.apiBaseUrl}${path}`, {
+          ...options,
+          method,
+          headers,
+        });
+      let response = await execute();
+      if (response.status === 401 && authReplayAvailable) {
+        authReplayAvailable = false;
+        const refreshedToken = await ensureFreshAccessToken(true);
+        headers.set("authorization", `Bearer ${refreshedToken}`);
+        response = await execute();
+      }
       const requestId = response.headers.get("x-vonavy-request-id");
       const sourceRevision = response.headers.get("x-vonavy-source-revision");
       if (sourceRevision) state.sourceRevision = sourceRevision;
       const payload = await response.json().catch(() => ({}));
       if (response.ok) return payload;
+      if (response.status === 401) {
+        clearTokens();
+        showAuthenticationState();
+        throw new ApiRequestError("Your sign-in session expired. Sign in again to continue.", {
+          status: 401,
+          requestId,
+          sourceRevision,
+        });
+      }
 
       const error = new ApiRequestError(
         payload.error?.message || `Request failed (${response.status})`,
@@ -179,7 +294,6 @@ async function api(path, options = {}) {
         attempt < attempts - 1
       ) {
         lastError = error;
-        clearTimeout(timeout);
         await sleep(API_RETRY_DELAYS_MS[attempt]);
         continue;
       }
@@ -194,13 +308,10 @@ async function api(path, options = {}) {
       );
       if (method === "GET" && attempt < attempts - 1) {
         lastError = wrapped;
-        clearTimeout(timeout);
         await sleep(API_RETRY_DELAYS_MS[attempt]);
         continue;
       }
       throw wrapped;
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
@@ -246,20 +357,14 @@ async function exchangeCode(code, returnedState) {
   if (!response.ok) throw new Error("Cognito rejected the authorization code.");
   const tokenResponse = await response.json();
   if (!tokenResponse.access_token) throw new Error("Cognito returned no access token.");
-  saveTokens({
-    access_token: tokenResponse.access_token,
-    expires_in: tokenResponse.expires_in,
-    token_type: tokenResponse.token_type,
-  });
+  saveTokens(tokenResponse);
   sessionStorage.removeItem("vonavy_pkce_verifier");
   sessionStorage.removeItem("vonavy_oauth_state");
   history.replaceState({}, "", "/");
 }
 
 function logout() {
-  sessionStorage.removeItem("vonavy_tokens");
-  state.tokens = null;
-  state.ownerId = null;
+  clearTokens();
   const params = new URLSearchParams({
     client_id: state.config.userPoolClientId,
     logout_uri: state.config.redirectUri,
@@ -1330,8 +1435,14 @@ async function start() {
   const code = query.get("code");
   if (code) await exchangeCode(code, query.get("state"));
   state.tokens = loadTokens();
-  $("signed-out").classList.toggle("hidden", Boolean(state.tokens));
-  $("signed-in").classList.toggle("hidden", !state.tokens);
+  if (state.tokens) {
+    try {
+      await ensureFreshAccessToken();
+    } catch (error) {
+      if (!(error instanceof ApiRequestError) || error.status !== 401) throw error;
+    }
+  }
+  showAuthenticationState();
   if (state.tokens) {
     const claims = decodeJwt(state.tokens.access_token);
     state.ownerId = claims.sub;

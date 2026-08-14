@@ -9,12 +9,12 @@ import pandas as pd
 import pytest
 from sqlalchemy.engine import Engine
 
-from vonavy_agent.api import migrate
-from vonavy_agent.datasets import DatasetRegistry, build_profile
-from vonavy_agent.domain import (
+from skincare_advisor.api import migrate
+from skincare_advisor.catalogs import CatalogRegistry, build_profile
+from skincare_advisor.domain import (
     AvailabilityKind,
     AvailabilityPolicy,
-    DatasetMappingSpec,
+    CatalogMappingSpec,
     DateRange,
     ExperimentSpec,
     FeatureMapping,
@@ -25,25 +25,32 @@ from vonavy_agent.domain import (
     RidgeDirectConfig,
     SeasonalNaiveConfig,
 )
-from vonavy_agent.experiments import create_experiment_spec
-from vonavy_agent.persistence import DataProfile, DatasetMapping, DatasetVersion, create_db_engine
-from vonavy_agent.settings import Settings
+from skincare_advisor.experiments import create_experiment_spec
+from skincare_advisor.persistence import (
+    CatalogMapping,
+    CatalogVersion,
+    DataProfile,
+    create_db_engine,
+)
+from skincare_advisor.settings import Settings
 
 
 def synthetic_frame(days: int = 120, *, duplicate: bool = False) -> pd.DataFrame:
     start = date(2025, 1, 1)
     rows: list[dict[str, Any]] = []
-    for entity_index, entity in enumerate(("store-a", "store-b")):
+    for entity_index, entity in enumerate(("product_id-a", "product_id-b")):
         for offset in range(days):
             day = start + timedelta(days=offset)
-            promotion = int((offset + entity_index) % 13 == 0)
+            skin_type_match = int((offset + entity_index) % 13 == 0)
             rows.append(
                 {
                     "date": day.isoformat(),
-                    "store": entity,
-                    "demand": float(100 + 20 * entity_index + day.weekday() * 2 + promotion * 15),
-                    "promotion": promotion,
-                    "region": "north" if entity_index == 0 else "south",
+                    "product_id": entity,
+                    "rating": float(
+                        100 + 20 * entity_index + day.weekday() * 2 + skin_type_match * 15
+                    ),
+                    "skin_type_match": skin_type_match,
+                    "brand": "north" if entity_index == 0 else "south",
                 }
             )
     if duplicate:
@@ -52,35 +59,35 @@ def synthetic_frame(days: int = 120, *, duplicate: bool = False) -> pd.DataFrame
 
 
 @pytest.fixture
-def runtime(tmp_path: Path) -> tuple[Settings, Engine, DatasetRegistry]:
+def runtime(tmp_path: Path) -> tuple[Settings, Engine, CatalogRegistry]:
     settings = Settings(managed_root=tmp_path / "state", supervise_worker=False)
     migrate(settings)
     engine = create_db_engine(settings.database_path)
-    return settings, engine, DatasetRegistry(settings, engine)
+    return settings, engine, CatalogRegistry(settings, engine)
 
 
 @pytest.fixture
 def evidence(
-    runtime: tuple[Settings, Engine, DatasetRegistry],
-) -> tuple[Settings, Engine, DatasetRegistry, DatasetVersion, DatasetMapping, DataProfile]:
+    runtime: tuple[Settings, Engine, CatalogRegistry],
+) -> tuple[Settings, Engine, CatalogRegistry, CatalogVersion, CatalogMapping, DataProfile]:
     settings, engine, registry = runtime
     content = synthetic_frame().to_csv(index=False).encode()
     version = registry.ingest_stream(io.BytesIO(content), "panel.csv", "Panel")
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
             features=(
                 FeatureMapping(
-                    name="promotion",
+                    name="skin_type_match",
                     role=FeatureRole.KNOWN_FUTURE,
                     availability=AvailabilityPolicy(kind=AvailabilityKind.ORIGIN),
                 ),
                 FeatureMapping(
-                    name="region",
+                    name="brand",
                     role=FeatureRole.STATIC,
                     availability=AvailabilityPolicy(kind=AvailabilityKind.ALWAYS),
                 ),
@@ -92,14 +99,14 @@ def evidence(
 
 
 def make_spec(
-    version: DatasetVersion,
-    mapping: DatasetMapping,
+    version: CatalogVersion,
+    mapping: CatalogMapping,
     profile: DataProfile,
     *,
     models: tuple[SeasonalNaiveConfig | MovingAverageConfig | RidgeDirectConfig, ...] | None = None,
 ) -> ExperimentSpec:
     return ExperimentSpec(
-        dataset_version_id=version.id,
+        catalog_version_id=version.id,
         mapping_id=mapping.id,
         profile_id=profile.id,
         train=DateRange(start=date(2025, 1, 1), end=date(2025, 3, 10)),
@@ -111,9 +118,9 @@ def make_spec(
         ),
         horizon_days=2,
         training_window_days=60,
-        entity_column="store",
-        target_column="demand",
-        features=DatasetMappingSpec.model_validate_json(mapping.canonical_json).features,
+        entity_column="product_id",
+        target_column="rating",
+        features=CatalogMappingSpec.model_validate_json(mapping.canonical_json).features,
         models=models
         or (
             SeasonalNaiveConfig(),
@@ -136,7 +143,7 @@ def make_spec(
 
 @pytest.fixture
 def spec_row(
-    evidence: tuple[Settings, Engine, DatasetRegistry, DatasetVersion, DatasetMapping, DataProfile],
+    evidence: tuple[Settings, Engine, CatalogRegistry, CatalogVersion, CatalogMapping, DataProfile],
 ):
     _, engine, _, version, mapping, profile = evidence
     return create_experiment_spec(engine, make_spec(version, mapping, profile))

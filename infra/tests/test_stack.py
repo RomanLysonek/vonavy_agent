@@ -6,7 +6,7 @@ from typing import Any
 import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
 
-from vonavy_infra.control_plane_stack import ControlPlaneStack, DeploymentConfig
+from skincare_infra.control_plane_stack import ControlPlaneStack, DeploymentConfig
 
 
 def _template() -> Template:
@@ -17,7 +17,7 @@ def _template() -> Template:
         config=DeploymentConfig(
             environment_name="test",
             max_upload_bytes=100 * 1024 * 1024,
-            max_datasets_per_owner=10,
+            max_catalogs_per_owner=10,
             max_total_bytes_per_owner=1024 * 1024 * 1024,
             upload_retention_days=14,
             protect_data=True,
@@ -173,7 +173,7 @@ def test_lambda_separates_staging_and_immutable_data_permissions() -> None:
         statement for statement in statements if _resource_mentions(statement, "pending/users/*")
     ]
     data_statements = [
-        statement for statement in statements if _resource_mentions(statement, "datasets/users/*")
+        statement for statement in statements if _resource_mentions(statement, "catalogs/users/*")
     ]
 
     assert len(staging_statements) == 1
@@ -229,7 +229,7 @@ def test_every_api_route_requires_jwt_and_custom_scope() -> None:
     for route in routes.values():
         properties = route["Properties"]
         assert properties["AuthorizationType"] == "JWT"
-        assert properties["AuthorizationScopes"] == ["vonavy-agent/api"]
+        assert properties["AuthorizationScopes"] == ["skincare-advisor/api"]
         assert "AuthorizerId" in properties
 
 

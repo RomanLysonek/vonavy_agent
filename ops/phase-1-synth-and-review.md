@@ -50,7 +50,7 @@ uv sync --frozen --extra dev
 npm ci
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy vonavy_infra
+uv run mypy skincare_infra
 uv run pytest
 node --check web/app.js
 ```
@@ -67,17 +67,17 @@ Return every other failure rather than redesigning the infrastructure.
 ## 5. Synthesize locally
 
 ```bash
-export AWS_PROFILE=vonavy-readonly
+export AWS_PROFILE=skincare-readonly
 export AWS_REGION=eu-central-1
 export AWS_DEFAULT_REGION=eu-central-1
 export CDK_DEFAULT_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_REGION=eu-central-1
-export VONAVY_ENVIRONMENT=dev
-export VONAVY_PROTECT_DATA=true
-export VONAVY_MAX_UPLOAD_BYTES="$((100 * 1024 * 1024))"
-export VONAVY_MAX_DATASETS_PER_OWNER=10
-export VONAVY_MAX_TOTAL_BYTES_PER_OWNER="$((1024 * 1024 * 1024))"
-export VONAVY_UPLOAD_RETENTION_DAYS=14
+export SKINCARE_ADVISOR_ENVIRONMENT=dev
+export SKINCARE_ADVISOR_PROTECT_DATA=true
+export SKINCARE_ADVISOR_MAX_UPLOAD_BYTES="$((100 * 1024 * 1024))"
+export SKINCARE_ADVISOR_MAX_CATALOGS_PER_OWNER=10
+export SKINCARE_ADVISOR_MAX_TOTAL_CATALOG_BYTES_PER_OWNER="$((1024 * 1024 * 1024))"
+export SKINCARE_ADVISOR_UPLOAD_RETENTION_DAYS=14
 
 npm exec cdk -- synth
 ```
@@ -85,7 +85,7 @@ npm exec cdk -- synth
 Inspect the generated resource inventory:
 
 ```bash
-TEMPLATE="cdk.out/VonavyAgent-dev-ControlPlane.template.json"
+TEMPLATE="cdk.out/SkincareAdvisor-dev-ControlPlane.template.json"
 test -f "$TEMPLATE"
 
 jq -r '
@@ -125,29 +125,29 @@ and review them; do not mistake them for continuously running compute.
 
 ```bash
 npm exec cdk -- diff \
-  VonavyAgent-dev-ControlPlane \
-  --profile vonavy-readonly \
+  SkincareAdvisor-dev-ControlPlane \
+  --profile skincare-readonly \
   --no-change-set \
   --security-only
 
 npm exec cdk -- diff \
-  VonavyAgent-dev-ControlPlane \
-  --profile vonavy-readonly \
+  SkincareAdvisor-dev-ControlPlane \
+  --profile skincare-readonly \
   --no-change-set
 ```
 
 If the read-only profile lacks an inspection permission, report the exact denied
-action. Do not silently switch MCP or CDK to `vonavy-admin`.
+action. Do not silently switch MCP or CDK to `skincare-admin`.
 
 Export the complete diff to files and return them with the executor report:
 
 ```bash
-npm exec cdk -- diff VonavyAgent-dev-ControlPlane \
-  --profile vonavy-readonly --no-change-set \
+npm exec cdk -- diff SkincareAdvisor-dev-ControlPlane \
+  --profile skincare-readonly --no-change-set \
   > ../phase1-cdk-diff.txt 2>&1
 
-npm exec cdk -- diff VonavyAgent-dev-ControlPlane \
-  --profile vonavy-readonly --no-change-set --security-only \
+npm exec cdk -- diff SkincareAdvisor-dev-ControlPlane \
+  --profile skincare-readonly --no-change-set --security-only \
   > ../phase1-cdk-security-diff.txt 2>&1
 ```
 

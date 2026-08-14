@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vonavy-agent"
+name = "skincare-advisor"
 version = "0.2.0"
-description = "Local leakage-safe forecasting experiment workbench"
+description = "Local leakage-safe skincare recommendation workbench"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -34,17 +34,17 @@ dev = [
 ]
 
 [project.scripts]
-vonavy-agent = "vonavy_agent.cli:main"
+skincare-advisor = "skincare_advisor.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/vonavy_agent"]
+packages = ["src/skincare_advisor"]
 
 [tool.hatch.build]
 include = [
-  "src/vonavy_agent/**/*.py",
-  "src/vonavy_agent/web/*",
-  "src/vonavy_agent/report/*",
-  "src/vonavy_agent/migrations/**/*",
+  "src/skincare_advisor/**/*.py",
+  "src/skincare_advisor/web/*",
+  "src/skincare_advisor/report/*",
+  "src/skincare_advisor/migrations/**/*",
 ]
 
 [tool.pytest.ini_options]
@@ -61,7 +61,7 @@ ignore = ["E501"]
 
 [tool.mypy]
 strict = true
-packages = ["vonavy_agent"]
+packages = ["skincare_advisor"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]

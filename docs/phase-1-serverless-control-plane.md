@@ -21,7 +21,7 @@ Bounded Lambda control plane
         └── accepted immutable copy in versioned data S3
 ```
 
-The browser never sends a dataset through Lambda or API Gateway. Lambda creates
+The browser never sends a catalog through Lambda or API Gateway. Lambda creates
 a short-lived, policy-constrained S3 POST into a dedicated unversioned staging
 bucket. The POST policy requires the exact declared byte length, media type,
 server-side encryption field, object key, and pending tag. Replaying a valid POST
@@ -30,21 +30,21 @@ object versions.
 
 Completion first copies the staging object into a separate versioned data
 bucket under an owner-scoped final key. Lambda then inspects that exact copied
-`VersionId`, verifies its byte length, and only afterward publishes the dataset
+`VersionId`, verifies its byte length, and only afterward publishes the catalog
 metadata transaction. A rejected copied version is deleted explicitly. On
 success, Lambda records the exact S3 `VersionId`, applies completion and
 retention tags, and deletes the staging object. This ordering closes the race in
 which a still-valid staging form could otherwise overwrite the source between a
 pre-copy check and the copy. All later validation or training phases must read
 that final key and exact version. A replayed staging form therefore cannot
-mutate the accepted dataset.
+mutate the accepted catalog.
 
 ## Security properties
 
 - Cognito public sign-up is disabled.
 - Ownership comes only from the validated JWT `sub` claim.
 - The browser cannot submit an owner ID.
-- Protected API routes require the custom `vonavy-agent/api` access-token scope.
+- Protected API routes require the custom `skincare-advisor/api` access-token scope.
 - OAuth uses authorization code plus PKCE and validates the OAuth state value.
 - Access tokens are kept in `sessionStorage`, not durable local storage.
 - Upload, data, and web buckets block public access and enforce TLS.
@@ -53,14 +53,14 @@ mutate the accepted dataset.
 - The data bucket is versioned, encrypted with SSE-S3, and lifecycle-managed.
 - Completed demo data is copied into the data bucket and tagged for configured
   automatic current-version expiry.
-- DynamoDB is on-demand, encrypted, owner-partitioned, TTL-enabled, and protected
+- DynamoDB is on-rating, encrypted, owner-partitioned, TTL-enabled, and protected
   by point-in-time recovery.
 - A fixed per-owner upload-slot set is reserved transactionally. Concurrent
-  requests cannot exceed the configured dataset-count ceiling.
+  requests cannot exceed the configured catalog-count ceiling.
 - The deployment configuration requires `max_upload_bytes × upload_slots` to be
   no larger than the configured owner storage ceiling, creating a hard upper
   bound even under concurrency.
-- Pending slot, upload, and dataset records expire after one day; completion
+- Pending slot, upload, and catalog records expire after one day; completion
   extends all three records to the configured demo retention period.
 - Lambda has bounded concurrency, memory, and wall time.
 - Lambda permissions separate the staging upload prefix from the finalized
@@ -86,12 +86,12 @@ All Lambda-backed routes are authenticated and scope-protected:
 - `GET /api/health`
 - `POST /api/upload-sessions`
 - `POST /api/upload-sessions/{upload_id}/complete`
-- `GET /api/datasets`
+- `GET /api/catalogs`
 
 ## Default server policy
 
 - 100 MiB maximum per upload;
-- 10 active dataset slots per owner;
+- 10 active catalog slots per owner;
 - 1 GiB hard maximum represented by those slots;
 - 15-minute presigned POST lifetime;
 - one-day pending-upload retention;
@@ -123,7 +123,7 @@ upload, lifecycle, and teardown smoke tests.
 
 At idle, the stack contains no continuously running compute. Charges, if any,
 come from stored S3/DynamoDB data, CloudFront/API/Lambda requests, logs, and
-Cognito usage. Dataset and metadata retention are bounded by lifecycle and TTL
+Cognito usage. Catalog and metadata retention are bounded by lifecycle and TTL
 rules. CDK helper Lambdas may exist in the synthesized template for asset
 deployment or log retention, but they are not permanently running workers.
 

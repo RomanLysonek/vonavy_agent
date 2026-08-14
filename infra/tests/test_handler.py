@@ -114,7 +114,7 @@ def test_upload_validation_rejects_paths_and_server_limit() -> None:
     with pytest.raises(handler.ApiError, match="path components"):
         handler._validate_upload(
             {
-                "datasetName": "Panel",
+                "catalogName": "Panel",
                 "filename": "../panel.csv",
                 "mediaType": "text/csv",
                 "sizeBytes": 100,
@@ -123,7 +123,7 @@ def test_upload_validation_rejects_paths_and_server_limit() -> None:
     with pytest.raises(handler.ApiError) as error:
         handler._validate_upload(
             {
-                "datasetName": "Panel",
+                "catalogName": "Panel",
                 "filename": "panel.csv",
                 "mediaType": "text/csv",
                 "sizeBytes": 1025,
@@ -135,7 +135,7 @@ def test_upload_validation_rejects_paths_and_server_limit() -> None:
     with pytest.raises(handler.ApiError, match="control characters"):
         handler._validate_upload(
             {
-                "datasetName": "Panel",
+                "catalogName": "Panel",
                 "filename": "panel\n.csv",
                 "mediaType": "text/csv",
                 "sizeBytes": 100,
@@ -144,7 +144,7 @@ def test_upload_validation_rejects_paths_and_server_limit() -> None:
     with pytest.raises(handler.ApiError, match="path components"):
         handler._validate_upload(
             {
-                "datasetName": "Panel",
+                "catalogName": "Panel",
                 "filename": "folder\\panel.csv",
                 "mediaType": "text/csv",
                 "sizeBytes": 100,
@@ -153,18 +153,18 @@ def test_upload_validation_rejects_paths_and_server_limit() -> None:
 
 
 def test_identity_is_derived_from_authorizer_claims() -> None:
-    owner, email = handler._identity(_event("GET", "/api/datasets"))
+    owner, email = handler._identity(_event("GET", "/api/catalogs"))
     assert owner == "12345678-1234-1234-1234-123456789012"
     assert email == "reviewer@example.com"
 
-    event = _event("GET", "/api/datasets")
+    event = _event("GET", "/api/catalogs")
     event["requestContext"]["authorizer"]["jwt"]["claims"]["token_use"] = "id"
     with pytest.raises(handler.ApiError) as error:
         handler._identity(event)
     assert error.value.code == "unauthorized"
 
 
-def test_owner_upload_slots_enforce_hard_dataset_count() -> None:
+def test_owner_upload_slots_enforce_hard_catalog_count() -> None:
     table = FakeTable()
     owner = "12345678-1234-1234-1234-123456789012"
     table.query_items = [{"slot_number": 0, "expected_size": 700}]
@@ -176,7 +176,7 @@ def test_owner_upload_slots_enforce_hard_dataset_count() -> None:
     ]
     with pytest.raises(handler.ApiError) as count_error:
         handler._next_owner_upload_slot(table, owner, 100)
-    assert count_error.value.code == "dataset_quota_exceeded"
+    assert count_error.value.code == "catalog_quota_exceeded"
 
 
 def test_create_upload_session_scopes_storage_to_authenticated_owner(monkeypatch) -> None:
@@ -190,7 +190,7 @@ def test_create_upload_session_scopes_storage_to_authenticated_owner(monkeypatch
             "POST",
             "/api/upload-sessions",
             body={
-                "datasetName": "Interview panel",
+                "catalogName": "Interview panel",
                 "filename": "panel.csv",
                 "mediaType": "text/csv",
                 "sizeBytes": 512,
@@ -204,19 +204,19 @@ def test_create_upload_session_scopes_storage_to_authenticated_owner(monkeypatch
     assert fake_s3.presigned is not None
     assert fake_s3.presigned["Bucket"] == "unit-upload-bucket"
     assert fake_s3.presigned["Key"].startswith(
-        "pending/users/12345678-1234-1234-1234-123456789012/datasets/"
+        "pending/users/12345678-1234-1234-1234-123456789012/catalogs/"
     )
     assert fake_s3.presigned["Conditions"][-1] == ["content-length-range", 512, 512]
     transaction = fake_table.client.transactions[0]["TransactItems"]
     slot_item = transaction[0]["Put"]["Item"]
-    dataset_item = transaction[1]["Put"]["Item"]
+    catalog_item = transaction[1]["Put"]["Item"]
     assert slot_item["sk"]["S"] == "SLOT#0000"
     assert slot_item["status"]["S"] == "pending"
-    assert dataset_item["owner_sub"]["S"] == "12345678-1234-1234-1234-123456789012"
-    assert dataset_item["status"]["S"] == "upload_pending"
-    assert dataset_item["slot_key"]["S"] == "SLOT#0000"
-    assert dataset_item["staging_object_key"]["S"].startswith("pending/users/")
-    assert dataset_item["object_key"]["S"].startswith("datasets/users/")
+    assert catalog_item["owner_sub"]["S"] == "12345678-1234-1234-1234-123456789012"
+    assert catalog_item["status"]["S"] == "upload_pending"
+    assert catalog_item["slot_key"]["S"] == "SLOT#0000"
+    assert catalog_item["staging_object_key"]["S"].startswith("pending/users/")
+    assert catalog_item["object_key"]["S"].startswith("catalogs/users/")
 
 
 def test_complete_upload_copies_to_immutable_data_storage(monkeypatch) -> None:
@@ -228,11 +228,11 @@ def test_complete_upload_copies_to_immutable_data_storage(monkeypatch) -> None:
     fake_table = FakeTable()
     owner = "12345678-1234-1234-1234-123456789012"
     upload_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    staging_key = "pending/users/owner/datasets/dataset-id/upload/panel.csv"
-    object_key = "datasets/users/owner/dataset-id/upload/panel.csv"
+    staging_key = "pending/users/owner/catalogs/catalog-id/upload/panel.csv"
+    object_key = "catalogs/users/owner/catalog-id/upload/panel.csv"
     fake_table.items[(f"USER#{owner}", f"UPLOAD#{upload_id}")] = {
         "owner_sub": owner,
-        "dataset_id": "dataset-id",
+        "catalog_id": "catalog-id",
         "upload_id": upload_id,
         "slot_key": "SLOT#0000",
         "staging_object_key": staging_key,
@@ -266,10 +266,10 @@ def test_complete_upload_copies_to_immutable_data_storage(monkeypatch) -> None:
     assert fake_s3.deleted_requests == [{"Bucket": "unit-upload-bucket", "Key": staging_key}]
     completion_transaction = fake_table.client.transactions[0]["TransactItems"]
     assert len(completion_transaction) == 3
-    dataset_update = completion_transaction[1]["Update"]
+    catalog_update = completion_transaction[1]["Update"]
     slot_update = completion_transaction[2]["Update"]
-    assert dataset_update["ExpressionAttributeValues"][":object_key"] == {"S": object_key}
-    assert dataset_update["ExpressionAttributeValues"][":version"] == {"S": "version-1"}
+    assert catalog_update["ExpressionAttributeValues"][":object_key"] == {"S": object_key}
+    assert catalog_update["ExpressionAttributeValues"][":version"] == {"S": "version-1"}
     assert slot_update["Key"]["sk"] == {"S": "SLOT#0000"}
 
 
@@ -279,11 +279,11 @@ def test_complete_upload_rejects_and_deletes_wrong_final_size(monkeypatch) -> No
     fake_table = FakeTable()
     owner = "12345678-1234-1234-1234-123456789012"
     upload_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    staging_key = "pending/users/owner/datasets/dataset-id/upload/panel.csv"
-    object_key = "datasets/users/owner/dataset-id/upload/panel.csv"
+    staging_key = "pending/users/owner/catalogs/catalog-id/upload/panel.csv"
+    object_key = "catalogs/users/owner/catalog-id/upload/panel.csv"
     fake_table.items[(f"USER#{owner}", f"UPLOAD#{upload_id}")] = {
         "owner_sub": owner,
-        "dataset_id": "dataset-id",
+        "catalog_id": "catalog-id",
         "upload_id": upload_id,
         "slot_key": "SLOT#0000",
         "staging_object_key": staging_key,
@@ -312,14 +312,14 @@ def test_complete_upload_rejects_and_deletes_wrong_final_size(monkeypatch) -> No
     assert fake_table.client.transactions == []
 
 
-def test_list_datasets_filters_defensively_by_owner(monkeypatch) -> None:
+def test_list_catalogs_filters_defensively_by_owner(monkeypatch) -> None:
     fake_table = FakeTable()
     owner = "12345678-1234-1234-1234-123456789012"
     fake_table.query_items = [
         {
             "owner_sub": owner,
-            "dataset_id": "mine",
-            "dataset_name": "Mine",
+            "catalog_id": "mine",
+            "catalog_name": "Mine",
             "filename": "mine.csv",
             "media_type": "text/csv",
             "expected_size": 10,
@@ -329,8 +329,8 @@ def test_list_datasets_filters_defensively_by_owner(monkeypatch) -> None:
         },
         {
             "owner_sub": "another-owner",
-            "dataset_id": "hidden",
-            "dataset_name": "Hidden",
+            "catalog_id": "hidden",
+            "catalog_name": "Hidden",
             "filename": "hidden.csv",
             "media_type": "text/csv",
             "expected_size": 10,
@@ -342,7 +342,7 @@ def test_list_datasets_filters_defensively_by_owner(monkeypatch) -> None:
     monkeypatch.setattr(handler, "_table", fake_table)
     monkeypatch.setattr(handler, "_s3", FakeS3())
 
-    response = handler.lambda_handler(_event("GET", "/api/datasets"), None)
+    response = handler.lambda_handler(_event("GET", "/api/catalogs"), None)
     assert response["statusCode"] == 200
     payload = json.loads(response["body"])
-    assert [dataset["datasetId"] for dataset in payload["datasets"]] == ["mine"]
+    assert [catalog["catalogId"] for catalog in payload["catalogs"]] == ["mine"]

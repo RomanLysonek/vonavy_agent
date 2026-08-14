@@ -1,4 +1,4 @@
-# vonavy-agent AWS infrastructure
+# skincare-advisor AWS infrastructure
 
 This directory contains the Phase 1 AWS CDK application. It defines a
 serverless, authenticated control plane with separate staging and finalized S3
@@ -26,7 +26,7 @@ uv sync --frozen --extra dev
 npm ci
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy vonavy_infra
+uv run mypy skincare_infra
 uv run pytest
 node --check web/app.js
 npm exec cdk -- synth
@@ -36,13 +36,13 @@ npm exec cdk -- synth
 
 Environment variables consumed by `app.py`:
 
-- `VONAVY_ENVIRONMENT` — lowercase deployment name, default `dev`;
-- `VONAVY_MAX_UPLOAD_BYTES` — default 100 MiB;
-- `VONAVY_MAX_DATASETS_PER_OWNER` — default 10;
-- `VONAVY_MAX_TOTAL_BYTES_PER_OWNER` — default 1 GiB;
-- `VONAVY_UPLOAD_RETENTION_DAYS` — default 14;
-- `VONAVY_PROTECT_DATA` — default true;
-- `VONAVY_LOCAL_CALLBACK_URL` — default `http://localhost:5173/`.
+- `SKINCARE_ADVISOR_ENVIRONMENT` — lowercase deployment name, default `dev`;
+- `SKINCARE_ADVISOR_MAX_UPLOAD_BYTES` — default 100 MiB;
+- `SKINCARE_ADVISOR_MAX_CATALOGS_PER_OWNER` — default 10;
+- `SKINCARE_ADVISOR_MAX_TOTAL_CATALOG_BYTES_PER_OWNER` — default 1 GiB;
+- `SKINCARE_ADVISOR_UPLOAD_RETENTION_DAYS` — default 14;
+- `SKINCARE_ADVISOR_PROTECT_DATA` — default true;
+- `SKINCARE_ADVISOR_LOCAL_CALLBACK_URL` — default `http://localhost:5173/`.
 
 The total-byte policy must be at least the per-upload limit multiplied by the
 number of upload slots. This makes the storage ceiling hard under concurrent

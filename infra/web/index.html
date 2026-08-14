@@ -11,9 +11,9 @@
 <body>
   <main>
     <header>
-      <p class="eyebrow">NOTINO FORECASTING WORKBENCH</p>
+      <p class="eyebrow">SKINCARE ADVISOR</p>
       <h1>VOŇAVÝ AGENT</h1>
-      <p class="lead">Invite-only dataset intake for leakage-safe forecasting experiments.</p>
+      <p class="lead">Invite-only catalog intake for leakage-safe skincare recommendation experiments.</p>
     </header>
 
     <section id="signed-out" class="card">
@@ -32,17 +32,17 @@
       </div>
 
       <section class="card">
-        <h2>Upload dataset</h2>
+        <h2>Upload catalog</h2>
         <p>CSV or Parquet. The browser uploads directly into private, encrypted S3 storage.</p>
         <p id="upload-policy" class="policy"></p>
         <form id="upload-form">
           <label>
-            Dataset name
-            <input id="dataset-name" maxlength="200" required placeholder="Interview demand panel">
+            Catalog name
+            <input id="catalog-name" maxlength="200" required placeholder="Interview rating panel">
           </label>
           <label>
             Data file
-            <input id="dataset-file" type="file" accept=".csv,.parquet" required>
+            <input id="catalog-file" type="file" accept=".csv,.parquet" required>
           </label>
           <button id="upload-button" type="submit">Create upload</button>
         </form>
@@ -52,12 +52,12 @@
       <section class="card">
         <div class="section-heading">
           <div>
-            <h2>Your datasets</h2>
+            <h2>Your catalogs</h2>
             <p>Only objects owned by the authenticated Cognito subject are returned.</p>
           </div>
           <button id="refresh" type="button" class="secondary">Refresh</button>
         </div>
-        <div id="datasets"></div>
+        <div id="catalogs"></div>
       </section>
     </section>
   </main>

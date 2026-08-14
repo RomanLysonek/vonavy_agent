@@ -8,7 +8,7 @@ This phase deliberately does not deploy AWS resources. It changes the local appl
 
 Every user-created aggregate now carries a stable `owner_id`:
 
-- dataset and dataset version;
+- catalog and catalog version;
 - mapping and profile;
 - evaluation specification and leakage gate;
 - job and run;
@@ -30,10 +30,10 @@ AWS will later map a trusted resource profile to an allow-listed Batch job defin
 The domain now distinguishes:
 
 - `EvaluationSpec`: historical rolling-origin evaluation with known outcomes;
-- `ForecastSpec`: fit on eligible history and forecast dates whose targets are unknown;
+- `RecommendationSpec`: fit on eligible history and recommendation dates whose targets are unknown;
 - `InferenceSpec`: apply a stored model artifact to compatible future input data.
 
-Only evaluation is executable in the current local engine. Forecast and inference contracts are validated now so later implementations cannot quietly reuse the historical backtest path and call it future forecasting.
+Only evaluation is executable in the current local engine. Recommendation and inference contracts are validated now so later implementations cannot quietly reuse the historical backtest path and call it future recommendation.
 
 ### Cloud ports
 
@@ -62,7 +62,7 @@ The next implementation phases will provide S3, DynamoDB, AWS Batch, and model-r
 - DynamoDB repository implementation;
 - Step Functions orchestration;
 - Batch Fargate and Batch GPU backends;
-- actual future forecasting;
+- actual future recommendation;
 - stored-model batch inference;
 - retention and per-user usage quotas.
 

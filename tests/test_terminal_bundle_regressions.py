@@ -5,11 +5,11 @@ import json
 import pytest
 from sqlalchemy.orm import Session
 
-from vonavy_agent.domain import JobState
-from vonavy_agent.experiments import run_gate
-from vonavy_agent.hashing import canonical_json
-from vonavy_agent.jobs import Worker, enqueue_export, enqueue_run
-from vonavy_agent.persistence import (
+from skincare_advisor.domain import JobState
+from skincare_advisor.experiments import run_gate
+from skincare_advisor.hashing import canonical_json
+from skincare_advisor.jobs import Worker, enqueue_export, enqueue_run
+from skincare_advisor.persistence import (
     Export,
     Job,
     Run,

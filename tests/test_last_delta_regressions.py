@@ -11,25 +11,25 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from vonavy_agent.api import create_app
-from vonavy_agent.datasets import build_profile
-from vonavy_agent.domain import (
+from skincare_advisor.api import create_app
+from skincare_advisor.catalogs import build_profile
+from skincare_advisor.domain import (
     AvailabilityKind,
     AvailabilityPolicy,
-    DatasetMappingSpec,
+    CatalogMappingSpec,
     JobState,
     SeasonalNaiveConfig,
 )
-from vonavy_agent.errors import AgentError
-from vonavy_agent.experiments import create_experiment_spec, run_gate
-from vonavy_agent.exporting import create_static_export
-from vonavy_agent.hashing import canonical_json
-from vonavy_agent.jobs import (
+from skincare_advisor.errors import AgentError
+from skincare_advisor.experiments import create_experiment_spec, run_gate
+from skincare_advisor.exporting import create_static_export
+from skincare_advisor.hashing import canonical_json
+from skincare_advisor.jobs import (
     Worker,
     enqueue_export,
     enqueue_run,
 )
-from vonavy_agent.persistence import (
+from skincare_advisor.persistence import (
     GateResultRow,
     Job,
     Run,
@@ -97,7 +97,7 @@ def test_finalizing_recovery_fails_and_invalidates_corrupt_evidence(evidence, sp
         (settings.managed_root / "runs" / run.id / "manifest.json").read_text()
     )
     assert terminal_manifest["status"] == "failed"
-    assert terminal_manifest["errors"][0]["code"] == "artifact_promotion_failed"
+    assert terminal_manifest["errors"][0]["code"] == "artifact_skin_type_match_failed"
 
 
 def test_finalizing_run_and_export_evidence_is_not_public(evidence, spec_row) -> None:
@@ -177,10 +177,10 @@ def test_legacy_passing_gate_cannot_bypass_current_target_policy(runtime) -> Non
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(
                 kind=AvailabilityKind.COLUMN,
                 column="target_known_at",
@@ -222,24 +222,24 @@ def test_legacy_passing_gate_cannot_bypass_current_target_policy(runtime) -> Non
         enqueue_run(engine, spec.id, legacy_id, "legacy-token")
 
 
-def test_absent_forecast_row_remains_in_gate_and_run_denominator(
+def test_absent_recommendation_row_remains_in_gate_and_run_denominator(
     runtime,
 ) -> None:
     settings, engine, registry = runtime
     frame = synthetic_frame()
-    missing = (frame["store"] == "store-b") & (frame["date"] == "2025-03-11")
+    missing = (frame["product_id"] == "product_id-b") & (frame["date"] == "2025-03-11")
     frame = frame.loc[~missing].reset_index(drop=True)
     version = registry.ingest_stream(
         io.BytesIO(frame.to_csv(index=False).encode()),
-        "missing-forecast.csv",
-        "Missing forecast",
+        "missing-recommendation.csv",
+        "Missing recommendation",
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
         ),
     )

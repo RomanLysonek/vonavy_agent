@@ -67,7 +67,7 @@ def _json_response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
         "statusCode": status_code,
         "headers": {
             "content-type": "application/json; charset=utf-8",
-            "cache-control": "no-store",
+            "cache-control": "no-product_id",
             "x-content-type-options": "nosniff",
         },
         "body": json.dumps(payload, separators=(",", ":"), default=str),
@@ -107,19 +107,19 @@ def _identity(event: dict[str, Any]) -> tuple[str, str | None]:
 
 
 def _validate_upload(payload: dict[str, Any]) -> tuple[str, str, str, int]:
-    allowed = {"datasetName", "filename", "mediaType", "sizeBytes"}
+    allowed = {"catalogName", "filename", "mediaType", "sizeBytes"}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ApiError("invalid_request", "Unknown request fields", 400, {"fields": unknown})
 
-    dataset_name = payload.get("datasetName")
+    catalog_name = payload.get("catalogName")
     filename = payload.get("filename")
     media_type = payload.get("mediaType")
     size_bytes = payload.get("sizeBytes")
-    if not isinstance(dataset_name, str) or not 1 <= len(dataset_name.strip()) <= 200:
-        raise ApiError("invalid_dataset_name", "datasetName must contain 1 to 200 characters", 400)
-    if any(ord(character) < 32 or ord(character) == 127 for character in dataset_name):
-        raise ApiError("invalid_dataset_name", "datasetName contains control characters", 400)
+    if not isinstance(catalog_name, str) or not 1 <= len(catalog_name.strip()) <= 200:
+        raise ApiError("invalid_catalog_name", "catalogName must contain 1 to 200 characters", 400)
+    if any(ord(character) < 32 or ord(character) == 127 for character in catalog_name):
+        raise ApiError("invalid_catalog_name", "catalogName contains control characters", 400)
     if not isinstance(filename, str) or not 1 <= len(filename) <= 255:
         raise ApiError("invalid_filename", "filename must contain 1 to 255 characters", 400)
     if any(ord(character) < 32 or ord(character) == 127 for character in filename):
@@ -149,7 +149,7 @@ def _validate_upload(payload: dict[str, Any]) -> tuple[str, str, str, int]:
             413,
             {"maximumBytes": MAX_UPLOAD_BYTES},
         )
-    return dataset_name.strip(), filename, media_type, size_bytes
+    return catalog_name.strip(), filename, media_type, size_bytes
 
 
 def _route(event: dict[str, Any]) -> tuple[str, str]:
@@ -178,10 +178,10 @@ def _next_owner_upload_slot(table: Any, owner: str, requested_bytes: int) -> int
 
     if len(used_slots) >= MAX_DATASETS_PER_OWNER:
         raise ApiError(
-            "dataset_quota_exceeded",
-            "Dataset count exceeds the server-owned owner quota",
+            "catalog_quota_exceeded",
+            "Catalog count exceeds the server-owned owner quota",
             429,
-            {"maximumDatasets": MAX_DATASETS_PER_OWNER},
+            {"maximumCatalogs": MAX_DATASETS_PER_OWNER},
         )
     if reserved_bytes + requested_bytes > MAX_TOTAL_BYTES_PER_OWNER:
         raise ApiError(
@@ -195,7 +195,7 @@ def _next_owner_upload_slot(table: Any, owner: str, requested_bytes: int) -> int
 
 def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
     owner, email = _identity(event)
-    dataset_name, filename, media_type, size_bytes = _validate_upload(_parse_body(event))
+    catalog_name, filename, media_type, size_bytes = _validate_upload(_parse_body(event))
     s3, table = _clients()
     created_at = datetime.now(UTC).isoformat()
     owner_pk = f"USER#{owner}"
@@ -204,10 +204,10 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
         slot_number = _next_owner_upload_slot(table, owner, size_bytes)
         now = int(time.time())
         pending_expires_at = now + 86400
-        dataset_id = str(uuid.uuid4())
+        catalog_id = str(uuid.uuid4())
         upload_id = str(uuid.uuid4())
-        staging_object_key = f"pending/users/{owner}/datasets/{dataset_id}/{upload_id}/{filename}"
-        object_key = f"datasets/users/{owner}/{dataset_id}/{upload_id}/{filename}"
+        staging_object_key = f"pending/users/{owner}/catalogs/{catalog_id}/{upload_id}/{filename}"
+        object_key = f"catalogs/users/{owner}/{catalog_id}/{upload_id}/{filename}"
         slot_key = f"SLOT#{slot_number:04d}"
         try:
             table.meta.client.transact_write_items(
@@ -221,7 +221,7 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
                                 "entity_type": {"S": "UPLOAD_SLOT"},
                                 "owner_sub": {"S": owner},
                                 "slot_number": {"N": str(slot_number)},
-                                "dataset_id": {"S": dataset_id},
+                                "catalog_id": {"S": catalog_id},
                                 "upload_id": {"S": upload_id},
                                 "expected_size": {"N": str(size_bytes)},
                                 "status": {"S": "pending"},
@@ -237,11 +237,11 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
                             "TableName": METADATA_TABLE,
                             "Item": {
                                 "pk": {"S": owner_pk},
-                                "sk": {"S": f"DATASET#{dataset_id}"},
-                                "entity_type": {"S": "DATASET"},
+                                "sk": {"S": f"CATALOG#{catalog_id}"},
+                                "entity_type": {"S": "CATALOG"},
                                 "owner_sub": {"S": owner},
-                                "dataset_id": {"S": dataset_id},
-                                "dataset_name": {"S": dataset_name},
+                                "catalog_id": {"S": catalog_id},
+                                "catalog_name": {"S": catalog_name},
                                 "filename": {"S": filename},
                                 "media_type": {"S": media_type},
                                 "expected_size": {"N": str(size_bytes)},
@@ -266,7 +266,7 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
                                 "sk": {"S": f"UPLOAD#{upload_id}"},
                                 "entity_type": {"S": "UPLOAD"},
                                 "owner_sub": {"S": owner},
-                                "dataset_id": {"S": dataset_id},
+                                "catalog_id": {"S": catalog_id},
                                 "upload_id": {"S": upload_id},
                                 "slot_key": {"S": slot_key},
                                 "staging_object_key": {"S": staging_object_key},
@@ -310,7 +310,7 @@ def _create_upload_session(event: dict[str, Any]) -> dict[str, Any]:
         ExpiresIn=900,
     )
     return {
-        "datasetId": dataset_id,
+        "catalogId": catalog_id,
         "uploadId": upload_id,
         "expiresInSeconds": 900,
         "upload": post,
@@ -329,7 +329,7 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
     if not isinstance(upload, dict) or upload.get("owner_sub") != owner:
         raise ApiError("upload_not_found", "Upload session does not exist", 404)
     if upload.get("status") == "completed":
-        return {"datasetId": upload["dataset_id"], "uploadId": upload_id, "status": "uploaded"}
+        return {"catalogId": upload["catalog_id"], "uploadId": upload_id, "status": "uploaded"}
     if upload.get("status") != "pending":
         raise ApiError("upload_not_completable", "Upload session cannot be completed", 409)
 
@@ -412,7 +412,7 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
                         "TableName": METADATA_TABLE,
                         "Key": {
                             "pk": {"S": owner_pk},
-                            "sk": {"S": f"DATASET#{upload['dataset_id']}"},
+                            "sk": {"S": f"CATALOG#{upload['catalog_id']}"},
                         },
                         "UpdateExpression": (
                             "SET #status = :uploaded, updated_at = :updated, "
@@ -469,21 +469,21 @@ def _complete_upload(event: dict[str, Any], upload_id: str) -> dict[str, Any]:
             "Could not delete completed staging upload; lifecycle cleanup will remove it",
             extra={"upload_id": upload_id},
         )
-    return {"datasetId": upload["dataset_id"], "uploadId": upload_id, "status": "uploaded"}
+    return {"catalogId": upload["catalog_id"], "uploadId": upload_id, "status": "uploaded"}
 
 
-def _list_datasets(event: dict[str, Any]) -> dict[str, Any]:
+def _list_catalogs(event: dict[str, Any]) -> dict[str, Any]:
     owner, _ = _identity(event)
     _, table = _clients()
     response = table.query(
-        KeyConditionExpression=Key("pk").eq(f"USER#{owner}") & Key("sk").begins_with("DATASET#"),
+        KeyConditionExpression=Key("pk").eq(f"USER#{owner}") & Key("sk").begins_with("CATALOG#"),
         ConsistentRead=True,
     )
     items = response.get("Items", [])
-    datasets = [
+    catalogs = [
         {
-            "datasetId": item["dataset_id"],
-            "name": item["dataset_name"],
+            "catalogId": item["catalog_id"],
+            "name": item["catalog_name"],
             "filename": item["filename"],
             "mediaType": item["media_type"],
             "sizeBytes": int(item.get("actual_size", item["expected_size"])),
@@ -494,8 +494,8 @@ def _list_datasets(event: dict[str, Any]) -> dict[str, Any]:
         for item in items
         if item.get("owner_sub") == owner
     ]
-    datasets.sort(key=lambda item: item["createdAt"], reverse=True)
-    return {"datasets": datasets}
+    catalogs.sort(key=lambda item: item["createdAt"], reverse=True)
+    return {"catalogs": catalogs}
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -503,7 +503,9 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         method, path = _route(event)
         if method == "GET" and path == "/api/health":
-            return _json_response(200, {"status": "ok", "service": "vonavy-agent-control-plane"})
+            return _json_response(
+                200, {"status": "ok", "service": "skincare-advisor-control-plane"}
+            )
         if method == "POST" and path == "/api/upload-sessions":
             return _json_response(201, _create_upload_session(event))
         if (
@@ -519,8 +521,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             if str(parsed_upload_id) != upload_id:
                 raise ApiError("upload_not_found", "Upload session does not exist", 404)
             return _json_response(200, _complete_upload(event, upload_id))
-        if method == "GET" and path == "/api/datasets":
-            return _json_response(200, _list_datasets(event))
+        if method == "GET" and path == "/api/catalogs":
+            return _json_response(200, _list_catalogs(event))
         raise ApiError("route_not_found", "Route does not exist", 404)
     except ApiError as exc:
         return _json_response(

@@ -1,6 +1,6 @@
 # Executor assignment: clean Phase 1 verification
 
-You are the execution agent for `vonavy-agent`. The accepted Phase 0 source of
+You are the execution agent for `skincare-advisor`. The accepted Phase 0 source of
 truth is commit `5cce02f71bd747ed7a90897695ca68457f67a8cc`. Phase 1 must be
 established in a fresh Git worktree by the clean-restart bundle; do not reuse
 any earlier dirty Phase 1 branch, patch, repair script, or generated file.
@@ -22,7 +22,7 @@ This phase implements only the near-zero-idle-cost control plane:
 - JWT- and custom-scope-protected HTTP API;
 - owner-scoped DynamoDB metadata;
 - direct browser uploads into a one-day staging bucket;
-- immutable versioned finalized dataset storage;
+- immutable versioned finalized catalog storage;
 - server-owned upload and retention quotas.
 
 This phase must not create EC2, NAT Gateway, RDS, SageMaker, Batch, Fargate,
@@ -55,7 +55,7 @@ Expected base:
 5. Verify the synthesized stack contains three private S3 buckets: static web,
    unversioned staging upload, and versioned finalized data.
 6. Verify every API route requires Cognito JWT authorization and the
-   `vonavy-agent/api` scope.
+   `skincare-advisor/api` scope.
 7. Verify Lambda has no bucket-list permission and only the required object
    permissions on staging and finalized prefixes.
 8. Verify the browser POST does not use unsupported S3 `x-amz-tagging`; staging
@@ -90,7 +90,7 @@ Push the clean branch only if existing GitHub authentication permits it.
 
 Permitted:
 
-- read-only SSO verification through `vonavy-readonly`;
+- read-only SSO verification through `skincare-readonly`;
 - quota and resource inventory;
 - `cdk synth`;
 - `cdk diff --no-change-set` and `--security-only`.

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/vonavy-agent.iml" filepath="$PROJECT_DIR$/.idea/vonavy-agent.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/skincare-advisor.iml" filepath="$PROJECT_DIR$/.idea/skincare-advisor.iml" />
     </modules>
   </component>
 </project>

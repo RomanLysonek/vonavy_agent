@@ -1,7 +1,7 @@
 # Aurora cost investigation and cleanup gate
 
 The Phase 0 account inventory found an Aurora PostgreSQL Serverless v2 cluster
-that is unrelated to the vonavy-agent design. Phase 1 does not use Aurora.
+that is unrelated to the skincare-advisor design. Phase 1 does not use Aurora.
 Auto-pause can reduce compute charges, but cluster storage, backups, snapshots,
 I/O, and periods of activity can still produce cost.
 
@@ -15,7 +15,7 @@ export AURORA_INSTANCE_ID='<discovered-instance-id>'
 
 ## Read-only investigation
 
-Run with `vonavy-readonly` in `eu-central-1`:
+Run with `skincare-readonly` in `eu-central-1`:
 
 ```bash
 : "${AURORA_CLUSTER_ID:?Set AURORA_CLUSTER_ID}"
@@ -23,37 +23,37 @@ Run with `vonavy-readonly` in `eu-central-1`:
 
 aws rds describe-db-clusters \
   --db-cluster-identifier "$AURORA_CLUSTER_ID" \
-  --profile vonavy-readonly \
+  --profile skincare-readonly \
   --region eu-central-1
 
 aws rds describe-db-instances \
   --db-instance-identifier "$AURORA_INSTANCE_ID" \
-  --profile vonavy-readonly \
+  --profile skincare-readonly \
   --region eu-central-1
 
 CLUSTER_ARN="$(aws rds describe-db-clusters \
   --db-cluster-identifier "$AURORA_CLUSTER_ID" \
-  --profile vonavy-readonly \
+  --profile skincare-readonly \
   --region eu-central-1 \
   --query 'DBClusters[0].DBClusterArn' \
   --output text)"
 
 aws rds list-tags-for-resource \
   --resource-name "$CLUSTER_ARN" \
-  --profile vonavy-readonly \
+  --profile skincare-readonly \
   --region eu-central-1
 
 aws rds describe-db-cluster-snapshots \
   --db-cluster-identifier "$AURORA_CLUSTER_ID" \
   --snapshot-type manual \
-  --profile vonavy-readonly \
+  --profile skincare-readonly \
   --region eu-central-1
 
 aws rds describe-events \
   --source-type db-cluster \
   --source-identifier "$AURORA_CLUSTER_ID" \
   --duration 10080 \
-  --profile vonavy-readonly \
+  --profile skincare-readonly \
   --region eu-central-1
 ```
 

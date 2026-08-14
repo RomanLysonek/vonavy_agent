@@ -408,7 +408,7 @@ wheels = [
 ]
 
 [[package]]
-name = "vonavy-agent-infra"
+name = "skincare-advisor-infra"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

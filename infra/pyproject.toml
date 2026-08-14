@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vonavy-agent-infra"
+name = "skincare-advisor-infra"
 version = "0.1.0"
-description = "AWS CDK control plane for vonavy-agent"
+description = "AWS CDK control plane for skincare-advisor"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "aws-cdk-lib==2.261.0",
@@ -21,7 +21,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["vonavy_infra"]
+packages = ["skincare_infra"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -38,7 +38,7 @@ ignore = ["E501"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-packages = ["vonavy_infra"]
+packages = ["skincare_infra"]
 
 [[tool.mypy.overrides]]
 module = ["aws_cdk.*", "constructs.*"]

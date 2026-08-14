@@ -15,34 +15,34 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-import vonavy_agent.jobs as jobs_module
-from vonavy_agent.adapters import import_adapter_snapshot
-from vonavy_agent.datasets import (
+import skincare_advisor.jobs as jobs_module
+from skincare_advisor.adapters import import_adapter_snapshot
+from skincare_advisor.catalogs import (
     build_profile,
     compute_profile,
     publish_profile,
 )
-from vonavy_agent.domain import (
+from skincare_advisor.domain import (
     AvailabilityKind,
     AvailabilityPolicy,
-    DatasetMappingSpec,
+    CatalogMappingSpec,
     JobState,
     MovingAverageConfig,
     SeasonalNaiveConfig,
 )
-from vonavy_agent.errors import AgentError
-from vonavy_agent.executor import ExecutionContext, LeaseLost
-from vonavy_agent.experiments import create_experiment_spec, run_gate
-from vonavy_agent.exporting import create_static_export, safe_embedded_json
-from vonavy_agent.jobs import (
+from skincare_advisor.errors import AgentError
+from skincare_advisor.executor import ExecutionContext, LeaseLost
+from skincare_advisor.experiments import create_experiment_spec, run_gate
+from skincare_advisor.exporting import create_static_export, safe_embedded_json
+from skincare_advisor.jobs import (
     OUTPUT_LIMIT_BYTES,
     Worker,
     enqueue_export,
     enqueue_job,
     enqueue_run,
 )
-from vonavy_agent.managed_files import verified_managed_file
-from vonavy_agent.persistence import (
+from skincare_advisor.managed_files import verified_managed_file
+from skincare_advisor.persistence import (
     AdapterSnapshot,
     DataProfile,
     Export,
@@ -52,7 +52,7 @@ from vonavy_agent.persistence import (
     new_id,
     session_scope,
 )
-from vonavy_agent.planner import propose_experiments
+from skincare_advisor.planner import propose_experiments
 
 
 def test_stale_executor_cannot_publish_after_lease_recovery(evidence) -> None:
@@ -60,7 +60,7 @@ def test_stale_executor_cannot_publish_after_lease_recovery(evidence) -> None:
     job = enqueue_job(
         engine,
         "profile",
-        {"dataset_version_id": version.id, "mapping_id": mapping.id},
+        {"catalog_version_id": version.id, "mapping_id": mapping.id},
     )
     worker = Worker(settings, engine)
     claim = worker._claim()
@@ -98,7 +98,7 @@ def test_final_ownership_transaction_rolls_back_evidence_together(evidence) -> N
     job = enqueue_job(
         engine,
         "profile",
-        {"dataset_version_id": version.id, "mapping_id": mapping.id},
+        {"catalog_version_id": version.id, "mapping_id": mapping.id},
     )
     worker = Worker(settings, engine)
     claim = worker._claim()
@@ -129,17 +129,17 @@ def test_final_ownership_transaction_rolls_back_evidence_together(evidence) -> N
 def test_target_information_availability_rejects_future_label_shortcuts(runtime) -> None:
     _, engine, registry = runtime
     with pytest.raises(ValidationError, match="target availability"):
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.ALWAYS),
         )
     with pytest.raises(ValidationError, match="target availability"):
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.ORIGIN),
         )
 
@@ -152,10 +152,10 @@ def test_target_information_availability_rejects_future_label_shortcuts(runtime)
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(
                 kind=AvailabilityKind.COLUMN,
                 column="target_known_at",
@@ -176,13 +176,13 @@ def test_product_availability_is_distinct_and_controls_denominators(runtime) -> 
     frame = synthetic_frame()
     frame["product_available"] = True
     unavailable_keys = {
-        ("store-a", "2025-03-11"),
-        ("store-a", "2025-03-26"),
+        ("product_id-a", "2025-03-11"),
+        ("product_id-a", "2025-03-26"),
     }
     for entity, day in unavailable_keys:
-        mask = (frame["store"] == entity) & (frame["date"] == day)
+        mask = (frame["product_id"] == entity) & (frame["date"] == day)
         frame.loc[mask, "product_available"] = False
-        frame.loc[mask, "demand"] = 0.0
+        frame.loc[mask, "rating"] = 0.0
     version = registry.ingest_stream(
         io.BytesIO(frame.to_csv(index=False).encode()),
         "product-availability.csv",
@@ -190,10 +190,10 @@ def test_product_availability_is_distinct_and_controls_denominators(runtime) -> 
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
             observation_availability_column="product_available",
         ),
@@ -263,7 +263,7 @@ def canonical_adapter_snapshot() -> dict[str, object]:
     return {
         "schema_version": "1.0",
         "manifest_kind": "capability",
-        "adapter_kind": "chronos",
+        "adapter_kind": "optional_model",
         "adapter_version": "test",
         "available": False,
         "unavailable_reason": "test fixture",

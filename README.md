@@ -1,8 +1,8 @@
-# Experiment Agent
+# Skincare Advisor
 
 > Current development line: Phase 1 serverless control plane. Local evaluation remains fully supported; the AWS slice is implemented for synthesis and review but must not be deployed before its CDK/IAM diff is approved.
 
-Local, deterministic forecasting experiment workbench for the NOTINO interview
+Local, deterministic skincare recommendation workbench for the NOTINO interview
 portfolio. It copies permitted CSV/Parquet data into immutable content-addressed
 storage, profiles and maps availability, blocks leakage before execution, runs
 fast daily panel baselines in a separate worker process, compares common-row
@@ -18,15 +18,15 @@ Requires Python 3.11 or 3.12 and
 
 ```bash
 uv sync --extra dev
-uv run vonavy-agent demo-data .vonavy-agent/inbox/demo-demand.csv
-uv run vonavy-agent serve
+uv run skincare-advisor demo-data .skincare-advisor/inbox/demo-rating.csv
+uv run skincare-advisor serve
 ```
 
 Open <http://127.0.0.1:8765> and:
 
-1. Upload `.vonavy-agent/inbox/demo-demand.csv` as `Interview demand demo`.
-2. Keep the suggested mapping: `date`, `store`, `demand`; target available at
-   event time; `promotion` known at origin and `region` static.
+1. Upload `.skincare-advisor/inbox/demo-rating.csv` as `Skincare catalog demo`.
+2. Keep the suggested mapping: `date`, `product_id`, `rating`; target available at
+   event time; `skin_type_match` known at origin and `brand` static.
 3. Save the mapping/profile. Review the generated train, calibration, and test
    ranges.
 4. Create the spec. The gate must be visible and pass before Run is enabled.
@@ -38,7 +38,7 @@ Open `index.html` directly; it has no external assets or server dependency.
 
 ## Data contract
 
-The first version supports regular daily panel demand:
+The first version supports regular daily panel rating:
 
 - one timestamp column;
 - one optional entity column;
@@ -51,9 +51,9 @@ The first version supports regular daily panel demand:
 
 For daily aggregates, `available_at_event_time` means the value becomes eligible
 at the next day's origin; the current day's target is never visible to its own
-forecast.
+recommendation.
 
-An ingest creates a logical dataset version and never changes its source.
+An ingest creates a logical catalog version and never changes its source.
 Snapshot and append modes materialise new immutable Parquet content. Browser
 uploads and direct children of the configured local inbox are the only ingest
 surfaces. URL fetches, traversal, symlinks, recursive watching, and automatic
@@ -72,16 +72,16 @@ experiment execution are not supported.
   the engine never silently imputes or drops them.
 - Anomaly data without truth labels is described as exceedance/alert rate, never
   false-alarm rate.
-- Chronos remains an optional manifest-described challenger. This slice does not
+- An optional model challenger remains an optional manifest-described challenger. This slice does not
   run inference, training, or fine-tuning.
 
 ## Runtime and operations
 
-By default state lives under `.vonavy-agent/` and Uvicorn binds to
-`127.0.0.1:8765`. Override settings with the `VONAVY_AGENT_` prefix, for example:
+By default state lives under `.skincare-advisor/` and Uvicorn binds to
+`127.0.0.1:8765`. Override settings with the `SKINCARE_ADVISOR_` prefix, for example:
 
 ```bash
-VONAVY_AGENT_MANAGED_ROOT=/safe/local/path uv run vonavy-agent serve
+SKINCARE_ADVISOR_MANAGED_ROOT=/safe/local/path uv run skincare-advisor serve
 ```
 
 The web process only enqueues jobs. A supervised worker claims SQLite leases and
@@ -92,14 +92,14 @@ state, process-group reap, and parent-death monitoring. Expired leases are
 recovered during every claim cycle. To manage processes separately:
 
 ```bash
-VONAVY_AGENT_SUPERVISE_WORKER=false uv run vonavy-agent serve
-uv run vonavy-agent worker
+SKINCARE_ADVISOR_SUPERVISE_WORKER=false uv run skincare-advisor serve
+uv run skincare-advisor worker
 ```
 
 Useful commands:
 
 ```bash
-uv run vonavy-agent migrate
+uv run skincare-advisor migrate
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
@@ -123,9 +123,9 @@ The server also enforces trusted resource ceilings above the resource envelope
 requested by a client specification.
 
 The domain distinguishes historical `EvaluationSpec`, unseen-future
-`ForecastSpec`, and stored-model `InferenceSpec`. Only evaluation is executable
+`RecommendationSpec`, and stored-model `InferenceSpec`. Only evaluation is executable
 in this local slice. AWS storage, metadata, identity, and Batch implementations
-will be added behind the interfaces in `vonavy_agent.ports`; they are not
+will be added behind the interfaces in `skincare_advisor.ports`; they are not
 simulated by the current local runner. See `docs/phase-0-cloud-boundaries.md`.
 
 Airflow, Celery, Redis, Kubernetes, arbitrary shell, uploaded code execution,

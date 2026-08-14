@@ -10,15 +10,15 @@ from conftest import make_spec, synthetic_frame
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
 
-from vonavy_agent.api import create_app
-from vonavy_agent.domain import (
+from skincare_advisor.api import create_app
+from skincare_advisor.domain import (
     DateRange,
-    ForecastSpec,
     InferenceSpec,
     MovingAverageConfig,
+    RecommendationSpec,
     parse_run_spec,
 )
-from vonavy_agent.identity import IdentityContext
+from skincare_advisor.identity import IdentityContext
 
 
 class HeaderIdentityProvider:
@@ -31,29 +31,29 @@ class HeaderIdentityProvider:
         )
 
 
-def test_api_isolates_dataset_aggregates_by_owner(runtime) -> None:
+def test_api_isolates_catalog_aggregates_by_owner(runtime) -> None:
     settings, _, _ = runtime
     with TestClient(create_app(settings, HeaderIdentityProvider())) as client:
         created = client.post(
-            "/api/datasets/upload",
+            "/api/catalogs/upload",
             headers={"x-test-owner": "alice"},
-            data={"dataset_name": "Alice panel"},
+            data={"catalog_name": "Alice panel"},
             files={"file": ("panel.csv", synthetic_frame(30).to_csv(index=False), "text/csv")},
         )
         assert created.status_code == 200
         version_id = created.json()["id"]
 
-        alice = client.get("/api/datasets", headers={"x-test-owner": "alice"})
-        bob = client.get("/api/datasets", headers={"x-test-owner": "bob"})
-        assert [item["name"] for item in alice.json()["datasets"]] == ["Alice panel"]
-        assert bob.json()["datasets"] == []
+        alice = client.get("/api/catalogs", headers={"x-test-owner": "alice"})
+        bob = client.get("/api/catalogs", headers={"x-test-owner": "bob"})
+        assert [item["name"] for item in alice.json()["catalogs"]] == ["Alice panel"]
+        assert bob.json()["catalogs"] == []
 
         hidden = client.get(
-            f"/api/dataset-versions/{version_id}",
+            f"/api/catalog-versions/{version_id}",
             headers={"x-test-owner": "bob"},
         )
         assert hidden.status_code == 404
-        assert hidden.json()["error"]["code"] == "dataset_version_not_found"
+        assert hidden.json()["error"]["code"] == "catalog_version_not_found"
 
         inbox = client.get("/api/inbox", headers={"x-test-owner": "alice"})
         assert inbox.status_code == 404
@@ -74,32 +74,32 @@ def test_api_rejects_client_resource_limits_above_server_policy(evidence) -> Non
     }
 
 
-def test_forecast_and_inference_contracts_are_explicit_and_discriminated() -> None:
-    forecast = ForecastSpec(
-        dataset_version_id="dataset-version",
+def test_recommendation_and_inference_contracts_are_explicit_and_discriminated() -> None:
+    recommendation = RecommendationSpec(
+        catalog_version_id="catalog-version",
         mapping_id="mapping",
         profile_id="profile",
         training_end=date(2026, 1, 11),
-        forecast=DateRange(start=date(2026, 1, 12), end=date(2026, 1, 18)),
+        recommendation=DateRange(start=date(2026, 1, 12), end=date(2026, 1, 18)),
         training_window_days=365,
-        target_column="demand",
+        target_column="rating",
         models=(MovingAverageConfig(),),
         information_cutoff=datetime(2026, 1, 12, tzinfo=UTC),
     )
     inference = InferenceSpec(
         model_artifact_id="model-artifact",
         model_adapter_kind="neural_net",
-        dataset_version_id="future-features",
+        catalog_version_id="future-features",
         mapping_id="mapping",
         profile_id="profile",
-        forecast=DateRange(start=date(2026, 1, 12), end=date(2026, 1, 18)),
-        target_column="demand",
+        recommendation=DateRange(start=date(2026, 1, 12), end=date(2026, 1, 18)),
+        target_column="rating",
         information_cutoff=datetime(2026, 1, 12, tzinfo=UTC),
     )
 
-    assert forecast.horizon_days == 7
+    assert recommendation.horizon_days == 7
     assert inference.horizon_days == 7
-    assert parse_run_spec(forecast.model_dump()).mode == "forecast"
+    assert parse_run_spec(recommendation.model_dump()).mode == "recommendation"
     assert parse_run_spec(inference.model_dump()).mode == "inference"
 
 
@@ -109,7 +109,7 @@ def test_legacy_database_upgrade_assigns_local_owner() -> None:
         config = Config()
         config.set_main_option(
             "script_location",
-            str(Path("src/vonavy_agent/migrations").resolve()),
+            str(Path("src/skincare_advisor/migrations").resolve()),
         )
         config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
         command.upgrade(config, "0001_initial")
@@ -117,15 +117,15 @@ def test_legacy_database_upgrade_assigns_local_owner() -> None:
         with engine.begin() as connection:
             connection.execute(
                 text(
-                    "INSERT INTO datasets (id, name, created_at) "
-                    "VALUES ('legacy-dataset', 'Legacy', CURRENT_TIMESTAMP)"
+                    "INSERT INTO catalogs (id, name, created_at) "
+                    "VALUES ('legacy-catalog', 'Legacy', CURRENT_TIMESTAMP)"
                 )
             )
         command.upgrade(config, "head")
-        columns = {column["name"] for column in inspect(engine).get_columns("datasets")}
+        columns = {column["name"] for column in inspect(engine).get_columns("catalogs")}
         assert "owner_id" in columns
         with engine.connect() as connection:
             owner = connection.execute(
-                text("SELECT owner_id FROM datasets WHERE id='legacy-dataset'")
+                text("SELECT owner_id FROM catalogs WHERE id='legacy-catalog'")
             ).scalar_one()
         assert owner == "local"

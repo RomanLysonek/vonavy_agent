@@ -10,4 +10,4 @@ Order:
 4. apply and verify the Phase 0 patch locally
 5. only then begin the AWS control-plane CDK phase
 
-Never place AWS access keys, SSO caches, `.env` files, uploaded datasets, or generated model artifacts in Git.
+Never place AWS access keys, SSO caches, `.env` files, uploaded catalogs, or generated model artifacts in Git.

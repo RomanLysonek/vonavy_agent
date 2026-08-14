@@ -11,15 +11,15 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from vonavy_agent.adapters import PreparedInvocation, dry_run_invocation
-from vonavy_agent.backtest import PreparedData, _ridge_predictions
-from vonavy_agent.domain import DatasetMappingSpec, JobState, RidgeDirectConfig
-from vonavy_agent.errors import AgentError
-from vonavy_agent.experiments import run_gate
-from vonavy_agent.exporting import create_static_export
-from vonavy_agent.jobs import Worker, enqueue_job, enqueue_run, request_cancellation
-from vonavy_agent.persistence import Job, Run, RunMetric, session_scope
-from vonavy_agent.planner import propose_experiments
+from skincare_advisor.adapters import PreparedInvocation, dry_run_invocation
+from skincare_advisor.backtest import PreparedData, _ridge_predictions
+from skincare_advisor.domain import CatalogMappingSpec, JobState, RidgeDirectConfig
+from skincare_advisor.errors import AgentError
+from skincare_advisor.experiments import run_gate
+from skincare_advisor.exporting import create_static_export
+from skincare_advisor.jobs import Worker, enqueue_job, enqueue_run, request_cancellation
+from skincare_advisor.persistence import Job, Run, RunMetric, session_scope
+from skincare_advisor.planner import propose_experiments
 
 
 def test_gate_run_metrics_manifest_and_static_export(evidence, spec_row) -> None:
@@ -38,12 +38,12 @@ def test_gate_run_metrics_manifest_and_static_export(evidence, spec_row) -> None
     assert {metric.role for metric in metrics} >= {"calibration", "test"}
     manifest = json.loads((settings.managed_root / "runs" / run.id / "manifest.json").read_text())
     assert manifest["spec_hash"] == spec_row.spec_hash
-    assert manifest["command"][1:3] == ["-m", "vonavy_agent.executor"]
+    assert manifest["command"][1:3] == ["-m", "skincare_advisor.executor"]
     exported = create_static_export(engine, settings, "export-test", [run.id])
     with zipfile.ZipFile(settings.managed_root / exported["relative_path"]) as archive:
         assert set(archive.namelist()) == {"index.html", "report.json", "manifest.json"}
         index = archive.read("index.html").decode()
-        assert "NOTINO / Interview Assignment" in index
+        assert "Skincare Advisor" in index
         assert "https://" not in index
 
     failed_run, failed_job = enqueue_run(
@@ -72,13 +72,13 @@ def test_gate_run_metrics_manifest_and_static_export(evidence, spec_row) -> None
 
 def test_ridge_predictions_do_not_use_future_targets(evidence) -> None:
     _, _, registry, version, mapping_row, profile = evidence
-    mapping = DatasetMappingSpec.model_validate_json(mapping_row.canonical_json)
+    mapping = CatalogMappingSpec.model_validate_json(mapping_row.canonical_json)
     with Session(registry.engine) as session:
         path = registry.materialized_path(session, version.id)
     frame = pd.read_parquet(path)
     frame["_date"] = pd.to_datetime(frame["date"]).dt.normalize()
-    frame["_entity"] = frame["store"].astype("string")
-    frame["_target"] = frame["demand"].astype(float)
+    frame["_entity"] = frame["product_id"].astype("string")
+    frame["_target"] = frame["rating"].astype(float)
     frame["_target_available"] = frame["_date"] + pd.Timedelta(days=1)
     frame["_observation_available"] = True
     from conftest import make_spec
@@ -115,7 +115,7 @@ def test_worker_recovery_cancellation_and_adapter_safety(runtime) -> None:
     root = settings.managed_root.resolve()
     safe = PreparedInvocation(
         executable=sys.executable,
-        argv=("-m", "vonavy_agent.adapters_chronos", "--capabilities"),
+        argv=("-m", "skincare_advisor.adapters_optional_model", "--capabilities"),
         cwd=str(root),
         timeout_seconds=10,
     )

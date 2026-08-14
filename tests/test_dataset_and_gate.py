@@ -6,22 +6,22 @@ import json
 import pytest
 from conftest import make_spec, synthetic_frame
 
-from vonavy_agent.datasets import build_profile
-from vonavy_agent.domain import (
+from skincare_advisor.catalogs import build_profile
+from skincare_advisor.domain import (
     AvailabilityKind,
     AvailabilityPolicy,
-    DatasetMappingSpec,
+    CatalogMappingSpec,
 )
-from vonavy_agent.errors import AgentError
-from vonavy_agent.experiments import create_experiment_spec, run_gate
-from vonavy_agent.hashing import file_hash
-from vonavy_agent.persistence import Blob
+from skincare_advisor.errors import AgentError
+from skincare_advisor.experiments import create_experiment_spec, run_gate
+from skincare_advisor.hashing import file_hash
+from skincare_advisor.persistence import Blob
 
 
 def test_ingestion_hashes_versions_and_never_changes_source(runtime) -> None:
     settings, engine, registry = runtime
     source = synthetic_frame(days=5).to_csv(index=False).encode()
-    first = registry.ingest_stream(io.BytesIO(source), "safe.csv", "Demand")
+    first = registry.ingest_stream(io.BytesIO(source), "safe.csv", "Skincare ratings")
     with engine.connect() as connection:
         blob_path = (
             settings.managed_root
@@ -38,9 +38,9 @@ def test_ingestion_hashes_versions_and_never_changes_source(runtime) -> None:
     second = registry.ingest_stream(
         io.BytesIO(delta),
         "delta.csv",
-        "Demand",
+        "Skincare ratings",
         mode="append",
-        dataset_id=first.dataset_id,
+        catalog_id=first.catalog_id,
         parent_version_id=first.id,
     )
     assert second.version_number == 2
@@ -64,10 +64,10 @@ def test_profile_and_gate_block_duplicate_keys(runtime) -> None:
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
         ),
     )
@@ -81,7 +81,7 @@ def test_profile_and_gate_block_duplicate_keys(runtime) -> None:
 
 
 def make_spec_models():
-    from vonavy_agent.domain import MovingAverageConfig, SeasonalNaiveConfig
+    from skincare_advisor.domain import MovingAverageConfig, SeasonalNaiveConfig
 
     return (SeasonalNaiveConfig(), MovingAverageConfig())
 

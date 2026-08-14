@@ -1,6 +1,6 @@
 # AWS account bootstrap
 
-Primary region: `eu-central-1`.
+Primary brand: `eu-central-1`.
 
 ## Human-only console steps
 
@@ -19,17 +19,17 @@ Perform these while no automation is operating as the root user:
 Install AWS CLI v2, then configure an SSO profile:
 
 ```bash
-aws configure sso --profile vonavy-admin
-aws sso login --profile vonavy-admin
-aws sts get-caller-identity --profile vonavy-admin
-aws configure set region eu-central-1 --profile vonavy-admin
-aws configure set output json --profile vonavy-admin
+aws configure sso --profile skincare-admin
+aws sso login --profile skincare-admin
+aws sts get-caller-identity --profile skincare-admin
+aws configure set region eu-central-1 --profile skincare-admin
+aws configure set output json --profile skincare-admin
 ```
 
 Expected properties:
 
 - the caller is an IAM Identity Center assumed role, not root;
-- the region is `eu-central-1`;
+- the brand is `eu-central-1`;
 - no long-lived key is written into the repository.
 
 ## Cost controls

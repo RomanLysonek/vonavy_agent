@@ -26,22 +26,22 @@ function decodeJwt(token) {
 
 function saveTokens(tokens) {
   state.tokens = tokens;
-  sessionStorage.setItem("vonavy_tokens", JSON.stringify(tokens));
+  sessionStorage.setItem("skincare_tokens", JSON.stringify(tokens));
 }
 
 function loadTokens() {
-  const raw = sessionStorage.getItem("vonavy_tokens");
+  const raw = sessionStorage.getItem("skincare_tokens");
   if (!raw) return null;
   try {
     const tokens = JSON.parse(raw);
     const claims = decodeJwt(tokens.access_token);
     if (claims.exp * 1000 <= Date.now() + 30_000) {
-      sessionStorage.removeItem("vonavy_tokens");
+      sessionStorage.removeItem("skincare_tokens");
       return null;
     }
     return tokens;
   } catch {
-    sessionStorage.removeItem("vonavy_tokens");
+    sessionStorage.removeItem("skincare_tokens");
     return null;
   }
 }
@@ -59,8 +59,8 @@ async function api(path, options = {}) {
 async function login() {
   const verifier = randomVerifier();
   const oauthState = randomVerifier();
-  sessionStorage.setItem("vonavy_pkce_verifier", verifier);
-  sessionStorage.setItem("vonavy_oauth_state", oauthState);
+  sessionStorage.setItem("skincare_pkce_verifier", verifier);
+  sessionStorage.setItem("skincare_oauth_state", oauthState);
   const params = new URLSearchParams({
     client_id: state.config.userPoolClientId,
     response_type: "code",
@@ -74,8 +74,8 @@ async function login() {
 }
 
 async function exchangeCode(code, returnedState) {
-  const verifier = sessionStorage.getItem("vonavy_pkce_verifier");
-  const expectedState = sessionStorage.getItem("vonavy_oauth_state");
+  const verifier = sessionStorage.getItem("skincare_pkce_verifier");
+  const expectedState = sessionStorage.getItem("skincare_oauth_state");
   if (!verifier || !expectedState) throw new Error("The sign-in verifier is missing. Start sign-in again.");
   if (!returnedState || returnedState !== expectedState) {
     throw new Error("The sign-in response did not match this browser session.");
@@ -100,13 +100,13 @@ async function exchangeCode(code, returnedState) {
     expires_in: tokenResponse.expires_in,
     token_type: tokenResponse.token_type,
   });
-  sessionStorage.removeItem("vonavy_pkce_verifier");
-  sessionStorage.removeItem("vonavy_oauth_state");
+  sessionStorage.removeItem("skincare_pkce_verifier");
+  sessionStorage.removeItem("skincare_oauth_state");
   history.replaceState({}, "", "/");
 }
 
 function logout() {
-  sessionStorage.removeItem("vonavy_tokens");
+  sessionStorage.removeItem("skincare_tokens");
   state.tokens = null;
   const params = new URLSearchParams({
     client_id: state.config.userPoolClientId,
@@ -117,8 +117,8 @@ function logout() {
 
 async function upload(event) {
   event.preventDefault();
-  const file = $("dataset-file").files[0];
-  const name = $("dataset-name").value.trim();
+  const file = $("catalog-file").files[0];
+  const name = $("catalog-name").value.trim();
   if (!file || !name) return;
   if (file.size > state.config.maximumUploadBytes) {
     $("status").textContent = `File exceeds the ${state.config.maximumUploadBytes.toLocaleString()} byte server limit.`;
@@ -134,7 +134,7 @@ async function upload(event) {
     const session = await api("/api/upload-sessions", {
       method: "POST",
       body: JSON.stringify({
-        datasetName: name,
+        catalogName: name,
         filename: file.name,
         mediaType,
         sizeBytes: file.size,
@@ -153,7 +153,7 @@ async function upload(event) {
     });
     $("status").textContent = "Upload complete. Validation execution arrives in Phase 2.";
     $("upload-form").reset();
-    await listDatasets();
+    await listCatalogs();
   } catch (error) {
     $("status").textContent = error.message;
   } finally {
@@ -161,32 +161,32 @@ async function upload(event) {
   }
 }
 
-async function listDatasets() {
-  const payload = await api("/api/datasets");
-  const root = $("datasets");
+async function listCatalogs() {
+  const payload = await api("/api/catalogs");
+  const root = $("catalogs");
   root.replaceChildren();
-  if (!payload.datasets.length) {
-    root.textContent = "No datasets uploaded yet.";
+  if (!payload.catalogs.length) {
+    root.textContent = "No catalogs uploaded yet.";
     return;
   }
-  for (const dataset of payload.datasets) {
+  for (const catalog of payload.catalogs) {
     const item = document.createElement("article");
-    item.className = "dataset";
+    item.className = "catalog";
     const title = document.createElement("strong");
-    title.textContent = dataset.name;
+    title.textContent = catalog.name;
     const meta = document.createElement("span");
-    meta.textContent = `${dataset.filename} · ${dataset.status} · ${dataset.sizeBytes.toLocaleString()} bytes`;
+    meta.textContent = `${catalog.filename} · ${catalog.status} · ${catalog.sizeBytes.toLocaleString()} bytes`;
     item.append(title, meta);
     root.append(item);
   }
 }
 
 async function start() {
-  state.config = await fetch("/config.json", { cache: "no-store" }).then((response) => {
+  state.config = await fetch("/config.json", { cache: "no-product_id" }).then((response) => {
     if (!response.ok) throw new Error("Application configuration is unavailable.");
     return response.json();
   });
-  $("upload-policy").textContent = `Server policy: up to ${state.config.maximumUploadBytes.toLocaleString()} bytes per file and ${state.config.maximumDatasetsPerOwner} retained dataset slots per account.`;
+  $("upload-policy").textContent = `Server policy: up to ${state.config.maximumUploadBytes.toLocaleString()} bytes per file and ${state.config.maximumCatalogsPerOwner} retained catalog slots per account.`;
   const query = new URLSearchParams(location.search);
   const code = query.get("code");
   if (code) await exchangeCode(code, query.get("state"));
@@ -196,7 +196,7 @@ async function start() {
   if (state.tokens) {
     const claims = decodeJwt(state.tokens.access_token);
     $("identity").textContent = claims.username || claims.sub;
-    await listDatasets();
+    await listCatalogs();
   }
 }
 
@@ -204,7 +204,7 @@ $("login").addEventListener("click", login);
 $("logout").addEventListener("click", logout);
 $("upload-form").addEventListener("submit", upload);
 $("refresh").addEventListener("click", () => {
-  listDatasets().catch((error) => {
+  listCatalogs().catch((error) => {
     $("status").textContent = error.message;
   });
 });

@@ -27,8 +27,8 @@ button:disabled { opacity: .55; cursor: wait; }
 button.secondary { background: #3f3f46; }
 button.secondary:hover { background: #52525b; }
 pre { min-height: 20px; white-space: pre-wrap; color: #bfdbfe; }
-.dataset { display: grid; gap: 6px; padding: 14px 0; border-top: 1px solid #3f3f46; }
-.dataset span { color: #a1a1aa; font-size: 14px; }
+.catalog { display: grid; gap: 6px; padding: 14px 0; border-top: 1px solid #3f3f46; }
+.catalog span { color: #a1a1aa; font-size: 14px; }
 @media (max-width: 620px) {
   main { padding-top: 36px; }
   .identity-row, .section-heading { align-items: flex-start; flex-direction: column; }

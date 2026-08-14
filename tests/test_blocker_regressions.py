@@ -18,12 +18,12 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from vonavy_agent.backtest import _metric_records, _source_revision
-from vonavy_agent.datasets import build_profile
-from vonavy_agent.domain import (
+from skincare_advisor.backtest import _metric_records, _source_revision
+from skincare_advisor.catalogs import build_profile
+from skincare_advisor.domain import (
     AvailabilityKind,
     AvailabilityPolicy,
-    DatasetMappingSpec,
+    CatalogMappingSpec,
     ExperimentSpec,
     FeatureMapping,
     FeatureRole,
@@ -32,24 +32,24 @@ from vonavy_agent.domain import (
     RidgeDirectConfig,
     SeasonalNaiveConfig,
 )
-from vonavy_agent.errors import AgentError
-from vonavy_agent.experiments import create_experiment_spec, run_gate
-from vonavy_agent.jobs import (
+from skincare_advisor.errors import AgentError
+from skincare_advisor.experiments import create_experiment_spec, run_gate
+from skincare_advisor.jobs import (
     StreamCollector,
     Worker,
     enqueue_job,
     enqueue_run,
     request_cancellation,
 )
-from vonavy_agent.persistence import (
+from skincare_advisor.persistence import (
     Blob,
-    DatasetVersion,
+    CatalogVersion,
     Job,
     Run,
     session_scope,
 )
-from vonavy_agent.planner import confirm_proposal, propose_experiments
-from vonavy_agent.settings import Settings
+from skincare_advisor.planner import confirm_proposal, propose_experiments
+from skincare_advisor.settings import Settings
 
 
 def test_managed_directories_reject_symlink_children(tmp_path: Path) -> None:
@@ -71,7 +71,7 @@ def test_managed_directories_reject_symlink_children(tmp_path: Path) -> None:
 def test_blob_integrity_is_verified_on_every_consumption(evidence) -> None:
     settings, engine, registry, version, _, _ = evidence
     with Session(engine) as session:
-        version_row = session.get_one(DatasetVersion, version.id)
+        version_row = session.get_one(CatalogVersion, version.id)
         blob = session.get_one(Blob, version_row.materialized_blob_sha256)
         path = settings.managed_root / blob.relative_path
         path.write_bytes(b"x" * blob.byte_size)
@@ -94,7 +94,7 @@ def test_inbox_change_is_rejected_before_version_commit(runtime, monkeypatch) ->
     with pytest.raises(AgentError, match="changed while"):
         registry.import_inbox("changing.csv", "Changing")
     with Session(engine) as session:
-        assert session.scalar(select(func.count()).select_from(DatasetVersion)) == 0
+        assert session.scalar(select(func.count()).select_from(CatalogVersion)) == 0
 
 
 def test_concurrent_identical_blob_publication_has_one_verified_winner(runtime) -> None:
@@ -111,22 +111,22 @@ def test_concurrent_identical_blob_publication_has_one_verified_winner(runtime) 
 def test_profile_encodes_nonfinite_values_and_gate_blocks_them(runtime) -> None:
     _, engine, registry = runtime
     frame = synthetic_frame()
-    frame.loc[0, "demand"] = np.inf
+    frame.loc[0, "rating"] = np.inf
     version = registry.ingest_stream(
         io.BytesIO(frame.to_csv(index=False).encode()), "nonfinite.csv", "Nonfinite"
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
         ),
     )
     profile = build_profile(registry, version.id, mapping.id, 10)
     assert "Infinity" not in profile.canonical_json
-    assert json.loads(profile.canonical_json)["numeric"]["demand"]["nonfinite_count"] == 1
+    assert json.loads(profile.canonical_json)["numeric"]["rating"]["nonfinite_count"] == 1
     spec = make_spec(version, mapping, profile, models=(SeasonalNaiveConfig(),))
     spec_row = create_experiment_spec(engine, spec)
     report = json.loads(run_gate(engine, registry, spec_row.id).canonical_json)
@@ -197,7 +197,7 @@ def test_all_job_kinds_use_fenced_subprocess_path(evidence, spec_row) -> None:
     profile_job = enqueue_job(
         engine,
         "profile",
-        {"dataset_version_id": version.id, "mapping_id": mapping.id},
+        {"catalog_version_id": version.id, "mapping_id": mapping.id},
     )
     assert Worker(settings, engine).run_once()
     with Session(engine) as session:
@@ -345,14 +345,14 @@ def test_gate_blocks_all_feature_availability_failures(runtime) -> None:
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
             features=(
                 FeatureMapping(
-                    name="promotion",
+                    name="skin_type_match",
                     role=FeatureRole.PAST_ONLY,
                     availability=AvailabilityPolicy(
                         kind=AvailabilityKind.COLUMN,
@@ -360,7 +360,7 @@ def test_gate_blocks_all_feature_availability_failures(runtime) -> None:
                     ),
                 ),
                 FeatureMapping(
-                    name="region",
+                    name="brand",
                     role=FeatureRole.STATIC,
                     availability=AvailabilityPolicy(
                         kind=AvailabilityKind.COLUMN,
@@ -384,16 +384,16 @@ def test_gate_blocks_all_feature_availability_failures(runtime) -> None:
 def test_gate_blocks_model_infeasibility_and_null_entities(runtime) -> None:
     _, engine, registry = runtime
     frame = synthetic_frame()
-    frame.loc[0, "store"] = None
+    frame.loc[0, "product_id"] = None
     version = registry.ingest_stream(
         io.BytesIO(frame.to_csv(index=False).encode()), "null-entity.csv", "Null entity"
     )
     mapping = registry.create_mapping(
         version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
         ),
     )
@@ -412,10 +412,10 @@ def test_gate_blocks_model_infeasibility_and_null_entities(runtime) -> None:
     )
     clean_mapping = registry.create_mapping(
         clean_version.id,
-        DatasetMappingSpec(
+        CatalogMappingSpec(
             timestamp_column="date",
-            entity_column="store",
-            target_column="demand",
+            entity_column="product_id",
+            target_column="rating",
             target_availability=AvailabilityPolicy(kind=AvailabilityKind.EVENT_TIME),
         ),
     )
